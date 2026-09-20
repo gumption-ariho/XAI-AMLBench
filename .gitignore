@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+data/
+models/*.pt
+node_modules/
+.next/
+*.tsbuildinfo
+_old_backup/
+_old_js_backup/

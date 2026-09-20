@@ -1,0 +1,6 @@
+# vllm, torch, fastapi, uvicorn, pydantic come from the vllm/vllm-openai base image
+httpx
+networkx
+immudb-py
+prometheus-client
+prometheus-fastapi-instrumentator

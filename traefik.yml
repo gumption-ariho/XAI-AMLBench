@@ -1,0 +1,26 @@
+# Static configuration for Traefik v3 (container 1)
+api:
+  dashboard: true
+  insecure: true          # dashboard on :8081 -- DEV ONLY, remove for production
+
+entryPoints:
+  web:
+    address: ":80"
+  traefik:
+    address: ":8081"
+  metrics:
+    address: ":8082"
+
+providers:
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    exposedByDefault: false          # only containers with traefik.enable=true are routed
+    network: xai-net
+
+metrics:
+  prometheus:
+    entryPoint: metrics
+
+log:
+  level: INFO
+accessLog: {}

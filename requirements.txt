@@ -1,0 +1,17 @@
+# XAI-AMLBench  -  ONE file to install everything for local development
+#
+#     pip install -r requirements.txt          (or run:  bash install_all_requirements_v2.sh   -> does it all, fast)
+#
+# It only INCLUDES the per-service files below, so nothing is listed twice. Those files stay separate on purpose:
+# each Docker image installs just its own service's packages (the backend image must not download PyTorch).
+#
+# Not in this file (needs a special source, the install script handles both):
+#   torch==2.4.1   CPU build:  pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cpu
+#   vllm           GPU only; it lives inside the xai-narrative-api Docker image
+
+numpy<2            # PyTorch 2.4.1 was built for NumPy 1.x (the Docker image uses 1.26)
+
+-r aml_synth/requirements.txt
+-r gnn_aml_core/requirements.txt
+-r backend/requirements.txt
+-r xai_explainer/requirements.txt

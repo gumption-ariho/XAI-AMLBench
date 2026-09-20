@@ -1,0 +1,318 @@
+# XAI-AMLBench -- 14-container stack
+#
+# Profiles (so you don't have to run everything at once):
+#   (none)  -> infra: traefik, kafka, postgres, redis, neo4j, immudb
+#   app     -> frontend, backend, node_agent           (ProjectXY legacy)
+#   ml      -> aml-synth-worker, gnn-detection-api
+#   llm     -> xai-narrative-api                       (needs NVIDIA GPU)
+#   obs     -> prometheus-metrics, grafana-dashboard
+#
+# Examples:
+#   docker compose up -d                              # infra only
+#   docker compose --profile ml up -d --build         # infra + ML services
+#   docker compose --profile app --profile ml --profile obs up -d
+#
+# NOTE: image tags below are sensible defaults. If you already pulled different
+# tags, change them here so Docker uses your cached layers.
+
+name: xai-amlbench
+
+networks:
+  xai-net:
+    driver: bridge
+
+volumes:
+  pg-data:
+  redis-data:
+  neo4j-data:
+  neo4j-logs:
+  immudb-data:
+  prometheus-data:
+  grafana-data:
+  hf-cache:
+
+services:
+  # ------------------------------------------------------------------
+  # A. INGRESS & EVENT STREAMING
+  # ------------------------------------------------------------------
+  traefik-edge-router:            # Container 1
+    image: traefik:v3.1
+    restart: unless-stopped
+    command: ["--configFile=/etc/traefik/traefik.yml"]
+    ports:
+      - "80:80"
+      - "8081:8081"               # Traefik dashboard (dev only)
+    volumes:
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [xai-net]
+
+  apache-kafka:                   # Container 2 (single-node KRaft, no ZooKeeper)
+    image: apache/kafka:3.9.0
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://apache-kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@apache-kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+    ports:
+      - "29092:29092"             # host access for local scripts
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    networks: [xai-net]
+
+  # ------------------------------------------------------------------
+  # B. CORE APPLICATION (ProjectXY legacy) -- profile: app
+  # ------------------------------------------------------------------
+  frontend:                       # Container 3 (Next.js)
+    profiles: [app]
+    build: ./frontend
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_BASE: /api
+    depends_on: [backend]
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.frontend.rule=Host(`${PUBLIC_HOST}`)
+      - traefik.http.routers.frontend.entrypoints=web
+      - traefik.http.routers.frontend.priority=1
+      - traefik.http.services.frontend.loadbalancer.server.port=3000
+    ports:
+      - "3000:3000"
+    networks: [xai-net]
+
+  backend:                        # Container 4
+    profiles: [app]
+    build: ./backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@database:5432/${POSTGRES_DB}
+      GNN_API_URL: http://gnn-detection-api:8000
+      XAI_API_URL: http://xai-narrative-api:8000
+      IMMUDB_HOST: immudb-audit-ledger
+      IMMUDB_PORT: 3322
+    depends_on:
+      database: { condition: service_healthy }
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.backend.rule=Host(`${PUBLIC_HOST}`) && PathPrefix(`/api`)
+      - traefik.http.routers.backend.entrypoints=web
+      - traefik.http.routers.backend.priority=10
+      - traefik.http.services.backend.loadbalancer.server.port=8000   # adjust to ProjectXY backend port
+    networks: [xai-net]
+
+  node_agent:                     # Container 5
+    profiles: [app]
+    build: ./node_agent
+    restart: unless-stopped
+    env_file: .env
+    depends_on: [backend]
+    networks: [xai-net]
+
+  # ------------------------------------------------------------------
+  # C. INTELLIGENCE & PROCESSING -- profiles: ml, llm
+  # ------------------------------------------------------------------
+  aml-synth-worker:               # Container 6
+    profiles: [ml]
+    build:
+      context: .
+      dockerfile: aml_synth/Dockerfile
+    restart: "no"                 # batch worker: run on demand
+    environment:
+      KAFKA_BOOTSTRAP: apache-kafka:9092
+      KAFKA_TOPIC_TRANSACTIONS: ${KAFKA_TOPIC_TRANSACTIONS}
+      NEO4J_URI: bolt://neo4j-compliance-db:7687
+      NEO4J_USER: ${NEO4J_USER}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD}
+    depends_on:
+      apache-kafka: { condition: service_healthy }
+      neo4j-compliance-db: { condition: service_healthy }
+    volumes:
+      - ./data:/app/data
+    networks: [xai-net]
+
+  gnn-detection-api:              # Container 7
+    profiles: [ml]
+    build:
+      context: .
+      dockerfile: gnn_aml_core/Dockerfile
+    restart: unless-stopped
+    environment:
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis-feature-cache:6379/0
+      NEO4J_URI: bolt://neo4j-compliance-db:7687
+      NEO4J_USER: ${NEO4J_USER}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD}
+      KAFKA_BOOTSTRAP: apache-kafka:9092
+      IMMUDB_HOST: immudb-audit-ledger
+      IMMUDB_PORT: 3322
+      IMMUDB_ADMIN_PASSWORD: ${IMMUDB_ADMIN_PASSWORD}
+      MODEL_DIR: /app/models
+      GNN_LATENCY_TARGET_MS: ${GNN_LATENCY_TARGET_MS}
+      GNN_AUC_TARGET: ${GNN_AUC_TARGET}
+    depends_on:
+      redis-feature-cache: { condition: service_healthy }
+      neo4j-compliance-db: { condition: service_healthy }
+    volumes:
+      - ./models:/app/models
+      - ./data:/app/data
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.gnn.rule=Host(`${PUBLIC_HOST}`) && PathPrefix(`/gnn`)
+      - traefik.http.routers.gnn.entrypoints=web
+      - traefik.http.routers.gnn.middlewares=gnn-strip
+      - traefik.http.middlewares.gnn-strip.stripprefix.prefixes=/gnn
+      - traefik.http.services.gnn.loadbalancer.server.port=8000
+    # Uncomment for GPU inference:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices: [{ driver: nvidia, count: 1, capabilities: [gpu] }]
+    networks: [xai-net]
+
+  xai-narrative-api:              # Container 8 (FastAPI + in-process vLLM)
+    profiles: [llm]
+    build:
+      context: .
+      dockerfile: xai_explainer/Dockerfile   # FROM vllm/vllm-openai (pin VLLM_TAG build-arg to your pulled tag)
+    restart: unless-stopped
+    environment:
+      LLM_BACKEND: ${LLM_BACKEND:-vllm}          # set to 'template' to run without a GPU
+      LLM_MODEL: ${LLM_MODEL}
+      LLM_QUANT: ${LLM_QUANT:-awq}
+      LLM_MAX_MODEL_LEN: ${LLM_MAX_MODEL_LEN}
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN}
+      GNN_API_URL: http://gnn-detection-api:8000
+      IMMUDB_HOST: immudb-audit-ledger
+      IMMUDB_PORT: 3322
+      IMMUDB_ADMIN_PASSWORD: ${IMMUDB_ADMIN_PASSWORD}
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    ipc: host
+    # No NVIDIA GPU? delete this deploy block and set LLM_BACKEND=template in .env
+    deploy:
+      resources:
+        reservations:
+          devices: [{ driver: nvidia, count: 1, capabilities: [gpu] }]
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.xai.rule=Host(`${PUBLIC_HOST}`) && PathPrefix(`/xai`)
+      - traefik.http.routers.xai.entrypoints=web
+      - traefik.http.routers.xai.middlewares=xai-strip
+      - traefik.http.middlewares.xai-strip.stripprefix.prefixes=/xai
+      - traefik.http.services.xai.loadbalancer.server.port=8000
+    networks: [xai-net]
+
+  # ------------------------------------------------------------------
+  # D. CACHING & SPECIALIZED STORAGE
+  # ------------------------------------------------------------------
+  database:                       # Container 9 (Postgres)
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [xai-net]
+
+  redis-feature-cache:            # Container 10
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $${REDIS_PASSWORD} ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    networks: [xai-net]
+
+  neo4j-compliance-db:            # Container 11
+    image: neo4j:5-community
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER}/${NEO4J_PASSWORD}
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1G
+      NEO4J_server_memory_pagecache_size: 512m
+    ports:
+      - "7474:7474"               # Neo4j Browser (officers investigate here)
+      - "7687:7687"               # Bolt
+    volumes:
+      - neo4j-data:/data
+      - neo4j-logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u ${NEO4J_USER} -p ${NEO4J_PASSWORD} 'RETURN 1' >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    networks: [xai-net]
+
+  immudb-audit-ledger:            # Container 12
+    image: codenotary/immudb:latest
+    restart: unless-stopped
+    environment:
+      IMMUDB_ADMIN_PASSWORD: ${IMMUDB_ADMIN_PASSWORD}
+      IMMUDB_METRICS_SERVER: "true"   # exposes :9497/metrics for Prometheus
+    ports:
+      - "8080:8080"               # immudb web console
+    volumes:
+      - immudb-data:/var/lib/immudb
+    networks: [xai-net]
+
+  # ------------------------------------------------------------------
+  # E. OBSERVABILITY -- profile: obs
+  # ------------------------------------------------------------------
+  prometheus-metrics:             # Container 13
+    profiles: [obs]
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks: [xai-net]
+
+  grafana-dashboard:              # Container 14
+    profiles: [obs]
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_SERVER_ROOT_URL: http://${PUBLIC_HOST}/grafana/
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on: [prometheus-metrics]
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.grafana.rule=Host(`${PUBLIC_HOST}`) && PathPrefix(`/grafana`)
+      - traefik.http.routers.grafana.entrypoints=web
+      - traefik.http.services.grafana.loadbalancer.server.port=3000
+    networks: [xai-net]

@@ -1,0 +1,19 @@
+# Root-context images (aml_synth, gnn_aml_core, xai_explainer) only COPY their own package folder,
+# so keep everything else out of the build context: faster builds, no huge node_modules upload.
+.git
+.idea
+.env
+.venv
+__pycache__/
+*.pyc
+data/
+models/
+frontend/
+backend/
+node_agent/
+grafana/
+prometheus/
+traefik/
+_old_backup/
+_old_js_backup/
+*.md

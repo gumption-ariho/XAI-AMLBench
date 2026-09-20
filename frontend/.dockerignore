@@ -1,0 +1,5 @@
+node_modules
+.next
+preview
+_old_js_backup
+*.tsbuildinfo
