@@ -4,6 +4,21 @@
 > * (needs Node 18.18+) `cd frontend && npm install && npm run dev:demo` -> http://localhost:3000 (the real Next.js app on built-in sample data)
 > * or just open `frontend/preview/demo.html` in a browser (needs internet once, for React from a CDN)
 
+> **Python packages for local work:** one file, `requirements.txt` in the project root (it includes the four per-service
+> files). Install everything fast with `bash install_all_requirements_v2.sh`. The per-service files stay because each Docker
+> image installs only its own service's packages.
+
+## Connect everything (website + API + model + narratives) on a normal laptop, no GPU
+```bash
+.venv/bin/python -m gnn_aml_core.train --data data --out models        # once: the API serves ./models
+docker compose up -d                                                    # infrastructure
+# build ONE image at a time (kind to a slow connection), smallest first:
+docker compose build backend && docker compose build xai-narrative-lite && docker compose build gnn-detection-api && docker compose build frontend
+docker compose up -d gnn-detection-api backend xai-narrative-lite frontend node_agent
+python3 check_stack_v1.py                                               # tests every link and names the broken one
+```
+Then open http://localhost. (GPU machine with LLM narratives: use `--profile llm` instead of the lite service, not both.)
+
 ## 1. Start the infrastructure
 ```bash
 cp .env.example .env            # edit every change_me value

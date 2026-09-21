@@ -9,8 +9,9 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-NUM_RELATIONS = 4      # (domestic | cross-border) x (regular | large)
-EDGE_DIM = 4
+RELATIONS_BASE = 4     # (domestic | cross-border) x (regular | large)
+NUM_RELATIONS = 2 * RELATIONS_BASE   # x (forward | reverse copy of the transaction)
+EDGE_DIM = 5           # amount, cross-border, near-threshold, time, direction flag
 LARGE_TX = 8_000.0
 BURST_WINDOW_S = 6 * 3600
 
@@ -21,7 +22,7 @@ FEATURE_NAMES = [
     "flow_ratio", "retained_frac",
     "xb_out_ratio", "xb_in_ratio", "n_cp_countries",
     "near_thr_cnt", "near_thr_ratio", "burst_6h", "active_span_h",
-    "age_days", "is_offshore",
+    "age_days", "is_offshore", "kyc_risk",
     "type_individual", "type_business", "type_shell",
 ]
 _LOG_FEATURES = {
@@ -84,6 +85,7 @@ def build_node_features(accounts: pd.DataFrame, tx: pd.DataFrame, reporting_thre
     acc = accounts.set_index("account_id")
     df["age_days"] = ((t_ref - acc["opened_ts"]) / 86400.0).clip(lower=0).reindex(df.index)
     df["is_offshore"] = acc["country"].isin(OFFSHORE).astype(float).reindex(df.index)
+    df["kyc_risk"] = acc["risk_score"].reindex(df.index).fillna(0.0) if "risk_score" in acc.columns else 0.0
     for t in ("individual", "business", "shell"):
         df[f"type_{t}"] = (acc["account_type"] == t).astype(float).reindex(df.index)
 
@@ -111,3 +113,33 @@ def build_edge_features(tx: pd.DataFrame, reporting_threshold: float = 10_000.0)
     attr = np.stack([np.log1p(amt) / 12.0, tx["cross_border"].to_numpy(dtype=np.float64), near, tnorm], axis=1)
     etype = tx["cross_border"].to_numpy(dtype=np.int64) * 2 + (amt >= LARGE_TX).astype(np.int64)
     return attr.astype(np.float32), etype
+
+
+def make_bidirectional(src: np.ndarray, dst: np.ndarray, edge_attr: np.ndarray, edge_type: np.ndarray):
+    """Add a reversed copy of every transaction, flagged as reversed.
+
+    Message passing normally follows the edge direction, so an account would never hear from the accounts it SENDS to
+    (a mule paying a central account could not see that account). With the reverse copies every account sees all of its
+    neighbours, and the direction flag / relation id still tells the model which way the money went.
+
+    Returns (src2, dst2, edge_attr2 [2E, EDGE_DIM], edge_type2 [2E]). The first E rows are the original transactions,
+    the last E rows their reversed copies (so copy k+E is the reverse of transaction k).
+    """
+    e = len(src)
+    fwd = np.concatenate([edge_attr, np.zeros((e, 1), dtype=np.float32)], axis=1)
+    rev = np.concatenate([edge_attr, np.ones((e, 1), dtype=np.float32)], axis=1)
+    return (np.concatenate([src, dst]).astype(np.int64), np.concatenate([dst, src]).astype(np.int64),
+            np.concatenate([fwd, rev]).astype(np.float32), np.concatenate([edge_type, edge_type + RELATIONS_BASE]).astype(np.int64))
+
+
+def merge_reverse_copies(edge_ids, src_local, dst_local, importance, n_tx: int, top_k: int):
+    """Explanations run on the bidirectional graph. Fold each transaction's forward and reversed copy into ONE edge
+    (keeping the larger importance) and restore its true direction. Returns [(tx_index, src_local, dst_local, importance)]
+    sorted by importance, at most top_k."""
+    best: dict[int, tuple] = {}
+    for ge, s_l, d_l, imp in zip(edge_ids, src_local, dst_local, importance):
+        ge = int(ge)
+        tx, rev = ge % n_tx, ge >= n_tx
+        if tx not in best or float(imp) > best[tx][3]:
+            best[tx] = (tx, int(d_l) if rev else int(s_l), int(s_l) if rev else int(d_l), float(imp))
+    return sorted(best.values(), key=lambda r: -r[3])[:top_k]

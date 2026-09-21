@@ -4,7 +4,8 @@
 #   (none)  -> infra: traefik, kafka, postgres, redis, neo4j, immudb
 #   app     -> frontend, backend, node_agent           (ProjectXY legacy)
 #   ml      -> aml-synth-worker, gnn-detection-api
-#   llm     -> xai-narrative-api                       (needs NVIDIA GPU)
+#   llm     -> xai-narrative-api                       (LLM narratives, needs NVIDIA GPU)
+#   (the app profile already includes xai-narrative-lite: template narratives on CPU. Do not run it together with llm.)
 #   obs     -> prometheus-metrics, grafana-dashboard
 #
 # Examples:
@@ -36,9 +37,11 @@ services:
   # A. INGRESS & EVENT STREAMING
   # ------------------------------------------------------------------
   traefik-edge-router:            # Container 1
-    image: traefik:v3.1
+    image: traefik:v3
     restart: unless-stopped
     command: ["--configFile=/etc/traefik/traefik.yml"]
+    environment:
+      DOCKER_API_VERSION: "1.44"
     ports:
       - "80:80"
       - "8081:8081"               # Traefik dashboard (dev only)
@@ -215,6 +218,29 @@ services:
       - traefik.http.middlewares.xai-strip.stripprefix.prefixes=/xai
       - traefik.http.services.xai.loadbalancer.server.port=8000
     networks: [xai-net]
+
+  xai-narrative-lite:             # CPU-only narrative service (profile app): validated template narratives, no GPU needed
+    profiles: [app]
+    build:
+      context: .
+      dockerfile: xai_explainer/Dockerfile.lite
+    restart: unless-stopped
+    environment:
+      LLM_BACKEND: template
+      GNN_API_URL: http://gnn-detection-api:8000
+      IMMUDB_HOST: immudb-audit-ledger
+      IMMUDB_PORT: 3322
+      IMMUDB_ADMIN_PASSWORD: ${IMMUDB_ADMIN_PASSWORD}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.xai-lite.rule=Host(`${PUBLIC_HOST}`) && PathPrefix(`/xai`)
+      - traefik.http.routers.xai-lite.entrypoints=web
+      - traefik.http.routers.xai-lite.middlewares=xai-lite-strip
+      - traefik.http.middlewares.xai-lite-strip.stripprefix.prefixes=/xai
+      - traefik.http.services.xai-lite.loadbalancer.server.port=8000
+    networks:
+      xai-net:
+        aliases: [xai-narrative-api]     # the backend calls http://xai-narrative-api:8000 - this service answers to that name
 
   # ------------------------------------------------------------------
   # D. CACHING & SPECIALIZED STORAGE

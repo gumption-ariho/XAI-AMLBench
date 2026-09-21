@@ -1,0 +1,9 @@
+# CPU-only narrative service: no LLM, no GPU. Validated template narratives (see xai_explainer/sar_generator.py).
+fastapi
+uvicorn[standard]
+pydantic
+httpx
+networkx
+immudb-py
+prometheus-client
+prometheus-fastapi-instrumentator

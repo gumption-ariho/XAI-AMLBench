@@ -38,6 +38,7 @@ INDICATOR_PHRASES = {
     "type_shell": "shell or offshore account characteristics",
     "is_offshore": "shell or offshore account characteristics",
     "age_days": "a recently opened account",
+    "kyc_risk": "an elevated customer risk rating",
     "active_span_h": "a compressed period of activity",
 }
 _BANNED = ("guilty", "convicted", "criminal", "terrorist", "proves", "definitely")

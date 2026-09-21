@@ -1,4 +1,12 @@
-"""Export a SyntheticGraph to CSV, Kafka (transaction stream) and Neo4j (investigation graph)."""
+"""Export a SyntheticGraph to CSV, Parquet, JSON, Neo4j Cypher, a Kafka stream, or straight into Neo4j.
+
+    csv      accounts.csv + transactions.csv            (spreadsheet friendly)
+    parquet  accounts.parquet + transactions.parquet    (primary format for distributed processing; needs pyarrow)
+    json     graph_summary.json                         (metadata, schema, summary statistics)
+    cypher   import.cypher                              (run with: cypher-shell -f import.cypher)
+    kafka    transaction stream, in time order
+    neo4j    direct load into a running Neo4j
+"""
 from __future__ import annotations
 
 import json
@@ -12,14 +20,100 @@ log = logging.getLogger("aml_synth.exporters")
 TX_PROPS = ["tx_id", "amount", "currency", "payment_format", "timestamp",
             "cross_border", "is_laundering", "typology", "pattern_id"]
 
+SCHEMA = {
+    "accounts": {
+        "account_id": "string, unique id (ACC0000001)", "account_type": "individual | business | shell",
+        "country": "ISO-like country code (offshore set: VG KY PA SC BZ)", "opened_ts": "account opening time, unix seconds",
+        "risk_score": "0..1 KYC risk rating (a weak prior, not the label)", "is_suspicious": "1 if the account takes part in a laundering pattern",
+        "typology": "typology of the first pattern the account joined, or 'none'"},
+    "transactions": {
+        "tx_id": "string, unique", "src": "sending account_id", "dst": "receiving account_id", "amount": "USD",
+        "currency": "always USD", "payment_format": "wire | ach | card | cash | crypto_ramp", "timestamp": "unix seconds (UTC)",
+        "cross_border": "1 if sender and receiver countries differ", "is_laundering": "1 if part of an injected laundering pattern",
+        "typology": "smurfing | scatter_gather | cyclic_loop | shell_company | cross_border_velocity | none",
+        "pattern_id": "id of the injected pattern, -1 for ordinary traffic"},
+}
+
+
+def _out(out_dir) -> Path:
+    p = Path(out_dir)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
 
 # --------------------------------------------------------------------- CSV
 def export_csv(graph, out_dir: str = "data") -> None:
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    out = _out(out_dir)
     graph.accounts.to_csv(out / "accounts.csv", index=False)
     graph.transactions.to_csv(out / "transactions.csv", index=False)
     log.info("wrote %s/accounts.csv and %s/transactions.csv", out, out)
+
+
+# ----------------------------------------------------------------- Parquet
+def export_parquet(graph, out_dir: str = "data") -> None:
+    try:
+        import pyarrow  # noqa: F401
+    except ImportError as exc:
+        raise ImportError("Parquet export needs pyarrow:  pip install pyarrow") from exc
+    out = _out(out_dir)
+    graph.accounts.to_parquet(out / "accounts.parquet", index=False)
+    graph.transactions.to_parquet(out / "transactions.parquet", index=False)
+    log.info("wrote %s/accounts.parquet and %s/transactions.parquet", out, out)
+
+
+# -------------------------------------------------------------------- JSON
+def export_json(graph, out_dir: str = "data") -> None:
+    """Metadata + graph summary (not the full graph: use CSV/Parquet for that)."""
+    out = _out(out_dir)
+    doc = {
+        "name": "XAI-AMLBench synthetic transaction graph",
+        "generator_version": graph.config.get("generator_version"),
+        "license": "CC-BY-4.0 (data), MIT (code)",
+        "synthetic": True,
+        "contains_personal_data": False,
+        "config": {k: v for k, v in graph.config.items() if k not in ("generator_version",)},
+        "summary": graph.summary(),
+        "schema": SCHEMA,
+    }
+    (out / "graph_summary.json").write_text(json.dumps(doc, indent=2, default=str), encoding="utf-8")
+    log.info("wrote %s/graph_summary.json", out)
+
+
+# ------------------------------------------------------------------ Cypher
+def _lit(v) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int,)) or type(v).__name__.startswith(("int", "uint")):
+        return str(int(v))
+    if isinstance(v, float) or type(v).__name__.startswith("float"):
+        return repr(float(v))
+    return json.dumps(str(v), ensure_ascii=False)          # Cypher accepts JSON-style double-quoted strings
+
+
+def _map(row: dict, keys) -> str:
+    return "{" + ", ".join(f"{k}: {_lit(row[k])}" for k in keys) + "}"
+
+
+def export_cypher(graph, out_dir: str = "data", batch: int = 1000) -> None:
+    """Writes import.cypher: constraints + batched UNWIND statements. Run with `cypher-shell -f import.cypher`."""
+    out = _out(out_dir)
+    acc_keys = ["account_id", "account_type", "country", "opened_ts", "risk_score", "is_suspicious", "typology"]
+    tx_keys = ["src", "dst"] + TX_PROPS
+    accounts = graph.accounts[acc_keys].to_dict("records")
+    txs = graph.transactions[tx_keys].to_dict("records")
+    with open(out / "import.cypher", "w", encoding="utf-8") as f:
+        f.write("// XAI-AMLBench synthetic graph. Load with:  cypher-shell -u neo4j -p <password> -f import.cypher\n")
+        f.write("CREATE CONSTRAINT account_id IF NOT EXISTS FOR (a:Account) REQUIRE a.account_id IS UNIQUE;\n")
+        for i in range(0, len(accounts), batch):
+            rows = ",\n  ".join(_map(r, acc_keys) for r in accounts[i:i + batch])
+            f.write(f"UNWIND [\n  {rows}\n] AS row\nMERGE (a:Account {{account_id: row.account_id}}) SET a += row;\n")
+        for i in range(0, len(txs), batch):
+            rows = ",\n  ".join(_map(r, tx_keys) for r in txs[i:i + batch])
+            f.write("UNWIND [\n  " + rows + "\n] AS row\nMATCH (s:Account {account_id: row.src}), (d:Account {account_id: row.dst})\n"
+                    "CREATE (s)-[:TRANSFERRED {tx_id: row.tx_id, amount: row.amount, currency: row.currency, payment_format: row.payment_format, "
+                    "timestamp: row.timestamp, cross_border: row.cross_border, is_laundering: row.is_laundering, typology: row.typology, "
+                    "pattern_id: row.pattern_id}]->(d);\n")
+    log.info("wrote %s/import.cypher (%d accounts, %d transactions)", out, len(accounts), len(txs))
 
 
 # ------------------------------------------------------------------- Kafka
@@ -37,9 +131,7 @@ def export_kafka(graph, bootstrap: str | None = None, topic: str | None = None,
     for attempt in range(1, 16):
         try:
             producer = KafkaProducer(
-                bootstrap_servers=bootstrap,
-                acks="all",
-                linger_ms=20,
+                bootstrap_servers=bootstrap, acks="all", linger_ms=20,
                 value_serializer=lambda v: json.dumps(v, default=str).encode(),
                 key_serializer=lambda k: k.encode(),
             )

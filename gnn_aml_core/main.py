@@ -26,8 +26,9 @@ from fastapi import FastAPI, HTTPException, Query
 from prometheus_client import Counter, Gauge, Histogram
 from prometheus_fastapi_instrumentator import Instrumentator, metrics
 from pydantic import BaseModel, Field
-from torch_geometric.utils import k_hop_subgraph, subgraph
+from torch_geometric.utils import k_hop_subgraph
 
+from gnn_aml_core.features import merge_reverse_copies
 from gnn_aml_core.models import build_model
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -38,7 +39,7 @@ LATENCY_TARGET_MS = float(os.getenv("GNN_LATENCY_TARGET_MS", 100))
 AUC_TARGET = float(os.getenv("GNN_AUC_TARGET", 0.87))
 CACHE_TTL = int(os.getenv("PRED_CACHE_TTL", 300))
 REPORTING_THRESHOLD = float(os.getenv("REPORTING_THRESHOLD", 10_000))
-MAX_EXPLAIN_EDGES = 4000
+MAX_EXPLAIN_EDGES = 8000        # counts both the forward and the reversed copy of every transaction
 
 # ---- custom Prometheus metrics (scraped by prometheus-metrics -> Grafana) ----
 FLAGGED = Counter("aml_flagged_accounts_total", "Accounts scored above the alert threshold")
@@ -251,20 +252,15 @@ def explain(req: ExplainRequest):
     n = g["x"].size(0)
 
     with S.lock:
-        # Neighbourhood for the *narrative*: 2 hops in + 2 hops out. Extra edges cannot change the
-        # centre node's prediction (only its in-neighbourhood matters) and simply get ~0 importance.
-        s_in, *_ = k_hop_subgraph(idx, S.hops, g["edge_index"], flow="source_to_target", num_nodes=n)
-        s_out, *_ = k_hop_subgraph(idx, S.hops, g["edge_index"], flow="target_to_source", num_nodes=n)
-        subset = torch.unique(torch.cat([s_in, s_out]))
-        ei, ea, emask = subgraph(subset, g["edge_index"], g["edge_attr"], relabel_nodes=True,
-                                 num_nodes=n, return_edge_mask=True)
-        if ei.size(1) > MAX_EXPLAIN_EDGES:          # very large hub: fall back to in-neighbourhood only
-            subset = s_in
-            ei, ea, emask = subgraph(subset, g["edge_index"], g["edge_attr"], relabel_nodes=True,
-                                     num_nodes=n, return_edge_mask=True)
+        # The stored graph is bidirectional (every transaction also has a reversed copy), so a k-hop query
+        # returns the complete neighbourhood; very large hubs fall back to 1 hop.
+        subset, ei, mapping, emask = k_hop_subgraph(idx, S.hops, g["edge_index"], relabel_nodes=True, num_nodes=n)
+        if ei.size(1) > MAX_EXPLAIN_EDGES:
+            subset, ei, mapping, emask = k_hop_subgraph(idx, 1, g["edge_index"], relabel_nodes=True, num_nodes=n)
+        ea = g["edge_attr"][emask]
         et = g["edge_type"][emask]
         x_sub = g["x"][subset]
-        center = int((subset == idx).nonzero().view(-1)[0])
+        center = int(mapping[0])
 
         with torch.no_grad():
             score = float(torch.sigmoid(S.model(x_sub, ei, ea, et)[center]))
@@ -280,22 +276,21 @@ def explain(req: ExplainRequest):
         edge_imp = expl.edge_mask.detach().cpu()
         feat_imp = expl.node_mask[center].abs().detach().cpu()
 
-    global_edge_ids = emask.nonzero().view(-1)
-    order = torch.argsort(edge_imp, descending=True)[: req.top_k].tolist()
+    n_tx = int(g["n_tx"])
+    global_edge_ids = emask.nonzero().view(-1).numpy()
+    folded = merge_reverse_copies(global_edge_ids, ei[0].numpy(), ei[1].numpy(), edge_imp.numpy(), n_tx, req.top_k)
     node_ids = {center}
     edges = []
-    for e in order:
-        s_l, d_l = int(ei[0, e]), int(ei[1, e])
+    for tx, s_l, d_l, imp in folded:
         node_ids.update((s_l, d_l))
-        ge = int(global_edge_ids[e])
         edges.append({
-            "tx_id": g["tx_ids"][ge],
+            "tx_id": g["tx_ids"][tx],
             "src": g["account_ids"][int(subset[s_l])],
             "dst": g["account_ids"][int(subset[d_l])],
-            "amount": round(float(g["tx_amount"][ge]), 2),
-            "timestamp": int(g["tx_timestamp"][ge]),
-            "cross_border": int(g["tx_cross_border"][ge]),
-            "importance": round(float(edge_imp[e]), 5),
+            "amount": round(float(g["tx_amount"][tx]), 2),
+            "timestamp": int(g["tx_timestamp"][tx]),
+            "cross_border": int(g["tx_cross_border"][tx]),
+            "importance": round(imp, 5),
         })
     nodes = []
     for l in sorted(node_ids):

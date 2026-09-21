@@ -1,0 +1,14 @@
+# CPU-only variant of the narrative service (no vLLM, no GPU, small image, starts in seconds).
+# Build context = project root (see docker-compose.yml, service xai-narrative-lite).
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 LLM_BACKEND=template
+WORKDIR /app
+
+COPY xai_explainer/requirements.lite.txt xai_explainer/requirements.lite.txt
+RUN pip install -r xai_explainer/requirements.lite.txt
+
+COPY xai_explainer xai_explainer
+
+EXPOSE 8000
+CMD ["uvicorn", "xai_explainer.main:app", "--host", "0.0.0.0", "--port", "8000"]

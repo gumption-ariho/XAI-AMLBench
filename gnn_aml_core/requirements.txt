@@ -1,4 +1,4 @@
-# torch + CUDA come from the base image
+# torch (CPU build) is installed by the Dockerfile, numpy<2 pinned there
 fastapi
 uvicorn[standard]
 pydantic
