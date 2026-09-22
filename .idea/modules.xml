@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/XAI-AMLBench.iml" filepath="$PROJECT_DIR$/.idea/XAI-AMLBench.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/xai-amlbench.iml" filepath="$PROJECT_DIR$/.idea/xai-amlbench.iml" />
     </modules>
   </component>
 </project>

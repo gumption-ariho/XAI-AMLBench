@@ -121,7 +121,13 @@ def export_kafka(graph, bootstrap: str | None = None, topic: str | None = None,
                  rate_per_sec: float | None = None) -> None:
     """Stream transactions in time order. rate_per_sec=0 sends as fast as possible."""
     from kafka import KafkaProducer
-    from kafka.errors import NoBrokersAvailable
+    from kafka import errors as kafka_errors
+    # kafka-python has renamed/restructured this exception across major versions; try the classic name first,
+    # then a couple of plausible renames, and fall back to the library's own base exception class so the retry
+    # loop below still catches connection failures correctly even if none of the specific names match.
+    NoBrokersAvailable = (getattr(kafka_errors, "NoBrokersAvailable", None)
+                          or getattr(kafka_errors, "NoBrokersAvailableError", None)
+                          or getattr(kafka_errors, "KafkaError"))
 
     bootstrap = bootstrap or os.getenv("KAFKA_BOOTSTRAP", "apache-kafka:9092")
     topic = topic or os.getenv("KAFKA_TOPIC_TRANSACTIONS", "aml.transactions")

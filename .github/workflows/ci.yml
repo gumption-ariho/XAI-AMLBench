@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install CPU-only PyTorch
+        run: pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install the package (all extras, editable)
+        run: pip install -e ".[dev]"
+
+      - name: Run tests with coverage
+        run: pytest --cov --cov-report=term --cov-report=xml --cov-fail-under=80
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-py${{ matrix.python-version }}
+          path: coverage.xml
+
+  no-torch-smoke-test:
+    # Confirms that installing WITHOUT the [gnn] extra still works: aml_synth and xai_explainer, and the tests
+    # that don't need torch, run fine on a plain CPU-only install with no ML framework at all.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install the core package only (no gnn/xai extras)
+        run: pip install -e ".[test]"
+      - name: Generate a small synthetic graph
+        run: python -m aml_synth.graph_generator --accounts 500 --to csv --out /tmp/smoke
+      - name: Run the torch-independent tests
+        run: pytest tests/test_graph_generator.py tests/test_features.py tests/test_baselines.py tests/test_sar_generator.py -q

@@ -1,0 +1,10 @@
+# Local-development override: opens ONLY the three ports the venv-run services need, bound to 127.0.0.1 (this laptop only).
+# Use together with the main file, so the data volumes are kept:
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d database redis-feature-cache immudb-audit-ledger
+services:
+  database:
+    ports: ["127.0.0.1:15432:5432"]      # Postgres
+  redis-feature-cache:
+    ports: ["127.0.0.1:16379:6379"]      # Redis
+  immudb-audit-ledger:
+    ports: ["127.0.0.1:13322:3322"]      # immudb gRPC (the audit ledger)

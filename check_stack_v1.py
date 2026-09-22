@@ -4,6 +4,7 @@ check_stack_v1.py  -  is everything connected?  Tests the whole chain through th
 
     python3 check_stack_v1.py                          # http://localhost
     python3 check_stack_v1.py --base http://localhost --json stack_report.json
+    python3 check_stack_v1.py --base http://localhost:3000 --gnn http://127.0.0.1:8001 --xai http://127.0.0.1:8002   # services run by run_local.py
 
 The chain:   browser -> Traefik(:80) -> frontend (/)  and  backend (/api) -> GNN service (/gnn) + narrative service (/xai) -> Postgres
 
@@ -16,6 +17,7 @@ import json
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 RESULTS = []          # (status, name, detail, hint)
@@ -66,10 +68,32 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="http://localhost")
     ap.add_argument("--json", default="")
+    ap.add_argument("--traefik", default="", help="gateway dashboard/API URL (default: same host, port 8081)")
+    ap.add_argument("--gnn", default="", help="base URL of the model service when it runs outside Docker, e.g. http://127.0.0.1:8001")
+    ap.add_argument("--xai", default="", help="base URL of the narrative service when it runs outside Docker, e.g. http://127.0.0.1:8002")
     a = ap.parse_args()
     B = a.base
     state = {}
     print(f"XAI-AMLBench: stack check  ({B})\n" + "=" * 70)
+
+    u = urllib.parse.urlparse(B)
+    if u.port in (None, 80) or a.traefik:
+        print("\n0  Gateway routes (does Traefik see your containers?)")
+        tbase = a.traefik or f"{u.scheme}://{u.hostname}:8081"
+
+        def routes():
+            code, body, _ = call(tbase, "GET", "/api/http/routers")
+            if code != 200 or not isinstance(body, list):
+                return False, f"HTTP {code} from {tbase}/api/http/routers"
+            names = [r.get("name", "").split("@")[0] for r in body if r.get("name", "").endswith("@docker")]
+            want = {"frontend": "website", "backend": "backend API", "gnn": "model service"}
+            missing = [f"{k} ({v})" for k, v in want.items() if k not in names]
+            if not any(n.startswith("xai") for n in names):
+                missing.append("xai (narrative service)")
+            return not missing, (f"routes: {', '.join(sorted(names))}" if not missing else f"the gateway knows {len(names)} application route(s); missing: {', '.join(missing)}")
+        step("gateway has a route for every service", routes,
+             "the containers run but Traefik does not see them. With Docker Engine 29+ an old Traefik cannot talk to Docker: docker compose logs traefik-edge-router --tail 20 "
+             "(look for 'too old'). Fix: use a newer Traefik image (image: traefik:v3 in docker-compose.yml), docker compose pull traefik-edge-router, docker compose up -d traefik-edge-router. Also check that PUBLIC_HOST in .env matches the address you open.")
 
     print("\n1  Gateway and website")
     def front():
@@ -85,7 +109,7 @@ def main():
 
     print("\n3  GNN service (your trained model)")
     def gnn_health():
-        code, body, _ = call(B, "GET", "/gnn/health")
+        code, body, _ = call(a.gnn, "GET", "/health") if a.gnn else call(B, "GET", "/gnn/health")
         state["gnn_health"] = body
         return code == 200 and isinstance(body, dict) and bool(body.get("model_loaded")), body if code != 200 or not (isinstance(body, dict) and body.get("model_loaded")) else f"model {body.get('model')}, redis cache {'on' if body.get('redis') else 'off'}"
     step("GET /gnn/health: model loaded", gnn_health, "no model in ./models? run: python -m gnn_aml_core.train --data data --out models ; then docker compose restart gnn-detection-api")
@@ -124,7 +148,7 @@ def main():
         step("GNNExplainer returns a network (Network tab)", explain, "explanations need a GATv2 model; see docker compose logs gnn-detection-api --tail 40")
 
     def xai_health():
-        code, body, _ = call(B, "GET", "/xai/health")
+        code, body, _ = call(a.xai, "GET", "/health") if a.xai else call(B, "GET", "/xai/health")
         return code == 200 and isinstance(body, dict) and body.get("status") == "ok", f"backend '{body.get('backend')}'" if isinstance(body, dict) and code == 200 else f"HTTP {code}: {str(body)[:120]}"
     step("GET /xai/health: narrative service up", xai_health, "no narrative service. CPU-only machine: docker compose --profile app up -d --build (includes xai-narrative-lite); GPU machine: --profile llm")
 

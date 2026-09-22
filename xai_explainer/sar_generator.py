@@ -55,6 +55,27 @@ def infer_typology(subject: str, nodes: list[dict], edges: list[dict], threshold
     types = {n["account_id"]: n["account_type"] for n in nodes}
     countries = {n["account_id"]: n["country"] for n in nodes}
 
+    # Checked first: cross-border velocity has the most specific signature (one subject, many transactions,
+    # concentrated in a short window, spread across several countries), so it is checked before the shell-company
+    # and cyclic-loop checks below, which can otherwise fire on it by coincidence -- a handful of counterparties
+    # drawn from the general population will occasionally include 2+ shell accounts, and a subject that both pays
+    # and is paid by the same counterparty (common in bidirectional cross-border activity) trivially forms a
+    # 2-node cycle that is not the circular-fund-flow pattern the cyclic_loop check is meant to catch.
+    subj_edges = [e for e in edges if subject in (e["src"], e["dst"])]
+    if len(subj_edges) >= 10:
+        ts = sorted(e["timestamp"] for e in subj_edges)
+        cps = {e["dst"] if e["src"] == subject else e["src"] for e in subj_edges}
+        out_n = sum(1 for e in subj_edges if e["src"] == subject)
+        in_n = len(subj_edges) - out_n
+        # cross-border velocity is bidirectional by construction (the subject both sends and receives, roughly
+        # evenly), which tells it apart from a scatter_gather origin (pure fan-out, in_n == 0) or a smurfing hub
+        # (fan-in from dozens to thousands of mules, with only 1-3 outgoing transfers to beneficiaries -- an
+        # absolute floor like "at least 3" is not enough to rule that out, since 3 beneficiaries alone would pass
+        # it on a large hub, so the minority direction must also be a real share of the traffic, not a corner case).
+        minority = min(out_n, in_n)
+        bidirectional = minority >= 3 and minority / len(subj_edges) >= 0.15
+        if bidirectional and ts[-1] - ts[0] <= 5 * 24 * 3600 and len({countries.get(c) for c in cps} - {None}) >= 3:  # generator's velocity window is up to 96h
+            return "cross_border_velocity"
     if sum(1 for t in types.values() if t == "shell") >= 2:
         return "shell_company"
     if _has_cycle(g):
@@ -62,18 +83,23 @@ def infer_typology(subject: str, nodes: list[dict], edges: list[dict], threshold
     near = sum(1 for e in edges if 0.8 * threshold <= e["amount"] < threshold)
     if near >= 5 and near / len(edges) >= 0.5:      # structuring: most transfers sit just under the threshold
         return "smurfing"
+    # fan-in structuring: many distinct senders feeding one hub account, that hub receiving most of the traffic.
+    # (a second, amount-independent signature for smurfing: amounts are not always kept near the threshold, but
+    # the "many mules -> one collection account" shape survives regardless of the amount distribution used.)
+    in_by_dst: dict[str, set[str]] = {}
+    for e in edges:
+        in_by_dst.setdefault(e["dst"], set()).add(e["src"])
+    if in_by_dst:
+        hub, senders = max(in_by_dst.items(), key=lambda kv: len(kv[1]))
+        hub_edges = sum(1 for e in edges if e["dst"] == hub)
+        if len(senders) >= 15 and hub_edges / len(edges) >= 0.5:
+            return "smurfing"
     for n in g.nodes:
         succ = set(g.successors(n))
         if len(succ) >= 4:
             sinks = [set(g.successors(s)) for s in succ if g.out_degree(s)]
             if sinks and max(sum(1 for s in sinks if t in s) for t in set().union(*sinks)) >= max(3, len(succ) // 2):
                 return "scatter_gather"
-    subj_edges = [e for e in edges if subject in (e["src"], e["dst"])]
-    if len(subj_edges) >= 10:
-        ts = sorted(e["timestamp"] for e in subj_edges)
-        cps = {e["dst"] if e["src"] == subject else e["src"] for e in subj_edges}
-        if ts[-1] - ts[0] <= 12 * 3600 and len({countries.get(c) for c in cps} - {None}) >= 3:
-            return "cross_border_velocity"
     return "unclassified"
 
 
@@ -153,8 +179,8 @@ def render_fact_sheet(f: dict) -> str:
 # ----------------------------------------------------------------- narrative
 def template_narrative(f: dict) -> str:
     """Fully deterministic 4-sentence fallback (also the reference style for the LLM)."""
-    s1 = (f"Account {f['subject']} was flagged by the graph model with a risk score of {f['score_pct']} "
-          f"and is connected to {f['n_accounts']} accounts in activity consistent with {f['typology_label']}.")
+    s1 = (f"Account {f['subject']} was flagged (risk score {f['score_pct']}) and is linked to "
+          f"{f['n_accounts']} accounts in activity consistent with {f['typology_label']}.")
     when = f"on {f['start']}" if f["start"] == f["end"] else f"between {f['start']} and {f['end']}"
     s2 = (f"The reviewed network contains {f['n_tx']} transactions totaling {f['total']}, "
           f"occurring {when} over about {f['span_h']} hours.")
@@ -176,8 +202,8 @@ def template_narrative(f: dict) -> str:
     else:
         s3 = f"{f['n_cross']} of the {f['n_tx']} transactions were cross-border and the pattern deviates from expected account behavior."
     ind = _join(f["indicators"]) if f["indicators"] else "the overall transaction structure"
-    s4 = (f"Key model indicators include {ind}, and the activity is referred for compliance officer review "
-          "and potential Suspicious Activity Report filing.")
+    s4 = (f"Key indicators include {ind}, and the activity is referred for compliance review "
+          "and possible SAR filing.")
     return " ".join([s1, s2, s3, s4])
 
 

@@ -37,11 +37,11 @@ services:
   # A. INGRESS & EVENT STREAMING
   # ------------------------------------------------------------------
   traefik-edge-router:            # Container 1
-    image: traefik:v3
+    image: traefik:v3                 # v3.1 cannot talk to Docker Engine 29+ (API 1.24 rejected); current v3 negotiates the API version
     restart: unless-stopped
     command: ["--configFile=/etc/traefik/traefik.yml"]
     environment:
-      DOCKER_API_VERSION: "1.44"
+      DOCKER_API_VERSION: "1.44"      # Docker Engine 29+ refuses the old API version Traefik v3.1 uses; without this Traefik finds no containers
     ports:
       - "80:80"
       - "8081:8081"               # Traefik dashboard (dev only)

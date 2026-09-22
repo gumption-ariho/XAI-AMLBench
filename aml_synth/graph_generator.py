@@ -69,7 +69,8 @@ class GeneratorConfig:
         if self.n_patterns_per_typology is None:
             others, smurf = max(2, round(n / 450)), max(1, round(n / 5000))
         else:
-            others, smurf = int(self.n_patterns_per_typology), max(1, int(self.n_patterns_per_typology) // 10)
+            others = int(self.n_patterns_per_typology)
+            smurf = max(1, others // 10) if others > 0 else 0
         return {"background_tx": int(bg), "smurfing": smurf, "scatter_gather": others, "cyclic_loop": others,
                 "shell_company": others, "cross_border_velocity": others}
 

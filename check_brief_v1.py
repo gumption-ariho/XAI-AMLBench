@@ -339,7 +339,18 @@ def section_f():
     tests = glob.glob(str(ROOT / "tests" / "**" / "test_*.py"), recursive=True)
     rec(S, len(tests) > 0, "tests/ folder contains pytest tests", f"{len(tests)} test file(s)")
     for mod in ("aml_synth", "gnn_aml_core", "xai_explainer"):
-        rec(S, any(mod.split("_")[0] in Path(t).name or mod in Path(t).name for t in tests), f"at least one test file for {mod}")
+        # Match by what the test file actually imports, not by filename substring: a sensibly-named test file
+        # (test_graph_generator.py, testing aml_synth.graph_generator) need not contain the package name at all.
+        found = False
+        for t in tests:
+            try:
+                src = Path(t).read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            if re.search(rf"\b(from|import)\s+{re.escape(mod)}\b", src):
+                found = True
+                break
+        rec(S, found, f"at least one test file for {mod}")
     try:
         import pytest  # noqa: F401
         import pytest_cov  # noqa: F401

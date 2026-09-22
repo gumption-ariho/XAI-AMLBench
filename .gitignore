@@ -9,3 +9,7 @@ node_modules/
 *.tsbuildinfo
 _old_backup/
 _old_js_backup/
+hub/metrics/metrics.csv
+.pytest_cache/
+.coverage
+htmlcov/

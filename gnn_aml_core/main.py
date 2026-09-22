@@ -28,8 +28,8 @@ from prometheus_fastapi_instrumentator import Instrumentator, metrics
 from pydantic import BaseModel, Field
 from torch_geometric.utils import k_hop_subgraph
 
-from gnn_aml_core.features import merge_reverse_copies
 from gnn_aml_core.models import build_model
+from xai_explainer.extractor import extract_explanation
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("gnn_aml_core.api")
@@ -246,67 +246,18 @@ def explain(req: ExplainRequest):
     _require_model()
     if S.ckpt["model_name"] != "gatv2":
         raise HTTPException(501, "GNNExplainer is wired for the GATv2 model. Train with --model gatv2.")
-    from torch_geometric.explain import Explainer, GNNExplainer
-
-    g, idx = S.g, _idx(req.account_id)
-    n = g["x"].size(0)
+    _idx(req.account_id)  # 404 if unknown, before we take the lock
 
     with S.lock:
-        # The stored graph is bidirectional (every transaction also has a reversed copy), so a k-hop query
-        # returns the complete neighbourhood; very large hubs fall back to 1 hop.
-        subset, ei, mapping, emask = k_hop_subgraph(idx, S.hops, g["edge_index"], relabel_nodes=True, num_nodes=n)
-        if ei.size(1) > MAX_EXPLAIN_EDGES:
-            subset, ei, mapping, emask = k_hop_subgraph(idx, 1, g["edge_index"], relabel_nodes=True, num_nodes=n)
-        ea = g["edge_attr"][emask]
-        et = g["edge_type"][emask]
-        x_sub = g["x"][subset]
-        center = int(mapping[0])
+        try:
+            result = extract_explanation(
+                S.model, S.g, S.ckpt["feature_names"], req.account_id,
+                hops=S.hops, reporting_threshold=REPORTING_THRESHOLD,
+                top_k=req.top_k, epochs=req.epochs, max_explain_edges=MAX_EXPLAIN_EDGES,
+            )
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
 
-        with torch.no_grad():
-            score = float(torch.sigmoid(S.model(x_sub, ei, ea, et)[center]))
-        explainer = Explainer(
-            model=S.model,
-            algorithm=GNNExplainer(epochs=req.epochs),
-            explanation_type="model",
-            node_mask_type="attributes",
-            edge_mask_type="object",
-            model_config=dict(mode="binary_classification", task_level="node", return_type="raw"),
-        )
-        expl = explainer(x_sub, ei, index=center, edge_attr=ea, edge_type=et)
-        edge_imp = expl.edge_mask.detach().cpu()
-        feat_imp = expl.node_mask[center].abs().detach().cpu()
-
-    n_tx = int(g["n_tx"])
-    global_edge_ids = emask.nonzero().view(-1).numpy()
-    folded = merge_reverse_copies(global_edge_ids, ei[0].numpy(), ei[1].numpy(), edge_imp.numpy(), n_tx, req.top_k)
-    node_ids = {center}
-    edges = []
-    for tx, s_l, d_l, imp in folded:
-        node_ids.update((s_l, d_l))
-        edges.append({
-            "tx_id": g["tx_ids"][tx],
-            "src": g["account_ids"][int(subset[s_l])],
-            "dst": g["account_ids"][int(subset[d_l])],
-            "amount": round(float(g["tx_amount"][tx]), 2),
-            "timestamp": int(g["tx_timestamp"][tx]),
-            "cross_border": int(g["tx_cross_border"][tx]),
-            "importance": round(imp, 5),
-        })
-    nodes = []
-    for l in sorted(node_ids):
-        gi = int(subset[l])
-        nodes.append({"account_id": g["account_ids"][gi], "account_type": g["account_type"][gi],
-                      "country": g["country"][gi]})
-
-    total = float(feat_imp.sum()) or 1.0
-    top = torch.argsort(feat_imp, descending=True)[:6].tolist()
-    top_features = [{"feature": S.ckpt["feature_names"][i], "weight": round(float(feat_imp[i]) / total, 4)}
-                    for i in top if feat_imp[i] > 0]
-
-    audit("explanation_generated", {"account_id": req.account_id, "score": round(score, 5),
-                                    "n_edges": len(edges), "method": "GNNExplainer"})
-    return {
-        "account_id": req.account_id, "risk_score": round(score, 5), "threshold": S.ckpt["threshold"],
-        "reporting_threshold": REPORTING_THRESHOLD, "model": S.ckpt["model_name"],
-        "method": "GNNExplainer", "nodes": nodes, "edges": edges, "top_features": top_features,
-    }
+    audit("explanation_generated", {"account_id": req.account_id, "score": result["risk_score"],
+                                    "n_edges": len(result["edges"]), "method": "GNNExplainer"})
+    return {**result, "threshold": S.ckpt["threshold"], "model": S.ckpt["model_name"], "method": "GNNExplainer"}
