@@ -40,6 +40,9 @@ AUC_TARGET = float(os.getenv("GNN_AUC_TARGET", 0.87))
 CACHE_TTL = int(os.getenv("PRED_CACHE_TTL", 300))
 REPORTING_THRESHOLD = float(os.getenv("REPORTING_THRESHOLD", 10_000))
 MAX_EXPLAIN_EDGES = 8000        # counts both the forward and the reversed copy of every transaction
+MAX_SCORE_EDGES = int(os.getenv("MAX_SCORE_EDGES", 30_000))   # higher budget than explaining: one forward pass
+                                                                # is far cheaper per edge than GNNExplainer's
+                                                                # repeated optimisation passes
 
 # ---- custom Prometheus metrics (scraped by prometheus-metrics -> Grafana) ----
 FLAGGED = Counter("aml_flagged_accounts_total", "Accounts scored above the alert threshold")
@@ -55,6 +58,7 @@ class State:
     g: dict | None = None
     id2idx: dict[str, int] = {}
     hops = 2
+    calibrator = None             # set at load time: Calibrator from the checkpoint, or an identity fallback
     redis = None
     immu = None
     lock = threading.Lock()      # torch modules + GNNExplainer mask hooks are not thread-safe
@@ -75,6 +79,10 @@ def _load_model() -> None:
     model = build_model(ckpt["model_name"], ckpt["in_dim"], **ckpt["hparams"])
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
+    from gnn_aml_core.calibration import Calibrator
+    # Older checkpoints (trained before calibration was added) have no "calibration" key: fall back to an
+    # identity mapping so loading an old model.pt still works, just without the calibration benefit.
+    S.calibrator = Calibrator.from_dict(ckpt["calibration"]) if "calibration" in ckpt else Calibrator.identity()
     S.model, S.ckpt, S.g = model, ckpt, g
     S.id2idx = {a: i for i, a in enumerate(g["account_ids"])}
     S.hops = int(ckpt["hparams"].get("num_layers", 2))
@@ -162,11 +170,23 @@ def audit(kind: str, payload: dict) -> None:
 
 
 def _score(indices: list[int]) -> list[float]:
-    """Run the model on the union of the k-hop in-neighbourhoods of the requested nodes."""
+    """Run the model on the union of the k-hop in-neighbourhoods of the requested nodes.
+
+    Falls back to fewer hops if the combined subgraph would be unreasonably large: without this, a single
+    /predict request for an account near a high-degree hub (e.g. a smurfing collection account with thousands
+    of transactions) pulls in the hub's entire neighbourhood and can turn one request that should take
+    milliseconds into one that takes seconds. Mirrors the same protection /explain already has (MAX_EXPLAIN_EDGES),
+    just with a higher budget, since a single forward pass is far cheaper per edge than GNNExplainer's repeated
+    optimisation passes. Reducing hops does reduce the model's receptive field for that call -- a deliberate,
+    rare trade-off for the handful of very large hub accounts, not something that affects ordinary accounts."""
     g = S.g
+    idx_t = torch.tensor(indices)
     with S.lock, torch.no_grad():
-        subset, ei, mapping, emask = k_hop_subgraph(
-            torch.tensor(indices), S.hops, g["edge_index"], relabel_nodes=True, num_nodes=g["x"].size(0))
+        hops = S.hops
+        subset, ei, mapping, emask = k_hop_subgraph(idx_t, hops, g["edge_index"], relabel_nodes=True, num_nodes=g["x"].size(0))
+        while ei.size(1) > MAX_SCORE_EDGES and hops > 1:
+            hops -= 1
+            subset, ei, mapping, emask = k_hop_subgraph(idx_t, hops, g["edge_index"], relabel_nodes=True, num_nodes=g["x"].size(0))
         out = S.model(g["x"][subset], ei, g["edge_attr"][emask], g["edge_type"][emask])
         return torch.sigmoid(out[mapping]).tolist()
 
@@ -230,15 +250,20 @@ def predict(req: PredictRequest):
     results = []
     for a, (p, cached) in scores.items():
         flagged = p >= thr
-        results.append({"account_id": a, "score": round(p, 5), "flagged": flagged, "cached": cached})
+        # "score" (raw) drives the flagged decision and stays backward-compatible; "calibrated_score" is the
+        # same account mapped through isotonic calibration -- meaningful as a probability, meant for display
+        # (a risk gauge, a narrative's "risk score: X%"), and never used for the flagged decision itself, so
+        # existing behaviour and caching (keyed on the raw score) are unaffected.
+        results.append({"account_id": a, "score": round(p, 5), "calibrated_score": round(S.calibrator(p), 5),
+                        "flagged": flagged, "cached": cached})
         if flagged:
             FLAGGED.inc()
             audit("inference_flagged", {"account_id": a, "score": round(p, 5),
                                         "model": S.ckpt["model_name"], "threshold": thr})
     dt = time.perf_counter() - t0
     INFER_LAT.observe(dt)
-    return {"results": results, "threshold": thr, "latency_ms": round(dt * 1000, 2),
-            "meets_latency_target": dt * 1000 <= LATENCY_TARGET_MS}
+    return {"results": results, "threshold": thr, "calibrated_threshold": S.ckpt.get("calibrated_threshold", thr),
+            "latency_ms": round(dt * 1000, 2), "meets_latency_target": dt * 1000 <= LATENCY_TARGET_MS}
 
 
 @app.post("/explain")
@@ -260,4 +285,9 @@ def explain(req: ExplainRequest):
 
     audit("explanation_generated", {"account_id": req.account_id, "score": result["risk_score"],
                                     "n_edges": len(result["edges"]), "method": "GNNExplainer"})
-    return {**result, "threshold": S.ckpt["threshold"], "model": S.ckpt["model_name"], "method": "GNNExplainer"}
+    # Replace the raw risk_score with its calibrated value for display (a risk gauge showing "99.9%" for
+    # every flagged account is not informative); the paired threshold is calibrated the same way, so anything
+    # comparing risk_score against threshold stays on a consistent scale. The raw value stays available as
+    # raw_risk_score for anyone who needs the model's unmodified output (e.g. audit records already logged it).
+    return {**result, "risk_score": round(S.calibrator(result["risk_score"]), 5), "raw_risk_score": result["risk_score"],
+            "threshold": S.ckpt.get("calibrated_threshold", S.ckpt["threshold"]), "model": S.ckpt["model_name"], "method": "GNNExplainer"}

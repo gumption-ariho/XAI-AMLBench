@@ -371,13 +371,13 @@ export default function Home(): ReactElement {
       )}
       {scan !== null && busy !== "scan" && (
         <div className="scan-result rise">
-          <RiskGauge key={`${scan.account_id}-${scan.score}`} score={scan.score} threshold={scan.threshold} />
+          <RiskGauge key={`${scan.account_id}-${scan.score}`} score={scan.calibrated_score ?? scan.score} threshold={scan.calibrated_threshold ?? scan.threshold} />
           <div className="scan-meta">
             <div className={`verdict ${scan.flagged ? "bad" : "good"}`}>
               {scan.flagged ? "Flagged: suspicious pattern" : "Below alert threshold"}
             </div>
             <p className="muted">
-              {scan.account_id} · threshold {pct(scan.threshold)} · inference {scan.latency_ms} ms
+              {scan.account_id} · threshold {pct(scan.calibrated_threshold ?? scan.threshold)} · inference {scan.latency_ms} ms
               {scan.latency_ms <= latencyTarget && <span className="ok-text"> ✓ within {latencyTarget} ms target</span>}
             </p>
             <div className="row">

@@ -134,7 +134,8 @@ def main():
         ok = code == 200 and isinstance(body, dict) and body.get("flagged") and body.get("alert")
         if ok:
             state["alert"] = body["alert"]["id"]
-        return ok, (f"score {body['score']:.3f} (threshold {body['threshold']:.2f}), model {body['latency_ms']} ms, round trip {dt:.0f} ms, alert #{body['alert']['id']}" if ok
+        return ok, (f"score {body['score']:.3f} (calibrated {body.get('calibrated_score', body['score']):.3f}), threshold {body['threshold']:.2f}, "
+                    f"model {body['latency_ms']} ms, round trip {dt:.0f} ms, alert #{body['alert']['id']}" if ok
                     else f"HTTP {code}: {str(body)[:200]}")
     if "acct" in state:
         step("POST /api/alerts/scan flags a suspicious account and creates an alert", scan, "check docker compose logs gnn-detection-api --tail 30")

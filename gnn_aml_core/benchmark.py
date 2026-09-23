@@ -9,8 +9,13 @@ all of the brief's targets were met at the same time.
     python -m gnn_aml_core.benchmark --seeds 5 --models gatv2,rgcn     # both architectures
     python -m gnn_aml_core.benchmark --seeds 3 --no-gnn                # baselines only (fast, no PyTorch needed)
     python -m gnn_aml_core.benchmark --seeds 5 --camouflage 3.0        # a different difficulty level
+    python -m gnn_aml_core.benchmark --accounts 20000 --seeds 5        # a large, slow, overnight-scale run
 
-Writes benchmarks/results.json (every number, every seed) and benchmarks/results.md (paste-ready table).
+Writes benchmarks/results.json (every number, every seed) and benchmarks/results.md (paste-ready table) AFTER
+EVERY SEED, not just at the end -- a large run can take hours, and a laptop going to sleep, losing power, or the
+process being interrupted for any reason should not throw away seeds that already finished. Re-running the exact
+same command automatically picks up where it left off (matched by output directory, account count, camouflage,
+hard-negative ratio and model list); pass --fresh to ignore any partial results and start over.
 """
 from __future__ import annotations
 
@@ -77,6 +82,47 @@ def markdown_table(agg: dict, per_seed: list, meta: dict) -> str:
     return "\n".join(lines)
 
 
+def config_fingerprint(a) -> dict:
+    """The settings that must match for a saved partial run to be safely resumed -- mixing seeds generated
+    under different account counts, difficulty settings or model lists into one aggregate would be meaningless."""
+    return {"accounts": a.accounts, "camouflage": a.camouflage, "hard_negatives": a.hard_negatives, "models": a.models, "no_gnn": a.no_gnn}
+
+
+def load_resumable(out_dir: Path, fingerprint: dict) -> tuple[list, list]:
+    """Load a previous run's per-seed results from this output directory, if any, and if its configuration
+    matches. Returns (per_seed, seed_info) already completed, or ([], []) if there is nothing to resume from."""
+    p = out_dir / "results.json"
+    if not p.exists():
+        return [], []
+    try:
+        saved = json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError):
+        log.warning("could not read %s (corrupted?) -- starting fresh", p)
+        return [], []
+    if saved.get("fingerprint") != fingerprint:
+        log.info("found a previous run in %s with different settings -- starting fresh rather than mixing incompatible seeds", out_dir)
+        return [], []
+    return saved.get("per_seed", []), saved.get("seed_info", [])
+
+
+def save_progress(out: Path, per_seed: list, extra: list, fingerprint: dict, t_all: float, final: bool) -> None:
+    if not per_seed:
+        return
+    agg = aggregate(per_seed)
+    meta = {"accounts": fingerprint["accounts"], "camouflage": fingerprint["camouflage"],
+            "hard_negatives": fingerprint["hard_negatives"], "seeds": [e["seed"] for e in extra]}
+    md = markdown_table(agg, per_seed, meta)
+    if final:
+        print("\n" + md + "\n")
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "results.md").write_text(md + "\n", encoding="utf-8")
+    (out / "results.json").write_text(json.dumps({"fingerprint": fingerprint, "meta": meta, "per_seed": per_seed, "seed_info": extra,
+                                                  "aggregate": {k: {m: {"mean": v[0], "std": v[1]} for m, v in row.items()} for k, row in agg.items()},
+                                                  "complete": final}, indent=2, default=float), encoding="utf-8")
+    log.info("%s %s and %s (%d/%d seeds so far, %.0fs elapsed)", "saved" if final else "checkpointed",
+             out / "results.md", out / "results.json", len(per_seed), len(extra), time.time() - t_all)
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     ap = argparse.ArgumentParser(description="Multi-seed benchmark of the GNN against the baselines")
@@ -91,12 +137,22 @@ def main() -> None:
     ap.add_argument("--pos-weight", type=float, default=None)
     ap.add_argument("--no-gnn", action="store_true", help="baselines only")
     ap.add_argument("--out", default="benchmarks")
+    ap.add_argument("--fresh", action="store_true", help="ignore any previous partial run in --out and start over")
     a = ap.parse_args()
 
-    per_seed, extra = [], []
+    out = Path(a.out)
+    fingerprint = config_fingerprint(a)
+    per_seed, extra = ([], []) if a.fresh else load_resumable(out, fingerprint)
+    done_seeds = {e["seed"] for e in extra}
+    if done_seeds:
+        log.info("resuming: %d seed(s) already completed in %s (%s) -- skipping those, continuing with the rest",
+                 len(done_seeds), out, sorted(done_seeds))
+
     t_all = time.time()
     for i in range(a.seeds):
         seed = a.seed0 + i
+        if seed in done_seeds:
+            continue
         t0 = time.time()
         graph = AMLGraphGenerator(GeneratorConfig(n_accounts=a.accounts, seed=seed, camouflage=a.camouflage,
                                                   hard_negative_ratio=a.hard_negatives)).generate()
@@ -115,18 +171,12 @@ def main() -> None:
         extra.append(info)
         summary = "  ".join(f"{k.split(' (')[0][:22]} AUC {v['auc_roc']:.3f}" for k, v in rows.items() if k.startswith("GNN") or "neighbour" in k)
         log.info("seed %d done in %.0fs  |  %s", seed, time.time() - t0, summary)
+        save_progress(out, per_seed, extra, fingerprint, t_all, final=False)
 
-    agg = aggregate(per_seed)
-    meta = {"accounts": a.accounts, "camouflage": a.camouflage, "hard_negatives": a.hard_negatives, "seeds": [e["seed"] for e in extra]}
-    md = markdown_table(agg, per_seed, meta)
-    print("\n" + md + "\n")
-    out = Path(a.out)
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "results.md").write_text(md + "\n", encoding="utf-8")
-    (out / "results.json").write_text(json.dumps({"config": vars(a), "meta": meta, "per_seed": per_seed, "seed_info": extra,
-                                                  "aggregate": {k: {m: {"mean": v[0], "std": v[1]} for m, v in row.items()} for k, row in agg.items()}},
-                                                 indent=2, default=float), encoding="utf-8")
-    log.info("saved %s and %s  (total %.0f s)", out / "results.md", out / "results.json", time.time() - t_all)
+    if not any(seed not in done_seeds for seed in range(a.seed0, a.seed0 + a.seeds)):
+        log.info("all %d requested seed(s) were already completed in %s -- nothing new to do (pass --fresh to redo them)", a.seeds, out)
+
+    save_progress(out, per_seed, extra, fingerprint, t_all, final=True)
 
 
 if __name__ == "__main__":

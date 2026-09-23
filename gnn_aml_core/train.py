@@ -96,6 +96,7 @@ def fit_gnn(arrays: dict, tr, va, te, *, model_name: str = "gatv2", hidden: int 
     """
     import torch
     from sklearn.metrics import roc_auc_score
+    from gnn_aml_core.calibration import brier_score, expected_calibration_error, fit_calibrator
     from gnn_aml_core.models import build_model, class_weighted_bce
 
     torch.manual_seed(seed)
@@ -140,8 +141,22 @@ def fit_gnn(arrays: dict, tr, va, te, *, model_name: str = "gatv2", hidden: int 
     model.eval()
     with torch.no_grad():
         prob = torch.sigmoid(forward()).cpu().numpy()
+
+    # Calibration: fit on the VALIDATION split only, then measure its effect on the untouched test split. This
+    # never changes ranking metrics (AUC-ROC, PR-AUC, precision/recall at the chosen threshold all depend only
+    # on score ORDER, not absolute value) -- it only makes the score meaningful as a probability, which matters
+    # for anything that displays it (a risk gauge, a narrative's "risk score: X%").
+    calibrator = fit_calibrator(prob[va], y_np[va])
+    calibration_report = {
+        "ece_before": expected_calibration_error(prob[te], y_np[te]),
+        "ece_after": expected_calibration_error(calibrator(prob[te]), y_np[te]),
+        "brier_before": brier_score(prob[te], y_np[te]),
+        "brier_after": brier_score(calibrator(prob[te]), y_np[te]),
+    }
+
     return {"report": full_report(y_np[va], prob[va], y_np[te], prob[te]), "best_val_auc": best_auc, "best_epoch": best_epoch,
-            "epochs_run": epoch, "state_dict": {k: v.cpu() for k, v in best_state.items()}, "hparams": hp}
+            "epochs_run": epoch, "state_dict": {k: v.cpu() for k, v in best_state.items()}, "hparams": hp,
+            "calibrator": calibrator, "calibration_report": calibration_report}
 
 
 def main() -> None:
@@ -176,6 +191,7 @@ def main() -> None:
         "val_auc_roc": res["best_val_auc"], "best_epoch": res["best_epoch"], "test_auc_roc": rep["auc_roc"], "test_pr_auc": rep["pr_auc"],
         "test_precision": rep["precision"], "test_recall": rep["recall"], "test_f1": rep["f1"], "test_fpr": rep["fpr"],
         "threshold": rep["threshold"], "auc_target": a.auc_target, "meets_auc_target": bool(rep["auc_roc"] >= a.auc_target),
+        **{f"calibration_{k}": v for k, v in res["calibration_report"].items()},
     }
 
     table = {f"GNN ({a.model.upper()}, best epoch {res['best_epoch']})": rep}
@@ -186,13 +202,18 @@ def main() -> None:
         table.update(baselines)
     log.info("TEST SET RESULTS (threshold chosen on validation)\n%s", format_table(table))
     log.info("GNN meets the AUC target of %.2f: %s", a.auc_target, metrics["meets_auc_target"])
+    cr = res["calibration_report"]
+    log.info("calibration: ECE %.4f -> %.4f, Brier %.4f -> %.4f (raw score is uncalibrated; use 'calibrated_score' at serving time)",
+             cr["ece_before"], cr["ece_after"], cr["brier_before"], cr["brier_after"])
 
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
+    calibrated_threshold = float(res["calibrator"](metrics["threshold"]))
     torch.save({
         "model_name": a.model, "hparams": hp, "in_dim": arrays["x"].shape[1], "state_dict": res["state_dict"],
         "feature_names": arrays["feature_names"], "mean": torch.from_numpy(arrays["mean"]), "std": torch.from_numpy(arrays["std"]),
         "threshold": metrics["threshold"], "metrics": metrics,
+        "calibration": res["calibrator"].to_dict(), "calibrated_threshold": calibrated_threshold,
     }, out / "gnn_model.pt")
     graph = {k: torch.from_numpy(np.array(arrays[k])) for k in ("x", "edge_index", "edge_attr", "edge_type", "y", "tx_amount", "tx_timestamp", "tx_cross_border")}
     graph.update({k: arrays[k] for k in ("account_ids", "account_type", "country", "tx_ids", "feature_names", "n_tx")})

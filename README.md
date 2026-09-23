@@ -109,6 +109,7 @@ run straight from `.venv` and `frontend/node_modules`.
 docker compose -f docker-compose.yml -f docker-compose.local.yml up -d database redis-feature-cache immudb-audit-ledger
 python3 run_local.py                                                    # model :8001, narratives :8002, backend :8000, website :3000
 python3 check_stack_v1.py --base http://localhost:3000 --gnn http://127.0.0.1:8001 --xai http://127.0.0.1:8002
+python3 check_latency_v1.py --gnn http://127.0.0.1:8001                # cold/warm p50/p95/p99 vs the 100ms target
 ```
 Open http://localhost:3000. Ctrl+C stops everything; `python3 run_local.py --stop` cleans up leftovers.
 

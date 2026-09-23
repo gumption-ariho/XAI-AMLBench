@@ -1,0 +1,16 @@
+
+> xai-amlbench-frontend@0.2.0 dev
+> next dev -p 3000
+
+   ▲ Next.js 15.5.21
+   - Local:        http://localhost:3000
+   - Network:      http://192.168.210.242:3000
+
+ ✓ Starting...
+ ✓ Ready in 10.4s
+ ○ Compiling / ...
+ ✓ Compiled / in 3.8s (553 modules)
+ GET / 200 in 190ms
+ GET / 200 in 542ms
+ GET / 200 in 233ms
+ GET / 200 in 2098ms

@@ -1,10 +1,13 @@
 """Tests for the pure, torch-free logic in gnn_aml_core.benchmark: aggregation, paired comparison, target
 counting and the markdown table. `main()` itself runs the full generate -> train -> evaluate pipeline and needs
 PyTorch; it is exercised end to end by running `python -m gnn_aml_core.benchmark` manually, not by this suite."""
+import json
+
 import numpy as np
 import pytest
 
-from gnn_aml_core.benchmark import TARGETS, aggregate, markdown_table, meets_targets, paired, strongest_baseline
+from gnn_aml_core.benchmark import (TARGETS, aggregate, config_fingerprint, load_resumable, markdown_table,
+                                    meets_targets, paired, save_progress, strongest_baseline)
 
 
 def row(auc, precision, recall, f1, fpr, pr_auc=0.9):
@@ -104,3 +107,76 @@ class TestMarkdownTable:
         md = markdown_table(agg, PER_SEED, {"accounts": 5000, "camouflage": 1.5})
         assert "3 seeds" in md
         assert "5,000 accounts" in md
+
+
+class _FakeArgs:
+    """Stand-in for the argparse Namespace, with just the fields config_fingerprint reads."""
+    accounts = 5000
+    camouflage = 1.5
+    hard_negatives = 2.0
+    models = "gatv2"
+    no_gnn = False
+
+
+class TestConfigFingerprint:
+    def test_captures_the_settings_that_must_match_to_resume(self):
+        fp = config_fingerprint(_FakeArgs())
+        assert fp == {"accounts": 5000, "camouflage": 1.5, "hard_negatives": 2.0, "models": "gatv2", "no_gnn": False}
+
+
+class TestResumeAndCheckpointing:
+    """A large multi-seed run can take hours; these protect against losing completed seeds if it is interrupted."""
+
+    def test_no_previous_run_returns_nothing_to_resume(self, tmp_path):
+        per_seed, extra = load_resumable(tmp_path, config_fingerprint(_FakeArgs()))
+        assert per_seed == [] and extra == []
+
+    def test_a_checkpointed_run_can_be_loaded_back(self, tmp_path):
+        fp = config_fingerprint(_FakeArgs())
+        save_progress(tmp_path, [PER_SEED[0]], [{"seed": 1, "nodes": 100, "positive_rate": 0.08}], fp, 0, final=False)
+        per_seed, extra = load_resumable(tmp_path, fp)
+        assert len(per_seed) == 1
+        assert {e["seed"] for e in extra} == {1}
+
+    def test_mismatched_configuration_is_not_resumed(self, tmp_path):
+        fp = config_fingerprint(_FakeArgs())
+        save_progress(tmp_path, [PER_SEED[0]], [{"seed": 1, "nodes": 100, "positive_rate": 0.08}], fp, 0, final=False)
+
+        class DifferentArgs(_FakeArgs):
+            accounts = 20000
+
+        per_seed, extra = load_resumable(tmp_path, config_fingerprint(DifferentArgs()))
+        assert per_seed == [] and extra == []  # a 20k-account run must never silently merge with 5k-account seeds
+
+    def test_corrupted_results_file_starts_fresh_instead_of_raising(self, tmp_path):
+        (tmp_path / "results.json").write_text("not valid json{{{")
+        per_seed, extra = load_resumable(tmp_path, config_fingerprint(_FakeArgs()))
+        assert per_seed == [] and extra == []
+
+    def test_save_progress_with_no_seeds_yet_writes_nothing(self, tmp_path):
+        save_progress(tmp_path, [], [], config_fingerprint(_FakeArgs()), 0, final=True)
+        assert not (tmp_path / "results.json").exists()
+
+    def test_crash_then_resume_gives_the_same_final_aggregate_as_one_uninterrupted_run(self, tmp_path):
+        fp = config_fingerprint(_FakeArgs())
+        # "crash" after the first seed
+        save_progress(tmp_path, [PER_SEED[0]], [{"seed": 1, "nodes": 100, "positive_rate": 0.08}], fp, 0, final=False)
+        # "resume": load what is there, add the remaining seeds, finalise
+        per_seed, extra = load_resumable(tmp_path, fp)
+        per_seed += [PER_SEED[1], PER_SEED[2]]
+        extra += [{"seed": 2, "nodes": 100, "positive_rate": 0.08}, {"seed": 3, "nodes": 100, "positive_rate": 0.08}]
+        save_progress(tmp_path, per_seed, extra, fp, 0, final=True)
+
+        resumed_final = json.loads((tmp_path / "results.json").read_text())
+        uninterrupted_agg = aggregate(PER_SEED)
+        assert resumed_final["complete"] is True
+        assert {e["seed"] for e in resumed_final["seed_info"]} == {1, 2, 3}
+        assert resumed_final["aggregate"]["GNN (GATV2)"]["auc_roc"]["mean"] == pytest.approx(
+            uninterrupted_agg["GNN (GATV2)"]["auc_roc"][0])
+
+    def test_completed_run_has_nothing_left_to_resume_as_new_work(self, tmp_path):
+        fp = config_fingerprint(_FakeArgs())
+        save_progress(tmp_path, [PER_SEED[0]], [{"seed": 1, "nodes": 100, "positive_rate": 0.08}], fp, 0, final=True)
+        _, extra = load_resumable(tmp_path, fp)
+        assert {e["seed"] for e in extra} == {1}
+

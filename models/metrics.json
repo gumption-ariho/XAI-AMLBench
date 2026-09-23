@@ -1,5 +1,6 @@
 {
   "val_auc_roc": 0.9894120322984192,
+  "best_epoch": 145,
   "test_auc_roc": 0.9884261081804583,
   "test_pr_auc": 0.9421221114644523,
   "test_precision": 0.9375,
@@ -9,6 +10,10 @@
   "threshold": 0.9927176237106323,
   "auc_target": 0.87,
   "meets_auc_target": true,
+  "calibration_ece_before": 0.02515674972878531,
+  "calibration_ece_after": 0.006565998444974583,
+  "calibration_brier_before": 0.023959728821514748,
+  "calibration_brier_after": 0.016478669480889475,
   "model": "gatv2",
   "hparams": {
     "hidden": 64,

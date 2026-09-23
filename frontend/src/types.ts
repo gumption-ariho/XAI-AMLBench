@@ -21,8 +21,10 @@ export interface Alert {
 
 export interface ScanResponse {
   score: number;
+  calibrated_score?: number;
   flagged: boolean;
   threshold: number;
+  calibrated_threshold?: number;
   latency_ms: number;
   alert: Alert | null;
 }
@@ -82,6 +84,7 @@ export interface TopFeature {
 export interface Explanation {
   account_id: string;
   risk_score: number;
+  raw_risk_score?: number;
   threshold: number;
   reporting_threshold: number;
   model: string;

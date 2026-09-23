@@ -95,6 +95,15 @@ class TestExtractExplanation:
         for f in result["top_features"]:
             assert 0.0 <= f["weight"] <= 1.0
 
+    def test_top_feature_weights_sum_to_approximately_one(self, model, arrays):
+        # Weights are normalised against the sum of the SHOWN features only (not all 26), so a fair, sparse
+        # explanation always reads as a complete picture rather than being diluted by unshown features -- see
+        # xai_explainer/extractor.py's comment on this for why the earlier normalisation produced flat-looking
+        # bars (e.g. six features all around 4-6%) even when the underlying explanation was reasonably sparse.
+        result = explain(model, arrays, arrays["account_ids"][0])
+        total = sum(f["weight"] for f in result["top_features"])
+        assert total == pytest.approx(1.0, abs=0.01)
+
     def test_small_max_explain_edges_forces_the_1_hop_fallback_without_erroring(self, model, arrays):
         # A max_explain_edges of 1 forces the "very large hub" fallback path on virtually any account; this just
         # confirms that path still returns a well-formed result rather than crashing.

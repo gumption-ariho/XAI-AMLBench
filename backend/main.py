@@ -148,7 +148,14 @@ def scan(req: ScanRequest):
                 (req.account_id, res["score"]),
             ).fetchone()
         audit("alert_created", {"alert_id": alert["id"], "account_id": req.account_id, "score": res["score"]})
-    return {"score": res["score"], "flagged": res["flagged"], "threshold": pred["threshold"],
+    # "score"/"threshold" (raw) are what the flagged decision and the stored alert are based on, and stay
+    # exactly as before; "calibrated_score"/"calibrated_threshold" are the same pair mapped through isotonic
+    # calibration, meaningful as an actual probability -- meant for display (a risk gauge showing "99.9%" for
+    # every flagged account is not informative), never used for the flagged decision itself. .get() with a
+    # fallback keeps this working against an older gnn-detection-api that predates calibration.
+    return {"score": res["score"], "calibrated_score": res.get("calibrated_score", res["score"]),
+            "flagged": res["flagged"], "threshold": pred["threshold"],
+            "calibrated_threshold": pred.get("calibrated_threshold", pred["threshold"]),
             "latency_ms": pred["latency_ms"], "alert": alert}
 
 

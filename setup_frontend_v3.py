@@ -22,7 +22,7 @@ import shutil
 import sys
 from pathlib import Path
 
-VERSION = "v2  (adds demo mode: npm run dev:demo, Next 15.5.21 + React 19)"
+VERSION = "v3  (calibrated risk scores on the gauge and network panel; demo mode: npm run dev:demo, Next 15.5.21 + React 19)"
 MARK_FILE, MARK_END, PAYLOAD = "@@@@FILE: ", "@@@@END", "#==== PAYLOAD BELOW ===="
 OLD_JS = ["src/app/layout.js", "src/app/page.js"]
 BACKUP = "_old_js_backup"
@@ -112,9 +112,9 @@ def main():
     print("""
 Next steps
   cd frontend
-  npm install                 # new packages: typescript + @types
+  npm install                 # syncs the packages (quick when node_modules already exists)
+  npm run dev:demo            # the app on built-in sample data -> http://localhost:3000  (no backend needed)
   npm run typecheck           # strict TypeScript check
-  npm run demo                # builds preview/demo.html (opens in a browser, no backend needed)
 
 Run it for real
   docker compose --profile app up -d --build           # from the project root, opens on http://localhost
@@ -163,6 +163,8 @@ if __name__ == "__main__":
 #|/** @type {import('next').NextConfig} */
 #|const nextConfig = {
 #|  reactStrictMode: true,
+#|  // Pin the project root so a stray package-lock.json in your home folder cannot confuse Next.js.
+#|  outputFileTracingRoot: __dirname,
 #|  // Inlined at build time. "1" only for `npm run dev:demo`; a normal build gets "0" and drops the demo code.
 #|  env: { NEXT_PUBLIC_DEMO: process.env.NEXT_PUBLIC_DEMO === "1" ? "1" : "0" },
 #|  // When you open the app directly on :3000 (not through Traefik on :80), /api still reaches the backend.
@@ -3087,13 +3089,13 @@ if __name__ == "__main__":
 #|      )}
 #|      {scan !== null && busy !== "scan" && (
 #|        <div className="scan-result rise">
-#|          <RiskGauge key={`${scan.account_id}-${scan.score}`} score={scan.score} threshold={scan.threshold} />
+#|          <RiskGauge key={`${scan.account_id}-${scan.score}`} score={scan.calibrated_score ?? scan.score} threshold={scan.calibrated_threshold ?? scan.threshold} />
 #|          <div className="scan-meta">
 #|            <div className={`verdict ${scan.flagged ? "bad" : "good"}`}>
 #|              {scan.flagged ? "Flagged: suspicious pattern" : "Below alert threshold"}
 #|            </div>
 #|            <p className="muted">
-#|              {scan.account_id} · threshold {pct(scan.threshold)} · inference {scan.latency_ms} ms
+#|              {scan.account_id} · threshold {pct(scan.calibrated_threshold ?? scan.threshold)} · inference {scan.latency_ms} ms
 #|              {scan.latency_ms <= latencyTarget && <span className="ok-text"> ✓ within {latencyTarget} ms target</span>}
 #|            </p>
 #|            <div className="row">
@@ -4086,8 +4088,10 @@ if __name__ == "__main__":
 #|
 #|export interface ScanResponse {
 #|  score: number;
+#|  calibrated_score?: number;
 #|  flagged: boolean;
 #|  threshold: number;
+#|  calibrated_threshold?: number;
 #|  latency_ms: number;
 #|  alert: Alert | null;
 #|}
@@ -4147,6 +4151,7 @@ if __name__ == "__main__":
 #|export interface Explanation {
 #|  account_id: string;
 #|  risk_score: number;
+#|  raw_risk_score?: number;
 #|  threshold: number;
 #|  reporting_threshold: number;
 #|  model: string;
