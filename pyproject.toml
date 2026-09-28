@@ -45,6 +45,7 @@ gnn = [
     "redis",
     "prometheus-client",
     "prometheus-fastapi-instrumentator",
+    "psycopg[binary]",
 ]
 # The exact XGBoost baseline named in the project brief. Optional: gnn_aml_core.baselines falls back to
 # scikit-learn's HistGradientBoostingClassifier (and says so) when this is not installed.

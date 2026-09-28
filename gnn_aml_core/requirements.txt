@@ -11,3 +11,4 @@ kafka-python
 immudb-py
 prometheus-client
 prometheus-fastapi-instrumentator
+psycopg[binary]   # gnn_aml_core.feedback reads officer decisions from the same Postgres alerts table the backend writes to

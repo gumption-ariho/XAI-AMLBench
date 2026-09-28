@@ -63,15 +63,41 @@ The GNN beat the strongest baseline in all 5 seeds (paired AUC-ROC +0.022, PR-AU
 per-account-only boosting by roughly 0.10 AUC and 0.29 F1 -- the clearest evidence that the graph itself, not just
 more features, carries the signal. On average the GNN meets the project's AUC-ROC and false-positive-rate targets;
 precision, recall and F1 fall just inside one standard deviation of their targets rather than clearing them on
-every seed (all five targets were met simultaneously in 1 of 5 seeds). Run
-`python -m gnn_aml_core.benchmark --seeds 5` to reproduce or extend this table; results vary by about +/-0.03 AUC
-between seeds at this graph size, so always report a mean over several seeds rather than a single run.
+every seed (all five targets were met simultaneously in 1 of 5 seeds).
+
+### Does it hold at a larger scale?
+
+The same benchmark at 20,000 accounts (5 seeds; `python -m gnn_aml_core.benchmark --accounts 20000 --seeds 5`,
+checkpointed after every seed so an interrupted run can resume):
+
+| Model | AUC-ROC | PR-AUC | Precision | Recall | F1 |
+|---|---|---|---|---|---|
+| **GNN (GATv2)** | **0.979 +/- 0.008** | **0.905** | 0.884 | 0.821 | 0.851 |
+| Boosting + 1-/2-hop neighbour averages (strong, graph-aware) | 0.964 +/- 0.009 | 0.840 | 0.799 | 0.738 | 0.767 |
+| Boosting, per-account features only | 0.898 +/- 0.012 | 0.632 | 0.583 | 0.560 | 0.564 |
+| Logistic Regression | 0.861 +/- 0.014 | 0.486 | 0.484 | 0.508 | 0.493 |
+| Isolation Forest (unsupervised) | 0.677 +/- 0.023 | 0.167 | 0.190 | 0.361 | 0.244 |
+
+The GNN's edge over the strongest baseline holds at 4x the graph size -- still better in 5 of 5 seeds -- though the
+margin narrows somewhat (paired AUC-ROC +0.022 at 5,000 accounts vs. +0.015 at 20,000; F1 +0.093 vs. +0.084), as
+more training data lets the simpler baselines close part of the gap. Precision, F1 and the target-hit rate all
+improved with scale (targets met simultaneously in 2 of 5 seeds, up from 1 of 5); recall barely moved (0.819 to
+0.821) and remains the metric most often just short of target. Report both tables rather than only the smaller
+one: the trend itself -- a persistent but narrowing advantage -- is the honest, defensible claim, not "the GNN
+wins by a wide and constant margin regardless of scale."
+
+Run `python -m gnn_aml_core.benchmark --seeds 5` (add `--accounts N` for a different graph size) to reproduce or
+extend either table; results vary by about +/-0.03 AUC between seeds at 5,000 accounts, so always report a mean
+over several seeds rather than a single run.
 
 **A note on difficulty.** The synthetic data is deliberately hard: laundering accounts carry ordinary background
 traffic, about 40% of smurfing "mules" are recruited ordinary accounts, and realistic look-alike structures
 (large merchants, payroll, savings groups, escrow chains) share surface features with real typologies. A
 benchmark that a linear model already solves cannot demonstrate that a graph model adds anything -- see
-`aml_synth/README.md` for the measured baseline difficulty this was tuned against.
+`aml_synth/README.md` for the measured baseline difficulty this was tuned against. This benchmark demonstrates
+that a graph neural network can outperform per-account models on graph-structured synthetic data calibrated to
+known typologies; it does not demonstrate real-world detection performance on unlabelled bank data, and should be
+described as a benchmark and methodology contribution rather than a validated production detector.
 
 ## Citation
 

@@ -157,9 +157,17 @@ class TestStratifyByDegree:
         buckets = _lat.stratify_by_degree(p, n_per_bucket=5, hops=2, seed=0)
         assert buckets is not None
         high_ids = set(buckets["high (large neighbourhood, likely hub-adjacent)"])
-        # a customer of the collector (tiny own degree) must be classified as high-neighbourhood, not low
-        assert "ACC15" in high_ids
-        assert "ACC1" not in high_ids  # the fake hub's neighbourhood does not actually balloon
+        # 2,001 accounts (the collector plus its 2,000 customers) genuinely tie at the maximum neighbourhood
+        # size, so a random sample of 5 from that pool is not guaranteed to include any one specific account
+        # (ACC15 among them) -- asserting that would be asserting a coin flip, not the actual property this
+        # test cares about. What must hold is the CATEGORY: every account this random sample selects must come
+        # from the customer/collector cluster (ACC0, or ACC10..ACC2009), never from the "fake hub" cluster
+        # (ACC1, or ACC2010..ACC2509), whose own neighbourhood does not actually balloon despite its high raw
+        # degree -- that is the property the old (own-degree) stratification would have gotten backwards.
+        customer_cluster_ids = {"ACC0"} | {f"ACC{i}" for i in range(10, 2010)}
+        assert high_ids, "expected at least one account in the high bucket"
+        assert high_ids <= customer_cluster_ids, f"high bucket contained non-customer-cluster accounts: {high_ids - customer_cluster_ids}"
+        assert "ACC1" not in high_ids  # the fake hub itself must not be miscategorised as high-neighbourhood
 
     def test_same_seed_gives_identical_bucket_selection(self, tmp_path):
         # Without this, argsort on a fixed graph is fully deterministic, so re-running the benchmark within

@@ -184,3 +184,110 @@ class TestEvaluationMetrics:
         rep = full_report(y_val, p_val, y_test, p_test)
         assert rep["threshold"] == best_f1_threshold(y_val, p_val)
         assert "auc_roc" in rep and "f1" in rep and "fpr" in rep
+
+
+def _mini_graph(rows):
+    """A tiny accounts + transactions pair built from a list of (src, dst, amount, ts, cross_border) tuples,
+    for tests that need precisely constructed patterns rather than the randomly generated small_graph fixture."""
+    import pandas as pd
+    accts = sorted({a for r in rows for a in (r[0], r[1])})
+    accounts = pd.DataFrame({"account_id": accts, "account_type": ["individual"] * len(accts),
+                             "country": ["US"] * len(accts), "risk_score": [0.0] * len(accts),
+                             "opened_ts": [0] * len(accts)})
+    tx = pd.DataFrame([{"tx_id": f"T{i}", "src": r[0], "dst": r[1], "amount": r[2], "timestamp": r[3],
+                        "cross_border": r[4] if len(r) > 4 else 0} for i, r in enumerate(rows)])
+    return accounts, tx
+
+
+class TestMuleBehaviourFeatures:
+    """Each of these is grounded in a specific, real red flag (structuring, pass-through, coordinated batch
+    account creation) rather than an abstract statistic -- every test constructs one account that clearly
+    exhibits the pattern and one "normal" control that clearly does not, and checks the feature separates them."""
+
+    def test_round_amt_ratio_flags_exact_round_dollar_amounts(self):
+        rows = [("EXT", "ROUND", 5000.0, i * 1000) for i in range(10)]
+        rows += [("EXT", "NORMAL", 137.42 + i, i * 1000) for i in range(10)]
+        accounts, tx = _mini_graph(rows)
+        x, names = build_node_features(accounts, tx)
+        i = names.index("round_amt_ratio")
+        idx = {a: r for r, a in enumerate(accounts["account_id"])}
+        assert x[idx["ROUND"], i] > x[idx["NORMAL"], i]
+
+    def test_micro_tx_ratio_flags_many_tiny_transactions(self):
+        rows = [("EXT", "PROBE", 0.99, i * 100) for i in range(15)]
+        rows += [("EXT", "NORMAL", 200.0, i * 100) for i in range(15)]
+        accounts, tx = _mini_graph(rows)
+        x, names = build_node_features(accounts, tx)
+        i = names.index("micro_tx_ratio")
+        idx = {a: r for r, a in enumerate(accounts["account_id"])}
+        assert x[idx["PROBE"], i] > x[idx["NORMAL"], i]
+
+    def test_decimal_precision_ratio_flags_algorithmically_split_amounts(self):
+        rows = [("EXT", "SPLIT", 1234.567891, i * 1000) for i in range(8)]
+        rows += [("EXT", "NORMAL", round(45.67, 2), i * 1000) for i in range(8)]
+        accounts, tx = _mini_graph(rows)
+        x, names = build_node_features(accounts, tx)
+        i = names.index("decimal_precision_ratio")
+        idx = {a: r for r, a in enumerate(accounts["account_id"])}
+        assert x[idx["SPLIT"], i] > x[idx["NORMAL"], i]
+
+    def test_volume_shift_ratio_flags_a_drastic_increase(self):
+        rows = [("EXT", "SHIFT", 50.0, i * 1000) for i in range(10)]
+        rows += [("EXT", "SHIFT", 50_000.0, 20_000 + i * 1000) for i in range(10)]
+        rows += [("EXT", "STEADY", 500.0, i * 1000) for i in range(20)]
+        accounts, tx = _mini_graph(rows)
+        x, names = build_node_features(accounts, tx)
+        i = names.index("volume_shift_ratio")
+        idx = {a: r for r, a in enumerate(accounts["account_id"])}
+        assert x[idx["SHIFT"], i] > x[idx["STEADY"], i]
+
+    def test_tax_haven_cp_ratio_flags_offshore_counterparties(self):
+        from gnn_aml_core.features import OFFSHORE
+        haven_country = next(iter(OFFSHORE))
+        rows = [("HAVEN_CP", "HAVEN", 500.0, i * 1000, 1) for i in range(10)]
+        rows += [("EXT", "NORMAL", 500.0, i * 1000, 0) for i in range(10)]
+        accounts, tx = _mini_graph(rows)
+        accounts.loc[accounts["account_id"] == "HAVEN_CP", "country"] = haven_country
+        x, names = build_node_features(accounts, tx)
+        i = names.index("tax_haven_cp_ratio")
+        idx = {a: r for r, a in enumerate(accounts["account_id"])}
+        assert x[idx["HAVEN"], i] > x[idx["NORMAL"], i]
+
+    def test_hour_concentration_flags_scripted_fixed_hour_timing(self):
+        rows = [("EXT", "BOT", 200.0, day * 86400 + 3 * 3600) for day in range(20)]  # always at hour 3
+        rng = np.random.default_rng(0)
+        rows += [("EXT", "NORMAL", 200.0, int(rng.integers(0, 20 * 86400))) for _ in range(20)]
+        accounts, tx = _mini_graph(rows)
+        x, names = build_node_features(accounts, tx)
+        i = names.index("hour_concentration")
+        idx = {a: r for r, a in enumerate(accounts["account_id"])}
+        assert x[idx["BOT"], i] > x[idx["NORMAL"], i]
+
+    def test_pass_through_match_ratio_flags_money_in_then_straight_back_out(self):
+        rows = []
+        for i in range(6):
+            t0 = i * 200_000
+            rows.append(("EXT", "MULE", 973.42, t0))
+            rows.append(("MULE", "EXT2", 970.00, t0 + 3600))
+        rng = np.random.default_rng(0)
+        rows += [("EXT", "NORMAL", round(float(rng.uniform(12, 340)), 2), int(rng.integers(0, 30 * 86400)))
+                for _ in range(20)]
+        accounts, tx = _mini_graph(rows)
+        x, names = build_node_features(accounts, tx)
+        i = names.index("pass_through_match_ratio")
+        idx = {a: r for r, a in enumerate(accounts["account_id"])}
+        assert x[idx["MULE"], i] > x[idx["NORMAL"], i]
+
+    def test_pass_through_cap_does_not_crash_on_a_high_degree_hub_account(self):
+        rows = [("EXT", "HUB", 50.0 + (i % 7), i * 100) for i in range(500)]
+        rows += [("HUB", "EXT2", 60.0 + (i % 7), i * 100 + 60) for i in range(500)]
+        accounts, tx = _mini_graph(rows)
+        x, names = build_node_features(accounts, tx)
+        assert np.isfinite(x).all()
+
+    def test_all_new_features_present_and_finite_on_the_shared_fixture(self, small_graph):
+        x, names = build_node_features(small_graph.accounts, small_graph.transactions)
+        for feat in ("round_amt_ratio", "micro_tx_ratio", "decimal_precision_ratio", "volume_shift_ratio",
+                    "tax_haven_cp_ratio", "hour_concentration", "pass_through_match_ratio"):
+            assert feat in names
+        assert np.isfinite(x).all()

@@ -87,10 +87,13 @@ def format_table(rows: dict) -> str:
 # ------------------------------------------------------------------------------------------------------ training
 def fit_gnn(arrays: dict, tr, va, te, *, model_name: str = "gatv2", hidden: int = 64, layers: int = 2, lr: float = 0.005,
             epochs: int = 150, pos_weight: float | None = None, seed: int = 42, patience: int = 0,
-            eval_every: int = 5, verbose: bool = True) -> dict:
+            eval_every: int = 5, verbose: bool = True, **model_kwargs) -> dict:
     """Train one GNN and evaluate it. Model selection uses the validation AUC only; the test split is touched once, at the end.
 
     patience: stop after this many evaluations (each `eval_every` epochs) without a validation improvement; 0 = train all epochs.
+    **model_kwargs: extra keyword arguments forwarded to `build_model` beyond hidden/num_layers -- e.g. `edge_dim`
+    for a dataset whose edge features are not aml_synth's own EDGE_DIM (see gnn_aml_core.elliptic, which trains
+    on the real Elliptic Bitcoin dataset's 1-dimensional time-gap edge feature rather than aml_synth's 5).
     Returns {"report", "best_val_auc", "best_epoch", "epochs_run", "state_dict", "hparams"}; report = AUC, PR-AUC, precision,
     recall, F1, FPR on the test split with the threshold chosen on validation.
     """
@@ -107,7 +110,7 @@ def fit_gnn(arrays: dict, tr, va, te, *, model_name: str = "gatv2", hidden: int 
     tr_m = torch.zeros(n, dtype=torch.bool, device=dev)          # only the loss needs a mask; evaluation indexes with tr/va/te
     tr_m[torch.from_numpy(tr).to(dev)] = True
 
-    hp = {"hidden": hidden, "num_layers": layers}
+    hp = {"hidden": hidden, "num_layers": layers, **model_kwargs}
     model = build_model(model_name, arrays["x"].shape[1], **hp).to(dev)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 

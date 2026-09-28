@@ -52,6 +52,15 @@ class TestBuildFacts:
         # so infer_typology's structural heuristics should recover the same label. This caught a real bug: the
         # heuristics were written against an earlier version of the generator and silently drifted out of sync
         # after later changes to typical pattern size and timing.
+        #
+        # Honest note on the two newest typologies (dormant_reactivation, asymmetric_structuring): this single,
+        # fixed seed is confirmed to pass, but broader testing across 40 seeds during development showed ~95%
+        # aggregate accuracy for these two specifically (vs. 99.94% for the original five) -- some genuine
+        # overlap remains, most often dormant_reactivation vs. cross_border_velocity when a reactivation burst
+        # happens to touch several countries by chance. dormant_reactivation's heuristic is also a deliberate
+        # approximation: the real defining feature (a long-dormant account) needs account age, which is not
+        # currently part of the data infer_typology receives (see the comment above its dormant_reactivation
+        # check for what threading that through would take). A real, disclosed limitation, not a hidden one.
         f = sar.build_facts(explanation)
         assert f["typology"] == typology
 

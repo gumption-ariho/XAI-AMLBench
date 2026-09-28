@@ -1,10 +1,10 @@
-INFO:     Started server process [57558]
+INFO:     Started server process [677749]
 INFO:     Waiting for application startup.
-2026-09-23 09:33:54,320 INFO xai_explainer: LLM_BACKEND=template -> template narratives only
+2026-09-26 15:01:03,011 INFO xai_explainer: LLM_BACKEND=template -> template narratives only
 INFO:     Application startup complete.
 INFO:     Uvicorn running on http://127.0.0.1:8002 (Press CTRL+C to quit)
-INFO:     127.0.0.1:49494 - "GET /health HTTP/1.1" 200 OK
-2026-09-23 10:14:09,270 INFO httpx: HTTP Request: POST http://127.0.0.1:8001/explain "HTTP/1.1 200 OK"
-INFO:     127.0.0.1:43926 - "POST /narrative HTTP/1.1" 200 OK
-INFO:     127.0.0.1:57176 - "GET / HTTP/1.1" 404 Not Found
-INFO:     127.0.0.1:57176 - "GET /favicon.ico HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:51118 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:35240 - "GET / HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:35240 - "GET /favicon.ico HTTP/1.1" 404 Not Found
+2026-09-26 15:04:43,226 INFO httpx: HTTP Request: POST http://127.0.0.1:8001/explain "HTTP/1.1 200 OK"
+INFO:     127.0.0.1:54754 - "POST /narrative HTTP/1.1" 200 OK

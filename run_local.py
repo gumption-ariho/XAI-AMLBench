@@ -115,7 +115,7 @@ def main() -> int:
     if not (ROOT / "models" / "gnn_model.pt").exists():
         problems.append("no trained model in ./models  ->  .venv/bin/python -m gnn_aml_core.train --data data --out models")
     if not (ROOT / ".env").exists():
-        problems.append("no .env file  ->  python3 setup_backend_v22.py")
+        problems.append("no .env file  ->  python3 setup_backend_v33.py")
     for name, port in INFRA.items():
         ok = port_open(port)
         print(f"  {'ok  ' if ok else 'MISSING'}  {name:<24} 127.0.0.1:{port}")

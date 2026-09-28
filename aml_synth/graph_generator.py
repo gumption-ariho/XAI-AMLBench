@@ -33,7 +33,8 @@ import pandas as pd
 log = logging.getLogger("aml_synth")
 __version__ = "0.2.0"
 
-TYPOLOGIES = ["smurfing", "scatter_gather", "cyclic_loop", "shell_company", "cross_border_velocity"]
+TYPOLOGIES = ["smurfing", "scatter_gather", "cyclic_loop", "shell_company", "cross_border_velocity",
+             "dormant_reactivation", "asymmetric_structuring"]
 _TYPO_CODE = {t: i + 1 for i, t in enumerate(TYPOLOGIES)}          # 0 = none
 
 NORMAL_COUNTRIES = ["US", "GB", "DE", "FR", "KE", "NG", "ZA", "IN", "BR", "JP", "CA", "AE"]
@@ -72,7 +73,9 @@ class GeneratorConfig:
             others = int(self.n_patterns_per_typology)
             smurf = max(1, others // 10) if others > 0 else 0
         return {"background_tx": int(bg), "smurfing": smurf, "scatter_gather": others, "cyclic_loop": others,
-                "shell_company": others, "cross_border_velocity": others}
+                "shell_company": others, "cross_border_velocity": others,
+                "dormant_reactivation": (max(1, others // 6) if others > 0 else 0),
+                "asymmetric_structuring": (max(1, others // 6) if others > 0 else 0)}
 
 
 @dataclass
@@ -112,6 +115,14 @@ class AMLGraphGenerator:
     def __init__(self, cfg: GeneratorConfig | None = None):
         self.cfg = cfg or GeneratorConfig()
         self.rng = np.random.default_rng(self.cfg.seed)
+        # a completely separate, independent RNG for orthogonal/cosmetic tagging (currently: a_highrisk
+        # category assignment) that should never perturb the MAIN structural randomness -- consuming random
+        # draws from self.rng for something like this would shift every subsequent pattern's random parameters
+        # (amounts, timings, which accounts get picked), changing the whole graph's difficulty as an unintended
+        # side effect of an unrelated cosmetic feature. This was a real, measured regression during development:
+        # adding the first version of this tagging (drawing from self.rng) pushed baseline AUC up across every
+        # seed tested, even though the tagging itself carried almost no signal on its own.
+        self._cosmetic_rng = np.random.default_rng(self.cfg.seed + 900_000_007)
         self.W = self.cfg.days * DAY
         self.counts = self.cfg.resolved()
         # account columns; python lists so patterns can append new accounts
@@ -131,13 +142,21 @@ class AMLGraphGenerator:
         self._make_pool()
         bg = self._background()
         builders = {"smurfing": self._smurfing, "scatter_gather": self._scatter_gather, "cyclic_loop": self._cyclic_loop,
-                    "shell_company": self._shell_company, "cross_border_velocity": self._cross_border_velocity}
+                    "shell_company": self._shell_company, "cross_border_velocity": self._cross_border_velocity,
+                    "dormant_reactivation": self._dormant_reactivation, "asymmetric_structuring": self._asymmetric_structuring}
+        # dormant_reactivation and asymmetric_structuring are deliberately low-weight, supplementary typologies
+        # (see resolved()'s comment) and are excluded from the count that scales hard_negative_ratio -- including
+        # them inflated the number of hard-negative look-alike instances generated (each of which can add
+        # hundreds of extra background-like transactions), which was a real, measured side effect: it pulled the
+        # overall median transaction amount below the brief's required $500-2,000 range on some seeds.
+        HARD_NEGATIVE_SCALING_TYPOLOGIES = {"smurfing", "scatter_gather", "cyclic_loop", "shell_company", "cross_border_velocity"}
         n_patterns = 0
         for typ, fn in builders.items():
             for _ in range(self.counts[typ]):
                 fn()
                 self._pid += 1
-                n_patterns += 1
+                if typ in HARD_NEGATIVE_SCALING_TYPOLOGIES:
+                    n_patterns += 1
         for _ in range(int(round(self.cfg.hard_negative_ratio * n_patterns))):
             self._hard_negative()
             self._pid += 1
@@ -168,6 +187,12 @@ class AMLGraphGenerator:
         self.a_risk = rng.beta(2, 9, n).tolist()
         self.a_susp = [0] * n
         self.a_typo = [0] * n
+        # a_highrisk: accounts representing crypto exchanges, gambling operators or similar high-risk merchant
+        # categories. A small baseline rate among ORDINARY business accounts too (not just illicit patterns'
+        # own destinations) is deliberate: real, legitimate businesses use these services sometimes, and a
+        # signal that only ever appears on illicit accounts would make this feature trivially separating
+        # rather than a realistic, imperfect red flag.
+        self.a_highrisk = ((self._cosmetic_rng.random(n) < 0.01) & (kind == 1)).tolist()
         w = rng.pareto(1.6, n) + 1.0
         self.pool_w = w / w.sum()
         self.by_cty = {}
@@ -193,12 +218,18 @@ class AMLGraphGenerator:
         self.a_risk.append(float(rng.beta(3, 6) if (risky and rng.random() < 0.55) else rng.beta(2, 9)))
         self.a_susp.append(0)
         self.a_typo.append(0)
+        self.a_highrisk.append(False)
         return len(self.a_type) - 1
 
     def _flag(self, i: int, typo: str) -> None:
         self.a_susp[i] = 1
         if self.a_typo[i] == 0:
             self.a_typo[i] = _TYPO_CODE[typo]
+
+    def _mark_highrisk(self, i: int) -> None:
+        """Tag an account as a high-risk-category destination (crypto exchange, gambling operator, or similar
+        merchant category), so transactions into it can be flagged category='high_risk_dest'."""
+        self.a_highrisk[i] = True
 
     def _pool_pick(self, k: int, among: np.ndarray | None = None, home: int | None = None) -> np.ndarray:
         src = among if among is not None and len(among) else np.arange(self.cfg.n_accounts)
@@ -319,9 +350,22 @@ class AMLGraphGenerator:
             total += amt
         benes = [self._new_account("business", country=str(rng.choice(OFFSHORE)) if rng.random() < .6 else None)
                  for _ in range(int(rng.integers(1, 4)))]
+        # Real smurfing proceeds are not disbursed with clockwork precision -- both the retained fraction and
+        # the payout timing vary noticeably in practice (partial cash-outs, delays, fees taken at different
+        # points). A fixed 94%-retained, always-within-48h construction made this pattern almost perfectly
+        # separable by pass_through_match_ratio and retained_frac alone, which is exactly the kind of
+        # unrealistically clean signal that made simple baselines too strong (see gnn_aml_core/features.py's
+        # module docstring and the benchmark difficulty discussion in the README for the full context).
+        retained = float(rng.uniform(0.78, 0.97))
         for b in benes:
             self._flag(b, name)
-            rows.append((central, b, total * 0.94 / len(benes), burst + rng.uniform(1 * HOUR, 24 * HOUR), _F["wire"]))
+            # Real smurfing proceeds often drain onward into crypto or gambling platforms -- tagged here so the
+            # category-based feature has a genuine, imperfect signal to learn from (not every beneficiary, and
+            # not exclusively illicit ones, since a_highrisk already has a small baseline rate among ordinary
+            # accounts too).
+            if self._cosmetic_rng.random() < 0.4:
+                self._mark_highrisk(b)
+            rows.append((central, b, total * retained / len(benes), burst + rng.uniform(1 * HOUR, 60 * HOUR), _F["wire"]))
         self._emit(rows, _TYPO_CODE[name], True)
         self._camouflage(mules + [central], lam=8)
 
@@ -340,7 +384,10 @@ class AMLGraphGenerator:
             share = float(np.clip(self._pamt(origin, m, 0.4), 300, 400_000))
             t1 = rng.uniform(0, 36 * HOUR)
             rows.append((origin, m, share, t1, _F["wire"]))
-            rows.append((m, dest, share * rng.uniform(0.96, 0.99), t1 + rng.uniform(4 * HOUR, 72 * HOUR), _F["wire"]))
+            # Real intermediaries do not pass on a near-perfect 96-99% every time -- some take a larger cut,
+            # some delay past a short detection window. A too-tight range here made this pattern almost
+            # perfectly separable by pass_through_match_ratio alone.
+            rows.append((m, dest, share * rng.uniform(0.75, 0.99), t1 + rng.uniform(4 * HOUR, 60 * HOUR), _F["wire"]))
         self._emit(rows, _TYPO_CODE[name], True)
         self._camouflage(mids + [dest], lam=8)
 
@@ -409,6 +456,68 @@ class AMLGraphGenerator:
             rows.append((cp, subject, amt, o, _F["wire"]) if i % 2 == 0 else (subject, cp, amt * rng.uniform(0.9, 0.99), o, _F["crypto_ramp"]))
         self._emit(rows, _TYPO_CODE[name], True)
         self._camouflage([subject], lam=8)
+
+    def _dormant_reactivation(self) -> None:
+        """An account with a genuinely old opening date and little activity for most of the window suddenly
+        reactivates with a burst of noticeably larger transactions later on -- a real red flag (per the brief's
+        "sudden activation of a long-dormant account" and "drastic change in transaction volume" red flags).
+        Deliberately imperfect from the start: the reactivation point, burst size, span and transaction count
+        all vary randomly rather than firing at a fixed relative point in the window, which is exactly the kind
+        of too-clean construction that made smurfing and scatter_gather too easily separable by simple
+        per-account statistics alone (see the retained-fraction fix applied to both this session)."""
+        rng, name = self.rng, "dormant_reactivation"
+        home = self._home()
+        subject = self._acct("individual" if rng.random() < 0.7 else "business", home, age=float(rng.uniform(700, 3500)))
+        self._flag(subject, name)
+        late_start = rng.uniform(0.5, 0.85) * self.W          # reactivates somewhere in the back half, not a fixed point
+        span = rng.uniform(6 * HOUR, 72 * HOUR)
+        n_tx = int(rng.integers(4, 14))
+        counterparties = self._pool_pick(min(n_tx, 30))
+        rows = []
+        shift = float(rng.uniform(0.15, 0.9))     # not always a dramatic jump -- some reactivations are only modestly larger
+        for i in range(n_tx):
+            cp = int(counterparties[i % len(counterparties)])
+            amt = float(np.clip(self._pamt(cp, subject, shift, 1.4), 1200, 150_000))
+            o = late_start + rng.uniform(0, span)
+            if rng.random() < 0.5:
+                rows.append((cp, subject, amt, o, _F["wire"]))
+            else:
+                rows.append((subject, cp, amt * rng.uniform(0.6, 1.0), o, _F["wire"]))
+        self._emit(rows, _TYPO_CODE[name], True, anchored=True)
+        self._camouflage([subject], lam=2)     # only light camouflage: a dormant account should not look too busy overall
+
+    def _asymmetric_structuring(self) -> None:
+        """Many small inbound transactions from a modest (not smurfing-scale) set of counterparties are
+        consolidated into one disproportionately large outbound transfer -- a smaller-scale structuring
+        pattern than full smurfing (which needs dozens to hundreds of dedicated mule accounts), closer to
+        what a single compromised or complicit account might do alone. The payout fraction and its timing
+        vary realistically rather than reproducing a fixed, too-clean pass-through ratio."""
+        rng, name = self.rng, "asymmetric_structuring"
+        home = self._home()
+        subject = self._acct("individual" if rng.random() < 0.6 else "business", home)
+        self._flag(subject, name)
+        n_in = int(rng.integers(15, 45))
+        span = rng.uniform(1 * DAY, 10 * DAY)
+        counterparties = self._pool_pick(n_in)
+        rows, total = [], 0.0
+        for i in range(n_in):
+            cp = int(counterparties[i])
+            amt = float(np.clip(self._pamt(cp, subject, 0.15, 0.4), 150, 4500))
+            o = rng.uniform(0, span)
+            rows.append((cp, subject, amt, o, _F["cash"] if rng.random() < .6 else _F["wire"]))
+            total += amt
+        payout_frac = float(rng.uniform(0.55, 0.95))     # imperfect: not everything goes back out, amount varies
+        dest = self._new_account("business", country=str(rng.choice(OFFSHORE)) if rng.random() < .5 else None)
+        self._flag(dest, name)
+        if rng.random() < 0.35:
+            # sometimes split the payout into 2 instead of always one single obvious lump sum
+            frac1 = rng.uniform(0.4, 0.6)
+            rows.append((subject, dest, total * payout_frac * frac1, span + rng.uniform(2 * HOUR, 30 * HOUR), _F["wire"]))
+            rows.append((subject, dest, total * payout_frac * (1 - frac1), span + rng.uniform(30 * HOUR, 90 * HOUR), _F["wire"]))
+        else:
+            rows.append((subject, dest, total * payout_frac, span + rng.uniform(2 * HOUR, 60 * HOUR), _F["wire"]))
+        self._emit(rows, _TYPO_CODE[name], True)
+        self._camouflage([subject], lam=6)
 
     # ---------------------------------------------- benign look-alikes (hard negatives)
     def _hard_negative(self) -> None:
@@ -544,6 +653,15 @@ class AMLGraphGenerator:
         order = np.argsort(ts, kind="stable")
         src, dst, amt, ts, fmt, lab, typ, pid = (a[order] for a in (src, dst, amt, ts, fmt, lab, typ, pid))
 
+        # category: a merchant/destination category derived from the DESTINATION account, computed after the
+        # final sort so it lines up with the transaction order used below. "high_risk_dest" covers a real red
+        # flag (immediate drainage to crypto exchanges, gambling operators, and similar high-risk merchant
+        # categories) without needing to touch the row-construction tuple used across every typology method --
+        # it only depends on which accounts were tagged via _mark_highrisk or the baseline rate set at account
+        # creation.
+        highrisk = np.array(self.a_highrisk, dtype=bool)
+        category = np.where(highrisk[dst], "high_risk_dest", "standard")
+
         n_acc = len(self.a_type)
         ids = np.array([f"ACC{i:07d}" for i in range(n_acc)])
         cty = np.array(self.a_cty)
@@ -562,7 +680,7 @@ class AMLGraphGenerator:
             "src": ids[src], "dst": ids[dst], "amount": np.round(amt, 2), "currency": "USD",
             "payment_format": np.array(PAYMENT_FORMATS)[fmt], "timestamp": ts,
             "cross_border": (cty[src] != cty[dst]).astype(np.int64),
-            "is_laundering": lab, "typology": typo_names[typ], "pattern_id": pid,
+            "is_laundering": lab, "typology": typo_names[typ], "pattern_id": pid, "category": category,
         })
         cfg = asdict(self.cfg)
         cfg.update({"resolved": self.counts, "generator_version": __version__, "start_ts": START_TS})

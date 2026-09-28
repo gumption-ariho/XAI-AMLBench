@@ -18,7 +18,7 @@ from pathlib import Path
 log = logging.getLogger("aml_synth.exporters")
 
 TX_PROPS = ["tx_id", "amount", "currency", "payment_format", "timestamp",
-            "cross_border", "is_laundering", "typology", "pattern_id"]
+            "cross_border", "is_laundering", "typology", "pattern_id", "category"]
 
 SCHEMA = {
     "accounts": {
@@ -31,7 +31,8 @@ SCHEMA = {
         "currency": "always USD", "payment_format": "wire | ach | card | cash | crypto_ramp", "timestamp": "unix seconds (UTC)",
         "cross_border": "1 if sender and receiver countries differ", "is_laundering": "1 if part of an injected laundering pattern",
         "typology": "smurfing | scatter_gather | cyclic_loop | shell_company | cross_border_velocity | none",
-        "pattern_id": "id of the injected pattern, -1 for ordinary traffic"},
+        "pattern_id": "id of the injected pattern, -1 for ordinary traffic",
+        "category": "standard | high_risk_dest (destination account is a crypto exchange, gambling operator, or similar high-risk merchant category)"},
 }
 
 
