@@ -10,6 +10,9 @@ COPY gnn_aml_core/requirements.txt gnn_aml_core/requirements.txt
 RUN pip install -r gnn_aml_core/requirements.txt
 
 COPY gnn_aml_core gnn_aml_core
+# see gnn_aml_core/Dockerfile's comment: main.py's /explain endpoint needs xai_explainer.extractor, which was
+# missing from this image too (a real bug, found crash-looping the service on a real run).
+COPY xai_explainer xai_explainer
 
 EXPOSE 8000
 CMD ["uvicorn", "gnn_aml_core.main:app", "--host", "0.0.0.0", "--port", "8000"]

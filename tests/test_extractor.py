@@ -63,7 +63,10 @@ class TestExtractExplanation:
     def test_node_dicts_have_the_expected_shape(self, model, arrays):
         result = explain(model, arrays, arrays["account_ids"][0])
         for n in result["nodes"]:
-            assert set(n) == {"account_id", "account_type", "country"}
+            # age_days is present because arrays_from_frames (via opened_ts, threaded through this session for
+            # dormant_reactivation's classification) now supplies it; extractor.py adds it whenever the graph
+            # dict carries opened_ts, and this fixture's arrays do.
+            assert set(n) == {"account_id", "account_type", "country", "age_days"}
 
     def test_edge_dicts_have_the_expected_shape(self, model, arrays):
         result = explain(model, arrays, arrays["account_ids"][0])

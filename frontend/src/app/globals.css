@@ -142,6 +142,20 @@ button { font: inherit; }
 .chip { background: rgba(59, 130, 246, .08); border: 1px solid var(--line); color: var(--muted); border-radius: 999px; padding: 3px 12px; font-size: 12.5px; cursor: pointer; transition: all .2s; }
 .chip:hover { color: #fff; border-color: var(--line-hi); transform: translateY(-1px); }
 .chip.bad { border-color: rgba(251, 113, 133, .35); color: #fda4af; }
+
+.login-screen { min-height: 100svh; display: flex; align-items: center; justify-content: center; padding: 24px; }
+.login-card-wrap { width: 100%; max-width: 420px; }
+.login-card { display: flex; flex-direction: column; gap: 16px; padding: 32px; }
+.login-brand { display: flex; align-items: center; gap: 14px; }
+.login-shield { display: inline-flex; width: 40px; height: 40px; align-items: center; justify-content: center;
+  border-radius: 12px; background: rgba(59, 130, 246, .14); border: 1px solid var(--line-hi); color: var(--cyan); }
+.login-title { font-size: 17px; font-weight: 600; letter-spacing: .02em; }
+.login-subtitle { font-size: 12px; color: var(--dim); text-transform: uppercase; letter-spacing: .08em; }
+.login-hint { font-size: 13px; color: var(--muted); line-height: 1.5; }
+.login-hint code { background: rgba(3, 9, 30, .6); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; font-size: 12px; }
+.login-input { width: 100%; }
+.login-error { font-size: 13px; color: #fda4af; line-height: 1.4; }
+.login-submit { width: 100%; justify-content: center; }
 .seg { display: inline-flex; background: rgba(3, 9, 30, .55); border: 1px solid var(--line); border-radius: 12px; padding: 4px; }
 .seg button { background: none; border: 0; color: var(--muted); text-transform: capitalize; padding: 6px 14px; border-radius: 9px; cursor: pointer; transition: all .25s; }
 .seg button.on { background: linear-gradient(135deg, #2563eb, #0ea5e9); color: #fff; box-shadow: 0 4px 14px rgba(37, 99, 235, .45); }

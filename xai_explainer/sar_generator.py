@@ -76,7 +76,12 @@ def infer_typology(subject: str, nodes: list[dict], edges: list[dict], threshold
         # it on a large hub, so the minority direction must also be a real share of the traffic, not a corner case).
         minority = min(out_n, in_n)
         bidirectional = minority >= 3 and minority / len(subj_edges) >= 0.15
-        if bidirectional and ts[-1] - ts[0] <= 5 * 24 * 3600 and len({countries.get(c) for c in cps} - {None}) >= 3:  # generator's velocity window is up to 96h
+        max_amt = max(e["amount"] for e in subj_edges)
+        # cross_border_velocity's own transfer amounts are capped at $9,500 by construction; dormant_reactivation's
+        # can reach $150,000. A max amount well above that ceiling is a safe, well-justified exclusion -- found
+        # by testing across many seeds, where a dormant_reactivation instance with high-value transactions and
+        # a handful of foreign counterparties otherwise satisfied this check's other conditions too.
+        if bidirectional and max_amt <= 10_500 and ts[-1] - ts[0] <= 5 * 24 * 3600 and len({countries.get(c) for c in cps} - {None}) >= 3:  # generator's velocity window is up to 96h
             return "cross_border_velocity"
 
     # Checked next, before shell_company and cyclic_loop: fan-in structuring (many distinct senders feeding one
@@ -88,6 +93,7 @@ def infer_typology(subject: str, nodes: list[dict], edges: list[dict], threshold
     in_by_dst: dict[str, set[str]] = {}
     for e in edges:
         in_by_dst.setdefault(e["dst"], set()).add(e["src"])
+    max_fan_in = max((len(s) for s in in_by_dst.values()), default=0)
     if in_by_dst:
         hub, senders = max(in_by_dst.items(), key=lambda kv: len(kv[1]))
         hub_edges = sum(1 for e in edges if e["dst"] == hub)
@@ -108,21 +114,54 @@ def infer_typology(subject: str, nodes: list[dict], edges: list[dict], threshold
                 if max(hub_in_amts) < 6000 and len(senders) <= 50:
                     return "asymmetric_structuring"
                 return "smurfing"
-    if near >= 5 and near / len(edges) >= 0.5:      # structuring: most transfers sit just under the threshold
+    if near >= 5 and near / len(edges) >= 0.5 and max_fan_in >= 3:      # structuring: most transfers sit
+        # just under the threshold, AND at least 3 distinct senders feed the SAME destination -- a single chain
+        # transfer or cyclic flow trivially has multiple distinct senders across its different hops (each hop
+        # sends once), but never many senders into the same one account, which is genuine smurfing's actual
+        # shape. Checking distinct senders anywhere in the edge set (rather than fan-in to one destination) was
+        # a real first attempt at this fix that did not work, caught by re-measuring after applying it.
         return "smurfing"
 
     if sum(1 for t in types.values() if t == "shell") >= 2:
-        return "shell_company"
+        # Precise fix (not a reorder -- the reorder attempt above broke 288 other cases): require at least 2
+        # shell-type accounts CONNECTED to each other in sequence (each both receiving from and sending to
+        # another account in the subgraph), not just present anywhere. A randomly-drawn counterparty pool can
+        # incidentally include 2+ shell-type accounts that are each simple one-off counterparties to the
+        # subject, unconnected to each other -- that is not shell layering, which is specifically a CHAIN of
+        # shells passing money to one another (see _shell_company's origin -> shell -> shell -> ... ->
+        # beneficiary construction). This distinguishes the two without touching check order at all.
+        #
+        # "Connected" means sharing a direct edge with ANOTHER shell account -- not, as an earlier version of
+        # this fix required, each shell independently having both an incoming AND an outgoing edge. That
+        # stricter version broke a real, valid 2-shell chain ending directly at the final shell (no beneficiary
+        # node after it): the last shell in such a chain has no outgoing edge at all, so it never satisfied
+        # "out_degree >= 1" on its own, even though it is genuinely connected to the shell before it. Found by
+        # an existing test failing after that fix shipped, not caught before.
+        shell_accounts = {aid for aid, t in types.items() if t == "shell"}
+        connected_shells = sum(
+            1 for s in shell_accounts
+            if any(other in shell_accounts and (g.has_edge(s, other) or g.has_edge(other, s))
+                  for other in shell_accounts if other != s)
+        )
+        if connected_shells >= 2:
+            return "shell_company"
     if _has_cycle(g):
         return "cyclic_loop"
-    # dormant_reactivation: a small handful of transactions, all clustered in a short burst, at a noticeably
-    # elevated amount -- distinct from every other typology's shape (too few edges and too short a span to be
-    # smurfing or asymmetric_structuring, and not required to touch multiple countries the way
-    # cross_border_velocity is). NOTE: this is a deliberately age-independent approximation -- the real defining
-    # feature of this typology is a long-dormant account suddenly reactivating, but account age is not currently
-    # part of the data this function receives (nodes carry only account_type and country); threading age
-    # through the explanation schema (train.py's saved graph -> extractor.py's node construction -> here) would
-    # let this check use the real signal directly, and is a genuine, disclosed follow-up, not done here.
+    # dormant_reactivation: a genuinely old account (per generator construction, opened 700-3500 days before
+    # reactivating) suddenly showing a short, elevated burst of activity. Uses real account age when the
+    # explanation carries it (age_days on each node, threaded through from train.py's saved graph via
+    # extractor.py -- see extractor.py's node construction) and falls back to a purely structural approximation
+    # (few edges, short span, elevated amount, genuine bidirectionality) when it does not -- an older saved
+    # model, or a non-aml_synth dataset such as Elliptic, will not have this field, and this must not crash.
+    #
+    # Checked AFTER shell_company/cyclic_loop, not before: an earlier attempt moved this check first (reasoning:
+    # incidental shell-type counterparties can trigger shell_company's crude ">=2 shells" test on a
+    # dormant_reactivation instance by chance). That reorder was tried and measured -- it fixed 6 cases in that
+    # direction but broke 288 in the other (real shell_company and cyclic_loop instances misclassified as
+    # dormant_reactivation instead, since their own small, sometimes-bidirectional shape satisfies this check's
+    # conditions too easily once checked first). Reverted; the smaller, remaining incidental-shell collision is
+    # accepted rather than trading it for a much larger one.
+    ages = {n["account_id"]: n.get("age_days") for n in nodes}
     if subj_edges:
         ts_all = sorted(e["timestamp"] for e in subj_edges)
         span_h = (ts_all[-1] - ts_all[0]) / 3600
@@ -133,7 +172,19 @@ def infer_typology(subject: str, nodes: list[dict], edges: list[dict], threshold
         # essential: scatter_gather's origin node is pure fan-out (all outbound, never inbound) and otherwise
         # matches this shape closely enough to be misclassified as dormant_reactivation without this check --
         # a real regression found by testing across many seeds, not a hypothetical edge case.
-        if len(subj_edges) <= 16 and span_h <= 72 and mean_amt >= 1200 and min(in_n, out_n) >= 2:
+        # min(in_n, out_n) >= 1 (not >= 2): with as few as 4 total transactions by construction, an even 2-2
+        # split is not guaranteed even for a genuine instance -- >= 2 was too strict and rejected real cases by
+        # chance (a 1-in/3-out split, say). >= 1 still excludes scatter_gather's pure fan-out origin (in_n == 0
+        # always), which is the actual collision this check exists to prevent.
+        reactivation_burst = len(subj_edges) <= 16 and span_h <= 72 and mean_amt >= 1200 and min(in_n, out_n) >= 1
+        subject_age = ages.get(subject)
+        if subject_age is not None:
+            # real age available: require genuine dormancy (365 days is a full year below the generator's
+            # 700-day floor, a safety margin) AND the reactivation shape -- age alone is not enough, since an
+            # old account can also transact normally; the burst shape confirms reactivation, not just age.
+            if subject_age >= 365 and reactivation_burst:
+                return "dormant_reactivation"
+        elif reactivation_burst:
             return "dormant_reactivation"
     for n in g.nodes:
         succ = set(g.successors(n))

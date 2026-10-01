@@ -65,6 +65,7 @@ def arrays_from_frames(accounts: pd.DataFrame, tx: pd.DataFrame, reporting_thres
         "country": accounts["country"].tolist(), "tx_ids": tx["tx_id"].tolist(),
         "tx_amount": tx["amount"].to_numpy(dtype=np.float32), "tx_timestamp": tx["timestamp"].to_numpy(dtype=np.int64),
         "tx_cross_border": tx["cross_border"].to_numpy(dtype=np.int64),
+        "opened_ts": accounts["opened_ts"].to_numpy(dtype=np.int64),
     }
 
 
@@ -218,7 +219,8 @@ def main() -> None:
         "threshold": metrics["threshold"], "metrics": metrics,
         "calibration": res["calibrator"].to_dict(), "calibrated_threshold": calibrated_threshold,
     }, out / "gnn_model.pt")
-    graph = {k: torch.from_numpy(np.array(arrays[k])) for k in ("x", "edge_index", "edge_attr", "edge_type", "y", "tx_amount", "tx_timestamp", "tx_cross_border")}
+    graph = {k: torch.from_numpy(np.array(arrays[k])) for k in
+             ("x", "edge_index", "edge_attr", "edge_type", "y", "tx_amount", "tx_timestamp", "tx_cross_border", "opened_ts")}
     graph.update({k: arrays[k] for k in ("account_ids", "account_type", "country", "tx_ids", "feature_names", "n_tx")})
     torch.save(graph, out / "graph.pt")
     (out / "metrics.json").write_text(json.dumps({

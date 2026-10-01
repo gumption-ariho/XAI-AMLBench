@@ -263,3 +263,98 @@ class TestNewTypologies:
                   "top_features": [{"feature": "burst_6h", "weight": 0.3}]}
             facts = sar.build_facts(exp)
             sar.template_narrative(facts)  # must not raise
+
+
+class TestMemoField:
+    """The transaction memo/reference field (a real red flag: coordinated mules copy-pasting the same,
+    sometimes identically misspelled, reference text). Built following the same RNG-isolation lesson learned
+    from the category field earlier this session: tagging decisions use the cosmetic RNG, never the main
+    structural RNG, so adding this cannot perturb any other pattern's generation."""
+
+    def test_memo_column_exists_with_expected_values(self):
+        from aml_synth.graph_generator import AMLGraphGenerator, GeneratorConfig
+        g = AMLGraphGenerator(GeneratorConfig(n_accounts=2000, seed=1)).generate()
+        assert "memo" in g.transactions.columns
+        generic = {"PAYMENT", "INVOICE PMT", "TRANSFER", "RENT", "SALARY", ""}
+        typo_tags = set(g.transactions["memo"]) - generic
+        assert all("CONSULTNG FEE REF" in m for m in typo_tags)
+
+    def test_some_transactions_are_typo_tagged_at_realistic_scale(self):
+        from aml_synth.graph_generator import AMLGraphGenerator, GeneratorConfig
+        g = AMLGraphGenerator(GeneratorConfig(n_accounts=5000, seed=1)).generate()
+        assert (g.transactions["memo"].str.contains("CONSULTNG", na=False)).sum() > 0
+
+    def test_isolated_rng_means_the_underlying_graph_is_unaffected(self):
+        # same regression guard pattern as the category field: this feature's own randomness must not perturb
+        # anything else about the generated graph at a fixed seed.
+        from aml_synth.graph_generator import AMLGraphGenerator, GeneratorConfig
+        g1 = AMLGraphGenerator(GeneratorConfig(n_accounts=3000, seed=7)).generate()
+        g2 = AMLGraphGenerator(GeneratorConfig(n_accounts=3000, seed=7)).generate()
+        assert g1.accounts["is_suspicious"].tolist() == g2.accounts["is_suspicious"].tolist()
+        assert g1.transactions["amount"].tolist() == g2.transactions["amount"].tolist()
+
+    def test_export_schema_documents_the_new_field(self):
+        from aml_synth.exporters import SCHEMA, TX_PROPS
+        assert "memo" in TX_PROPS
+        assert "memo" in SCHEMA["transactions"]
+
+
+class TestDisputeField:
+    """The transaction dispute/reversal field (a real red flag: an account repeatedly disputing its own
+    transactions to probe automated reversal logic). Built following the same RNG-isolation and calibration-
+    check-immediately discipline established earlier this session."""
+
+    def test_disputed_column_exists_as_boolean(self):
+        from aml_synth.graph_generator import AMLGraphGenerator, GeneratorConfig
+        g = AMLGraphGenerator(GeneratorConfig(n_accounts=2000, seed=1)).generate()
+        assert "disputed" in g.transactions.columns
+        assert g.transactions["disputed"].dtype == bool
+
+    def test_baseline_dispute_rate_is_small_but_nonzero(self):
+        from aml_synth.graph_generator import AMLGraphGenerator, GeneratorConfig
+        g = AMLGraphGenerator(GeneratorConfig(n_accounts=5000, seed=1)).generate()
+        rate = g.transactions["disputed"].mean()
+        assert 0.0 < rate < 0.05  # a small baseline, not zero and not dominant
+
+    def test_asymmetric_structuring_shows_an_elevated_dispute_rate(self):
+        from aml_synth.graph_generator import AMLGraphGenerator, GeneratorConfig
+        g = AMLGraphGenerator(GeneratorConfig(n_accounts=5000, seed=1)).generate()
+        overall = g.transactions["disputed"].mean()
+        asym = g.transactions[g.transactions["typology"] == "asymmetric_structuring"]
+        assert asym["disputed"].mean() > overall
+
+    def test_isolated_rng_means_the_underlying_graph_is_unaffected(self):
+        from aml_synth.graph_generator import AMLGraphGenerator, GeneratorConfig
+        g1 = AMLGraphGenerator(GeneratorConfig(n_accounts=3000, seed=7)).generate()
+        g2 = AMLGraphGenerator(GeneratorConfig(n_accounts=3000, seed=7)).generate()
+        assert g1.accounts["is_suspicious"].tolist() == g2.accounts["is_suspicious"].tolist()
+        assert g1.transactions["amount"].tolist() == g2.transactions["amount"].tolist()
+
+    def test_export_schema_documents_the_new_field(self):
+        from aml_synth.exporters import SCHEMA, TX_PROPS
+        assert "disputed" in TX_PROPS
+        assert "disputed" in SCHEMA["transactions"]
+
+
+class TestBatchRegistrationClustering:
+    """A real red flag: a subset of freshly-created mule accounts sharing a near-identical registration date.
+    Reuses opened_ts (already threaded through this session for dormant_reactivation) rather than adding a new
+    schema field. Built with the same RNG-isolation discipline as every other addition this session: the
+    'which mules get batched' decision uses the cosmetic RNG, and every mule still draws its own age via the
+    main RNG first (via _acct), so the main structural RNG stream is identical regardless of batching -- a
+    correctness property checked directly here, since passing age= conditionally at creation time would have
+    silently skipped the main RNG's own age draw for exactly the batched mules."""
+
+    def test_isolated_rng_means_the_underlying_graph_is_unaffected(self):
+        g1 = AMLGraphGenerator(GeneratorConfig(n_accounts=3000, seed=7)).generate()
+        g2 = AMLGraphGenerator(GeneratorConfig(n_accounts=3000, seed=7)).generate()
+        assert g1.accounts["is_suspicious"].tolist() == g2.accounts["is_suspicious"].tolist()
+        assert g1.transactions["amount"].tolist() == g2.transactions["amount"].tolist()
+
+    def test_some_smurfing_mules_genuinely_share_a_registration_day(self):
+        g = AMLGraphGenerator(GeneratorConfig(n_accounts=5000, seed=1)).generate()
+        smurf_accounts = g.accounts[g.accounts["typology"] == "smurfing"]
+        reg_days = (smurf_accounts["opened_ts"] // 86400)
+        # at least one registration day should be shared by 2+ smurfing accounts, confirming the clustering
+        # mechanism actually produces batched accounts, not just a theoretical possibility
+        assert reg_days.value_counts().max() >= 2

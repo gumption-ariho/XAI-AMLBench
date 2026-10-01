@@ -4,6 +4,10 @@ export type AlertStatus = "open" | "confirmed" | "dismissed";
 export type TabId = "overview" | "scan" | "alerts" | "network";
 export type ToastKind = "ok" | "err" | "warn";
 
+export interface WhoamiResponse {
+  officer: string;
+}
+
 export interface Alert {
   id: number;
   account_id: string;

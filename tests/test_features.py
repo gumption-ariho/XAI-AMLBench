@@ -1,6 +1,7 @@
 """Tests for gnn_aml_core.features and gnn_aml_core.evaluation. Neither module needs PyTorch, so these tests
 always run, even in an environment where torch is not installed."""
 import numpy as np
+import pandas as pd
 import pytest
 
 from gnn_aml_core.evaluation import best_f1_threshold, binary_metrics, full_report, rank_metrics
@@ -291,3 +292,143 @@ class TestMuleBehaviourFeatures:
                     "tax_haven_cp_ratio", "hour_concentration", "pass_through_match_ratio"):
             assert feat in names
         assert np.isfinite(x).all()
+
+
+class TestSharedMemoRatio:
+    """A real red flag: coordinated mules sharing an identical (often identically misspelled) reference/memo
+    string with OTHER unrelated accounts, not just repeating their own memo."""
+
+    def test_flags_accounts_sharing_a_memo_with_unrelated_senders(self):
+        accounts = pd.DataFrame({"account_id": ["MULE_A", "MULE_B", "NORMAL"], "account_type": ["individual"] * 3,
+                                 "country": ["US"] * 3, "risk_score": [0.0] * 3, "opened_ts": [0] * 3})
+        tx = pd.DataFrame([
+            {"tx_id": "T0", "src": "MULE_A", "dst": "EXT", "amount": 100.0, "timestamp": 0, "cross_border": 0, "memo": "CONSULTNG FEE REF0001"},
+            {"tx_id": "T1", "src": "MULE_B", "dst": "EXT2", "amount": 100.0, "timestamp": 100, "cross_border": 0, "memo": "CONSULTNG FEE REF0001"},
+            {"tx_id": "T2", "src": "NORMAL", "dst": "EXT3", "amount": 100.0, "timestamp": 200, "cross_border": 0, "memo": "PAYMENT"},
+        ])
+        x, names = build_node_features(accounts, tx)
+        i = names.index("shared_memo_ratio")
+        idx = {a: r for r, a in enumerate(accounts["account_id"])}
+        assert x[idx["MULE_A"], i] == 1.0
+        assert x[idx["MULE_B"], i] == 1.0
+        assert x[idx["NORMAL"], i] == 0.0
+
+    def test_does_not_flag_an_account_reusing_its_own_memo_alone(self):
+        # one account repeating its OWN memo across several transactions is ordinary, not coordination -- the
+        # memo must be shared with a DIFFERENT, distinct sender to count.
+        accounts = pd.DataFrame({"account_id": ["SOLO"], "account_type": ["individual"],
+                                 "country": ["US"], "risk_score": [0.0], "opened_ts": [0]})
+        tx = pd.DataFrame([
+            {"tx_id": f"T{i}", "src": "SOLO", "dst": f"EXT{i}", "amount": 100.0, "timestamp": i * 100,
+             "cross_border": 0, "memo": "MY OWN CUSTOM REF"} for i in range(5)
+        ])
+        x, names = build_node_features(accounts, tx)
+        i = names.index("shared_memo_ratio")
+        assert x[0, i] == 0.0
+
+    def test_generic_memos_never_count_as_shared_even_when_widely_repeated(self):
+        accounts = pd.DataFrame({"account_id": [f"A{i}" for i in range(5)], "account_type": ["individual"] * 5,
+                                 "country": ["US"] * 5, "risk_score": [0.0] * 5, "opened_ts": [0] * 5})
+        tx = pd.DataFrame([{"tx_id": f"T{i}", "src": f"A{i}", "dst": "HUB", "amount": 100.0, "timestamp": i * 100,
+                           "cross_border": 0, "memo": "PAYMENT"} for i in range(5)])
+        x, names = build_node_features(accounts, tx)
+        i = names.index("shared_memo_ratio")
+        assert (x[:, i] == 0.0).all()
+
+    def test_degrades_gracefully_without_a_memo_column(self):
+        accounts = pd.DataFrame({"account_id": ["A"], "account_type": ["individual"],
+                                 "country": ["US"], "risk_score": [0.0], "opened_ts": [0]})
+        tx = pd.DataFrame([{"tx_id": "T0", "src": "A", "dst": "B", "amount": 100.0, "timestamp": 0, "cross_border": 0}])
+        x, names = build_node_features(accounts, tx)  # must not raise
+        assert x[0, names.index("shared_memo_ratio")] == 0.0
+
+
+class TestDisputeRate:
+    """A real red flag: an account repeatedly disputing its own transactions, probing a platform's automated
+    reversal logic."""
+
+    def test_flags_an_account_with_frequent_self_disputes(self):
+        accounts = pd.DataFrame({"account_id": ["PROBER", "NORMAL"], "account_type": ["individual"] * 2,
+                                 "country": ["US"] * 2, "risk_score": [0.0] * 2, "opened_ts": [0] * 2})
+        tx = pd.DataFrame([
+            {"tx_id": "T0", "src": "PROBER", "dst": "EXT", "amount": 100.0, "timestamp": 0, "cross_border": 0, "disputed": True},
+            {"tx_id": "T1", "src": "PROBER", "dst": "EXT2", "amount": 100.0, "timestamp": 100, "cross_border": 0, "disputed": True},
+            {"tx_id": "T2", "src": "NORMAL", "dst": "EXT3", "amount": 100.0, "timestamp": 200, "cross_border": 0, "disputed": False},
+        ])
+        x, names = build_node_features(accounts, tx)
+        idx = {a: r for r, a in enumerate(accounts["account_id"])}
+        i = names.index("dispute_rate")
+        assert x[idx["PROBER"], i] == 1.0
+        assert x[idx["NORMAL"], i] == 0.0
+
+    def test_degrades_gracefully_without_a_disputed_column(self):
+        accounts = pd.DataFrame({"account_id": ["A"], "account_type": ["individual"],
+                                 "country": ["US"], "risk_score": [0.0], "opened_ts": [0]})
+        tx = pd.DataFrame([{"tx_id": "T0", "src": "A", "dst": "B", "amount": 100.0, "timestamp": 0, "cross_border": 0}])
+        x, names = build_node_features(accounts, tx)  # must not raise
+        assert x[0, names.index("dispute_rate")] == 0.0
+
+    def test_only_counts_the_accounts_own_outbound_disputes(self):
+        # an account whose INBOUND transactions are disputed (by other senders' own doing) should not itself
+        # be flagged -- dispute_rate is specifically about the account's own outbound behaviour.
+        accounts = pd.DataFrame({"account_id": ["RECEIVER"], "account_type": ["individual"],
+                                 "country": ["US"], "risk_score": [0.0], "opened_ts": [0]})
+        tx = pd.DataFrame([{"tx_id": "T0", "src": "OTHER", "dst": "RECEIVER", "amount": 100.0,
+                           "timestamp": 0, "cross_border": 0, "disputed": True}])
+        x, names = build_node_features(accounts, tx)
+        assert x[0, names.index("dispute_rate")] == 0.0
+
+
+class TestCounterpartyRegistrationClusterRatio:
+    """A real red flag: many of an account's counterparties were all registered on the exact same day (a
+    batch-created mule network), detected purely from opened_ts -- no new schema field needed."""
+
+    def test_counterparties_not_present_in_the_accounts_table_do_not_crash(self):
+        # A real bug, found by this exact scenario crashing every test in this file (and test_sar_generator.py)
+        # whose transactions referenced ANY external counterparty not present in the accounts table -- a very
+        # common, realistic shape, not a hypothetical edge case. The counterparty's registration date maps to
+        # NaN, and value_counts().max() on an all-NaN group returned NaN, which int() cannot convert. Fixed by
+        # dropping unknown-registration counterparties before computing the ratio, rather than crashing on them.
+        accounts = pd.DataFrame({"account_id": ["A"], "account_type": ["individual"], "country": ["US"],
+                                 "risk_score": [0.0], "opened_ts": [0]})
+        tx = pd.DataFrame([{"tx_id": "T0", "src": "A", "dst": "EXTERNAL_NOT_IN_ACCOUNTS_TABLE", "amount": 100.0,
+                           "timestamp": 0, "cross_border": 0}])
+        x, names = build_node_features(accounts, tx)  # must not raise
+        assert x[0, names.index("counterparty_registration_cluster_ratio")] == 0.0
+
+    def test_flags_accounts_whose_counterparties_share_a_registration_day(self):
+        accounts = pd.DataFrame({
+            "account_id": ["HUB", "A", "B", "C", "D", "HUB2", "E", "F", "G", "H"],
+            "account_type": ["individual"] * 10, "country": ["US"] * 10, "risk_score": [0.0] * 10,
+            "opened_ts": [0, 1_000_000, 1_000_100, 1_000_200, 1_000_300,
+                         0, 100_000, 5_000_000, 9_000_000, 15_000_000],
+        })
+        rows = [{"tx_id": f"T{i}", "src": cp, "dst": "HUB", "amount": 100.0, "timestamp": i * 100, "cross_border": 0}
+               for i, cp in enumerate(["A", "B", "C", "D"])]
+        rows += [{"tx_id": f"T{i+4}", "src": cp, "dst": "HUB2", "amount": 100.0, "timestamp": i * 100, "cross_border": 0}
+                for i, cp in enumerate(["E", "F", "G", "H"])]
+        tx = pd.DataFrame(rows)
+        x, names = build_node_features(accounts, tx)
+        idx = {a: r for r, a in enumerate(accounts["account_id"])}
+        i = names.index("counterparty_registration_cluster_ratio")
+        assert x[idx["HUB"], i] > x[idx["HUB2"], i]
+
+    def test_no_opened_ts_column_is_not_a_realistic_scenario_for_this_function(self):
+        # honest note, not a real gap: build_node_features has ALWAYS hard-required opened_ts, since the
+        # pre-existing age_days feature (line ~91) accesses accounts["opened_ts"] directly with no guard --
+        # this crashes before this feature's own "if opened_ts in accounts.columns" check would ever matter.
+        # That check is harmless defensive code, not dead-code cleanup owed, but this test exists to document
+        # honestly that it is currently unreachable in practice for any real caller of this function, rather
+        # than imply a fallback path that was never actually exercised.
+        accounts = pd.DataFrame({"account_id": ["A", "B"], "account_type": ["individual"] * 2, "country": ["US"] * 2,
+                                 "risk_score": [0.0] * 2})  # no opened_ts column at all
+        tx = pd.DataFrame([{"tx_id": "T0", "src": "A", "dst": "B", "amount": 100.0, "timestamp": 0, "cross_border": 0}])
+        with pytest.raises(KeyError):
+            build_node_features(accounts, tx)
+
+    def test_a_single_counterparty_gives_zero_not_a_division_error(self):
+        accounts = pd.DataFrame({"account_id": ["A", "B"], "account_type": ["individual"] * 2, "country": ["US"] * 2,
+                                 "risk_score": [0.0] * 2, "opened_ts": [0, 1000]})
+        tx = pd.DataFrame([{"tx_id": "T0", "src": "A", "dst": "B", "amount": 100.0, "timestamp": 0, "cross_border": 0}])
+        x, names = build_node_features(accounts, tx)
+        assert x[0, names.index("counterparty_registration_cluster_ratio")] == 0.0

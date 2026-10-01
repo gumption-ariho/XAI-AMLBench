@@ -112,10 +112,18 @@ def extract_explanation(model: Any, graph: dict, feature_names: list[str], accou
         })
 
     nodes = []
+    has_age = "opened_ts" in graph
+    now_ts = int(graph["tx_timestamp"].max()) if has_age else None   # a portable "now": the graph's own latest
+                                                                     # transaction, not a generator-specific constant
     for local_idx in sorted(node_ids):
         global_idx = int(subset[local_idx])
-        nodes.append({"account_id": ids[global_idx], "account_type": graph["account_type"][global_idx],
-                      "country": graph["country"][global_idx]})
+        node = {"account_id": ids[global_idx], "account_type": graph["account_type"][global_idx],
+               "country": graph["country"][global_idx]}
+        if has_age:
+            # backward-compatible: older graph.pt files saved before this field existed simply omit it, rather
+            # than raising -- callers (sar_generator's infer_typology) already treat a missing age as "unknown"
+            node["age_days"] = round((now_ts - int(graph["opened_ts"][global_idx])) / 86400, 1)
+        nodes.append(node)
 
     # Normalise against the sum of the SHOWN top-k features, not all 26 -- dividing by the grand total (including
     # the 20 features never displayed) mechanically dilutes every shown percentage regardless of how sparse the

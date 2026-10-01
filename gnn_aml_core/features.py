@@ -28,7 +28,7 @@ FEATURE_NAMES = [
     "type_individual", "type_business", "type_shell",
     "round_amt_ratio", "micro_tx_ratio", "decimal_precision_ratio",
     "volume_shift_ratio", "tax_haven_cp_ratio", "hour_concentration", "pass_through_match_ratio",
-    "high_risk_dest_ratio",
+    "high_risk_dest_ratio", "shared_memo_ratio", "dispute_rate", "counterparty_registration_cluster_ratio",
 ]
 _LOG_FEATURES = {
     "out_deg", "in_deg", "out_uniq", "in_uniq", "out_amt_sum", "in_amt_sum", "out_amt_mean",
@@ -207,6 +207,71 @@ def build_node_features(accounts: pd.DataFrame, tx: pd.DataFrame, reporting_thre
         df["high_risk_dest_ratio"] = hr_out.reindex(df.index).fillna(0.0)
     else:
         df["high_risk_dest_ratio"] = 0.0
+
+    # shared_memo_ratio: share of an account's outbound transactions whose memo/reference text (a) is not one
+    # of a handful of common, generic strings, and (b) is used by 2+ OTHER, distinct accounts elsewhere in the
+    # graph -- a real red flag (coordinated mules copy-pasting the same reference text, typo and all). Requires
+    # the memo to be shared by genuinely unrelated senders, not just repeated by the same account many times,
+    # since one account reusing its own memo is ordinary behaviour, not coordination. Only meaningful if the
+    # transactions frame carries a "memo" column; degrades safely to 0.0 otherwise (real, non-synthetic data
+    # will not have this column at all).
+    if "memo" in tx.columns:
+        generic = {"PAYMENT", "INVOICE PMT", "TRANSFER", "RENT", "SALARY", ""}
+        non_generic = tx[~tx["memo"].isin(generic)]
+        senders_per_memo = non_generic.groupby("memo")["src"].nunique()
+        shared_memos = set(senders_per_memo[senders_per_memo >= 2].index)
+        tx["_shared_memo"] = tx["memo"].isin(shared_memos)
+        shared_out = tx.groupby("src")["_shared_memo"].mean()
+        df["shared_memo_ratio"] = shared_out.reindex(df.index).fillna(0.0)
+    else:
+        df["shared_memo_ratio"] = 0.0
+
+    # dispute_rate: share of an account's own outbound transactions that were later disputed/reversed. A real
+    # red flag when elevated well above baseline (repeatedly testing a platform's automated reversal logic),
+    # distinct from the occasional legitimate dispute every account has some small chance of. Only meaningful
+    # if the transactions frame carries a "disputed" column; degrades safely to 0.0 otherwise (real,
+    # non-synthetic data will not have this column at all).
+    if "disputed" in tx.columns:
+        dispute_out = tx.groupby("src")["disputed"].mean()
+        df["dispute_rate"] = dispute_out.reindex(df.index).fillna(0.0)
+    else:
+        df["dispute_rate"] = 0.0
+
+    # counterparty_registration_cluster_ratio: for each account, the largest share of its distinct
+    # counterparties that were all registered on the exact same day as each other -- a real red flag (a batch
+    # of mule accounts opened together, then used together), reusing opened_ts (already available on every
+    # account, threaded through earlier this session for dormant_reactivation) rather than needing any new
+    # schema field. An ordinary account's counterparties open their accounts independently, so this is
+    # naturally near 0 for most accounts; it only rises when several counterparties genuinely share a
+    # registration day, which real batch-created mule networks do and ordinary traffic does not.
+    #
+    # The "opened_ts not in accounts.columns" branch below is defensive, not currently reachable in practice:
+    # age_days (above) already accesses accounts["opened_ts"] directly with no guard, so this function has
+    # always hard-required that column for any real caller. Kept anyway as honest, harmless defensive code,
+    # not represented as an exercised fallback path (see test_features.py's note on this).
+    if "opened_ts" in accounts.columns:
+        opened = accounts.set_index("account_id")["opened_ts"]
+        reg_day_out = tx["dst"].map(opened) // 86400
+        reg_day_in = tx["src"].map(opened) // 86400
+        cluster_ratio = {}
+        for acct, group in pd.concat([
+            pd.DataFrame({"acct": tx["src"], "cp": tx["dst"], "reg_day": reg_day_out}),
+            pd.DataFrame({"acct": tx["dst"], "cp": tx["src"], "reg_day": reg_day_in}),
+        ]).groupby("acct"):
+            cps = group.drop_duplicates("cp").dropna(subset=["reg_day"])
+            # counterparties with an unknown registration date (an external account not present in the
+            # accounts table at all -- a real, common case, not a hypothetical one: it crashed every test
+            # whose transactions referenced any external counterparty, not just tests written for this
+            # feature specifically) contribute no clustering signal and are excluded, not treated as an error.
+            n_cps = len(cps)
+            if n_cps == 0:
+                cluster_ratio[acct] = 0.0
+                continue
+            largest_cluster = int(cps["reg_day"].value_counts().max())
+            cluster_ratio[acct] = (largest_cluster - 1) / n_cps if n_cps > 1 else 0.0
+        df["counterparty_registration_cluster_ratio"] = df.index.map(cluster_ratio).fillna(0.0)
+    else:
+        df["counterparty_registration_cluster_ratio"] = 0.0
 
     x = df[FEATURE_NAMES].astype("float64").copy()
     for c in _LOG_FEATURES:

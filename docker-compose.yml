@@ -44,7 +44,12 @@ services:
       DOCKER_API_VERSION: "1.44"      # Docker Engine 29+ refuses the old API version Traefik v3.1 uses; without this Traefik finds no containers
     ports:
       - "80:80"
-      - "8081:8081"               # Traefik dashboard (dev only)
+      - "127.0.0.1:8081:8081"     # Traefik dashboard (dev only) -- localhost-only, matching the "dev only"
+                                  # comment's own intent. Was previously bound to all interfaces with no
+                                  # authentication at all, a real finding from a security hygiene pass: this
+                                  # dashboard can disclose internal routing/service topology, and shipping it
+                                  # reachable from the network by default is exactly the kind of thing that
+                                  # should never happen just because nobody set an explicit binding.
     volumes:
       - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro

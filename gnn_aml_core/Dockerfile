@@ -11,6 +11,13 @@ RUN pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cpu \
  && pip install "numpy<2" -r gnn_aml_core/requirements.txt
 
 COPY gnn_aml_core gnn_aml_core
+# gnn_aml_core.main's own /explain endpoint calls xai_explainer.extractor.extract_explanation directly (the
+# GNNExplainer subgraph extraction logic), so xai_explainer must be present in THIS image too, not just the
+# separate xai-narrative-api container -- a real bug, found on a real run: this was missing entirely, so the
+# whole gnn-detection-api service crash-looped on startup with ModuleNotFoundError. Importing xai_explainer.
+# extractor also runs xai_explainer/__init__.py first (which imports sar_generator, needing networkx -- see
+# requirements.txt), even though extractor.py itself does not need sar_generator at all.
+COPY xai_explainer xai_explainer
 
 EXPOSE 8000
 CMD ["uvicorn", "gnn_aml_core.main:app", "--host", "0.0.0.0", "--port", "8000"]

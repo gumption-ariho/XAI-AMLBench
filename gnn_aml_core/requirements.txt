@@ -9,6 +9,9 @@ scikit-learn
 redis
 kafka-python
 immudb-py
+networkx   # xai_explainer/__init__.py (triggered just by importing xai_explainer.extractor for /explain)
+          # imports sar_generator, which needs this -- extractor.py itself does not, but the parent package's
+          # __init__.py always runs first
 prometheus-client
 prometheus-fastapi-instrumentator
 psycopg[binary]   # gnn_aml_core.feedback reads officer decisions from the same Postgres alerts table the backend writes to

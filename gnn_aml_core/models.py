@@ -30,11 +30,19 @@ class GATv2Detector(nn.Module):
         self.head = nn.Sequential(nn.Linear(d, hidden), nn.ReLU(), nn.Dropout(dropout), nn.Linear(hidden, 1))
 
     def forward(self, x, edge_index, edge_attr=None, edge_type=None):
+        return self.head(self.embed(x, edge_index, edge_attr=edge_attr)).view(-1)
+
+    def embed(self, x, edge_index, edge_attr=None, edge_type=None):
+        """The learned node representation just before the final classification layer -- useful on its own for
+        feeding into a different downstream model (e.g. gradient boosting), separate from this network's own
+        prediction. Added for gnn_aml_core.elliptic_search: on the real Elliptic dataset, boosting trained on
+        these learned embeddings can be compared directly against boosting trained on hand-engineered
+        neighbour-averaged features, the approach that actually won there."""
         for conv, norm in zip(self.convs, self.norms):
             x = conv(x, edge_index, edge_attr=edge_attr)
             x = F.elu(norm(x))
             x = F.dropout(x, p=self.dropout, training=self.training)
-        return self.head(x).view(-1)
+        return x
 
 
 class RGCNDetector(nn.Module):
@@ -55,13 +63,17 @@ class RGCNDetector(nn.Module):
         self.head = nn.Sequential(nn.Linear(d, hidden), nn.ReLU(), nn.Dropout(dropout), nn.Linear(hidden, 1))
 
     def forward(self, x, edge_index, edge_attr=None, edge_type=None):
+        return self.head(self.embed(x, edge_index, edge_type=edge_type)).view(-1)
+
+    def embed(self, x, edge_index, edge_attr=None, edge_type=None):
+        """See GATv2Detector.embed's docstring -- the same idea, applied here."""
         if edge_type is None:
             edge_type = torch.zeros(edge_index.size(1), dtype=torch.long, device=edge_index.device)
         for conv, norm in zip(self.convs, self.norms):
             x = conv(x, edge_index, edge_type)
             x = F.relu(norm(x))
             x = F.dropout(x, p=self.dropout, training=self.training)
-        return self.head(x).view(-1)
+        return x
 
 
 def build_model(name: str, in_dim: int, **hp) -> nn.Module:

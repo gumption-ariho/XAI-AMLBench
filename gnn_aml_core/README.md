@@ -63,6 +63,48 @@ on our part. It is not equivalent to a pilot on a real bank's own wire-transfer 
 transfers are different domains, and roughly three-quarters of Elliptic's transactions have no label at all
 (not "confirmed clean", just unknown). Report both benchmarks together, not the Elliptic one alone, and say so.
 
+## A second real-data check, the right domain this time: SynthAML (`synthaml.py`)
+
+Elliptic is real, but it is crypto, not bank wire transfers -- a different domain from what this whole project
+targets. [SynthAML](https://doi.org/10.1038/s41597-023-02569-2) (Jensen et al., 2023, *Nature Scientific Data*)
+closes that specific gap: it is built directly from a real Danish bank's (Spar Nord) actual transaction and AML
+alert data, in the right domain (card, cash, international and wire activity), with a peer-reviewed claim that
+performance on it transfers to the real world.
+
+**Read this before using it: SynthAML has no graph structure at all.** Each row is one client's transaction
+*history* leading up to an alert, not a network of transactions between accounts -- there is no src/dst, and
+`fit_gnn` (GATv2/RGCN) cannot be run on it. What it genuinely gives us is a real, bank-derived tabular benchmark
+for our baseline classifiers specifically, directly comparable to the paper's own reported numbers.
+
+```bash
+python -m gnn_aml_core.synthaml --data data/synthaml
+```
+
+Download SynthAML's two open-access CSV files from https://doi.org/10.6084/m9.figshare.c.6504421.v1 and place
+them in that folder. The loader replicates the paper's own feature engineering exactly (56 hand-engineered
+summary statistics per alert) and respects its quarter-only date accuracy (any split must fall on a quarter
+boundary, enforced rather than silently accepted).
+
+## Does detection degrade if launderers adapt? (`aml_synth/adversarial.py`)
+
+The feedback loop below assumes retraining helps once launderers change behaviour in response to being
+caught -- this module actually tests that assumption instead of just asserting it. It trains a baseline on one
+generation of synthetic data, measures which features it relies on most (the model's own coefficients, not an
+external guess), generates a second generation with `camouflage` raised specifically for the typologies those
+features implicate, and compares the SAME unretrained model's accuracy on both generations -- the drop is a
+real, quantified measure of adaptation pressure, not an assumption.
+
+```bash
+python -m aml_synth.adversarial --accounts 5000 --seed 1
+```
+
+**Honest finding from actually running this**: `camouflage` (currently the only real "blend in more" knob this
+generator exposes) does not reliably move detection difficulty here, even at a 5x increase -- consistent with
+what difficulty-calibration work earlier this session already found. The simulation mechanism itself works
+correctly; what it reveals is that a genuinely strong adaptation test would need the typology-specific
+imperfection parameters (retained fraction, timing spread) exposed as configurable knobs too, which they
+currently are not. A real, scoped follow-up, not attempted here.
+
 ## Keeping the model current: officer feedback (`feedback.py`)
 
 A model trained once and never revisited goes stale, because real launderers adapt once they learn what gets

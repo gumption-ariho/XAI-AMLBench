@@ -22,7 +22,7 @@ import shutil
 import sys
 from pathlib import Path
 
-VERSION = "v3  (calibrated risk scores on the gauge and network panel; demo mode: npm run dev:demo, Next 15.5.21 + React 19)"
+VERSION = "v5  (a real login screen (LoginScreen.tsx) replaces the prompt() placeholder: verifies the key via /api/whoami before accepting it, shows who is signed in, removes the now-stale free-text officer-name input; pairs with setup_backend_v47; includes v4)"
 MARK_FILE, MARK_END, PAYLOAD = "@@@@FILE: ", "@@@@END", "#==== PAYLOAD BELOW ===="
 OLD_JS = ["src/app/layout.js", "src/app/page.js"]
 BACKUP = "_old_js_backup"
@@ -2519,6 +2519,20 @@ if __name__ == "__main__":
 #|.chip { background: rgba(59, 130, 246, .08); border: 1px solid var(--line); color: var(--muted); border-radius: 999px; padding: 3px 12px; font-size: 12.5px; cursor: pointer; transition: all .2s; }
 #|.chip:hover { color: #fff; border-color: var(--line-hi); transform: translateY(-1px); }
 #|.chip.bad { border-color: rgba(251, 113, 133, .35); color: #fda4af; }
+#|
+#|.login-screen { min-height: 100svh; display: flex; align-items: center; justify-content: center; padding: 24px; }
+#|.login-card-wrap { width: 100%; max-width: 420px; }
+#|.login-card { display: flex; flex-direction: column; gap: 16px; padding: 32px; }
+#|.login-brand { display: flex; align-items: center; gap: 14px; }
+#|.login-shield { display: inline-flex; width: 40px; height: 40px; align-items: center; justify-content: center;
+#|  border-radius: 12px; background: rgba(59, 130, 246, .14); border: 1px solid var(--line-hi); color: var(--cyan); }
+#|.login-title { font-size: 17px; font-weight: 600; letter-spacing: .02em; }
+#|.login-subtitle { font-size: 12px; color: var(--dim); text-transform: uppercase; letter-spacing: .08em; }
+#|.login-hint { font-size: 13px; color: var(--muted); line-height: 1.5; }
+#|.login-hint code { background: rgba(3, 9, 30, .6); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; font-size: 12px; }
+#|.login-input { width: 100%; }
+#|.login-error { font-size: 13px; color: #fda4af; line-height: 1.4; }
+#|.login-submit { width: 100%; justify-content: center; }
 #|.seg { display: inline-flex; background: rgba(3, 9, 30, .55); border: 1px solid var(--line); border-radius: 12px; padding: 4px; }
 #|.seg button { background: none; border: 0; color: var(--muted); text-transform: capitalize; padding: 6px 14px; border-radius: 9px; cursor: pointer; transition: all .25s; }
 #|.seg button.on { background: linear-gradient(135deg, #2563eb, #0ea5e9); color: #fff; box-shadow: 0 4px 14px rgba(37, 99, 235, .45); }
@@ -2725,10 +2739,11 @@ if __name__ == "__main__":
 #|import type { DockTab } from "@/components/FloatingDock";
 #|import Glass from "@/components/Glass";
 #|import { IconBell, IconGraph, IconHome, IconRadar, IconShield } from "@/components/Icons";
+#|import LoginScreen from "@/components/LoginScreen";
 #|import NetworkGraph from "@/components/NetworkGraph";
 #|import RiskGauge from "@/components/RiskGauge";
 #|import { useCountUp, useTypewriter } from "@/components/hooks";
-#|import { api, errorMessage, pct, sleep } from "@/lib/api";
+#|import { api, clearApiKey, errorMessage, hasStoredApiKey, pct, sleep } from "@/lib/api";
 #|import { isDemo } from "@/lib/demo";
 #|import type {
 #|  Alert,
@@ -2741,6 +2756,7 @@ if __name__ == "__main__":
 #|  TabId,
 #|  Toast,
 #|  ToastKind,
+#|  WhoamiResponse,
 #|} from "@/types";
 #|
 #|const niceType = (t: string | null): string => (t ? t.replaceAll("_", " ") : "");
@@ -2859,7 +2875,8 @@ if __name__ == "__main__":
 #|  const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null);
 #|  const [accountId, setAccountId] = useState<string>("");
 #|  const [scan, setScan] = useState<ScanResult | null>(null);
-#|  const [officer, setOfficer] = useState<string>("");
+#|  const [authedOfficer, setAuthedOfficer] = useState<string | null>(null);
+#|  const [authChecked, setAuthChecked] = useState<boolean>(demoMode);   // demo mode skips auth entirely
 #|  const [filter, setFilter] = useState<Filter>("all");
 #|  const [busy, setBusy] = useState<string>("");
 #|  const [fresh, setFresh] = useState<Set<number>>(() => new Set<number>());
@@ -2889,6 +2906,29 @@ if __name__ == "__main__":
 #|      setReady(true);
 #|    });
 #|  }, [demoMode]);
+#|
+#|  useEffect(() => {
+#|    if (demoMode) return;   // demo mode has no real backend to authenticate against at all
+#|    if (!hasStoredApiKey()) {
+#|      setAuthChecked(true);
+#|      return;
+#|    }
+#|    // a key is already stored (e.g. this tab's sessionStorage survived a reload) -- verify it still works
+#|    // rather than trusting it blindly, since it may have been revoked since the last page load
+#|    api<WhoamiResponse>("/whoami")
+#|      .then((who) => setAuthedOfficer(who.officer))
+#|      .catch(() => clearApiKey())
+#|      .finally(() => setAuthChecked(true));
+#|  }, [demoMode]);
+#|
+#|  const handleLoginSuccess = useCallback((officerName: string): void => {
+#|    setAuthedOfficer(officerName);
+#|  }, []);
+#|
+#|  const handleLogout = useCallback((): void => {
+#|    clearApiKey();
+#|    setAuthedOfficer(null);
+#|  }, []);
 #|
 #|  useEffect(() => {
 #|    if (!ready) return undefined;
@@ -2944,15 +2984,11 @@ if __name__ == "__main__":
 #|  };
 #|
 #|  const doDecision = async (id: number, decision: "confirmed" | "dismissed"): Promise<void> => {
-#|    if (!officer.trim()) {
-#|      notify("err", "Enter the reviewing officer's name first.");
-#|      return;
-#|    }
 #|    setBusy(`d${id}`);
 #|    try {
 #|      const updated = await api<Alert>(`/alerts/${id}/decision`, {
 #|        method: "POST",
-#|        body: JSON.stringify({ officer: officer.trim(), decision, note: "" }),
+#|        body: JSON.stringify({ decision, note: "" }),
 #|      });
 #|      setAlerts((list) => list.map((x) => (x.id === id ? updated : x)));
 #|      notify("ok", `Alert #${id} ${decision} and written to the audit ledger`);
@@ -3120,7 +3156,6 @@ if __name__ == "__main__":
 #|            ))}
 #|          </div>
 #|          <div className="row">
-#|            <input className="input" placeholder="Reviewing officer name" value={officer} onChange={(e) => setOfficer(e.target.value)} />
 #|            <button className="btn ghost" onClick={() => void load()}>Refresh</button>
 #|          </div>
 #|        </div>
@@ -3225,6 +3260,18 @@ if __name__ == "__main__":
 #|    </>
 #|  );
 #|
+#|  if (!authChecked) {
+#|    return <Background />;   // brief, near-instant check of an already-stored key; nothing worth a spinner for
+#|  }
+#|  if (!demoMode && !authedOfficer) {
+#|    return (
+#|      <>
+#|        <Background />
+#|        <LoginScreen onSuccess={handleLoginSuccess} />
+#|      </>
+#|    );
+#|  }
+#|
 #|  return (
 #|    <>
 #|      <Background />
@@ -3251,6 +3298,12 @@ if __name__ == "__main__":
 #|            <i />
 #|            {online === null ? "Connecting…" : online ? "Backend online" : "Backend offline"}
 #|          </div>
+#|          {authedOfficer && (
+#|            <div className="row officer-badge">
+#|              <span className="muted">Signed in as {authedOfficer}</span>
+#|              <button className="btn ghost" onClick={handleLogout}>Sign out</button>
+#|            </div>
+#|          )}
 #|        </header>
 #|
 #|        <main key={tab} className="view">
@@ -3515,6 +3568,87 @@ if __name__ == "__main__":
 #|    <path d="m9 12 2.2 2.2L15.5 10" />
 #|  </svg>
 #|);
+#|@@@@END
+#|@@@@FILE: src/components/LoginScreen.tsx
+#|"use client";
+#|
+#|import { useState } from "react";
+#|import type { FormEvent, ReactElement } from "react";
+#|import Glass from "@/components/Glass";
+#|import { IconShield } from "@/components/Icons";
+#|import { api, setApiKey } from "@/lib/api";
+#|import type { WhoamiResponse } from "@/types";
+#|
+#|interface LoginScreenProps {
+#|  /** Called once the entered key is verified against /whoami -- the real officer name comes back from the
+#|   * backend, never from anything typed into this form, so the audit trail always reflects who actually
+#|   * authenticated, not a self-reported name. */
+#|  onSuccess: (officer: string) => void;
+#|}
+#|
+#|/** Replaces the earlier prompt()-based placeholder with a real form: the key is verified against /whoami
+#| * before it is treated as valid, and a wrong or revoked key gets a clear, specific error rather than silently
+#| * failing on the first real request. */
+#|export default function LoginScreen({ onSuccess }: LoginScreenProps): ReactElement {
+#|  const [key, setKey] = useState<string>("");
+#|  const [error, setError] = useState<string>("");
+#|  const [busy, setBusy] = useState<boolean>(false);
+#|
+#|  const handleSubmit = async (e: FormEvent): Promise<void> => {
+#|    e.preventDefault();
+#|    const trimmed = key.trim();
+#|    if (!trimmed) {
+#|      setError("Enter your officer API key.");
+#|      return;
+#|    }
+#|    setBusy(true);
+#|    setError("");
+#|    setApiKey(trimmed);   // must be stored before calling api(), which reads the key from storage
+#|    try {
+#|      const who = await api<WhoamiResponse>("/whoami");
+#|      onSuccess(who.officer);
+#|    } catch {
+#|      setError("That key was not accepted. Check it for typos, or ask whoever ran manage_keys.py to confirm it hasn't been revoked.");
+#|    } finally {
+#|      setBusy(false);
+#|    }
+#|  };
+#|
+#|  return (
+#|    <div className="login-screen">
+#|      <form className="login-card-wrap" onSubmit={(e) => void handleSubmit(e)}>
+#|        <Glass as="div" className="login-card">
+#|          <div className="login-brand">
+#|            <span className="login-shield"><IconShield /></span>
+#|            <div>
+#|              <div className="login-title">XAI·AMLBench</div>
+#|              <div className="login-subtitle">Compliance Console</div>
+#|            </div>
+#|          </div>
+#|          <p className="login-hint">
+#|            Sign in with your officer API key. Issued with <code>manage_keys.py create</code> -- ask your
+#|            administrator for one if you don&apos;t have it.
+#|          </p>
+#|          <input
+#|            className="input login-input"
+#|            type="password"
+#|            placeholder="officer_…"
+#|            value={key}
+#|            onChange={(e) => setKey(e.target.value)}
+#|            autoFocus
+#|            disabled={busy}
+#|            autoComplete="off"
+#|            spellCheck={false}
+#|          />
+#|          {error && <p className="login-error">{error}</p>}
+#|          <button className="btn shine login-submit" type="submit" disabled={busy || !key.trim()}>
+#|            {busy ? "Checking…" : "Sign in"}
+#|          </button>
+#|        </Glass>
+#|      </form>
+#|    </div>
+#|  );
+#|}
 #|@@@@END
 #|@@@@FILE: src/components/NetworkGraph.tsx
 #|"use client";
@@ -4016,10 +4150,42 @@ if __name__ == "__main__":
 #|}
 #|@@@@END
 #|@@@@FILE: src/lib/api.ts
-#|/** Thin typed wrapper around fetch for the /api routes (served by Traefik or the Next.js rewrite). */
+#|/** Thin typed wrapper around fetch for the /api routes (served by Traefik or the Next.js rewrite).
+#| *
+#| * Every route but /api/health requires "Authorization: Bearer <key>" (a real security fix: the backend
+#| * previously had no authentication at all). The key is kept in sessionStorage -- cleared when the tab closes,
+#| * never sent to localStorage or baked into the build (either of those would defeat the point: a key baked into
+#| * the compiled JS is visible to anyone via the browser's dev tools, and localStorage persists indefinitely,
+#| * widening an XSS attack's window). A real login screen (components/LoginScreen.tsx) collects the key and
+#| * verifies it via /whoami before storing it -- this module no longer falls back to a prompt() if the key is
+#| * missing; that was a deliberately temporary placeholder, now replaced. */
+#|const API_KEY_STORAGE_KEY = "xai_amlbench_api_key";
+#|
+#|export function getStoredApiKey(): string {
+#|  if (typeof window === "undefined") return "";           // server-side render: no browser storage to read
+#|  return window.sessionStorage.getItem(API_KEY_STORAGE_KEY) ?? "";
+#|}
+#|
+#|export function hasStoredApiKey(): boolean {
+#|  return getStoredApiKey() !== "";
+#|}
+#|
+#|export function setApiKey(key: string): void {
+#|  if (typeof window !== "undefined") window.sessionStorage.setItem(API_KEY_STORAGE_KEY, key);
+#|}
+#|
+#|export function clearApiKey(): void {
+#|  if (typeof window !== "undefined") window.sessionStorage.removeItem(API_KEY_STORAGE_KEY);
+#|}
+#|
 #|export async function api<T>(path: string, options?: RequestInit): Promise<T> {
+#|  const headers: Record<string, string> = { "Content-Type": "application/json" };
+#|  if (path !== "/health") {
+#|    const key = getStoredApiKey();
+#|    if (key) headers["Authorization"] = `Bearer ${key}`;
+#|  }
 #|  const res = await fetch(`/api${path}`, {
-#|    headers: { "Content-Type": "application/json" },
+#|    headers: { ...headers, ...(options?.headers as Record<string, string> | undefined) },
 #|    ...options,
 #|  });
 #|  const text = await res.text();
@@ -4031,6 +4197,10 @@ if __name__ == "__main__":
 #|    data = { detail: text };
 #|  }
 #|
+#|  if (res.status === 401) {
+#|    clearApiKey();   // the stored key was rejected (wrong or revoked) -- drop it so the app re-shows the
+#|                     // login screen rather than silently retrying the same bad key forever
+#|  }
 #|  if (!res.ok) {
 #|    const detail = (data as { detail?: unknown }).detail;
 #|    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
@@ -4070,6 +4240,10 @@ if __name__ == "__main__":
 #|export type AlertStatus = "open" | "confirmed" | "dismissed";
 #|export type TabId = "overview" | "scan" | "alerts" | "network";
 #|export type ToastKind = "ok" | "err" | "warn";
+#|
+#|export interface WhoamiResponse {
+#|  officer: string;
+#|}
 #|
 #|export interface Alert {
 #|  id: number;

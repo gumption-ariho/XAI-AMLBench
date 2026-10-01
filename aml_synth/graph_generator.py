@@ -193,6 +193,14 @@ class AMLGraphGenerator:
         # signal that only ever appears on illicit accounts would make this feature trivially separating
         # rather than a realistic, imperfect red flag.
         self.a_highrisk = ((self._cosmetic_rng.random(n) < 0.01) & (kind == 1)).tolist()
+        # a_memo_tag: a shared reference-code string for accounts coordinated to use identical (often
+        # identically-misspelled) transaction memo lines -- a real red flag (coordinated mules copy-pasting the
+        # same reference text). Empty string means "no shared tag, use an ordinary memo instead" at assembly time.
+        self.a_memo_tag = [""] * n
+        # a_dispute_prone: accounts that repeatedly dispute their own transactions, testing a platform's
+        # automated reversal logic -- a real red flag. A small baseline rate among ordinary business accounts
+        # too (not just illicit patterns' own accounts), for the same realism reason as a_highrisk above.
+        self.a_dispute_prone = ((self._cosmetic_rng.random(n) < 0.01) & (kind == 1)).tolist()
         w = rng.pareto(1.6, n) + 1.0
         self.pool_w = w / w.sum()
         self.by_cty = {}
@@ -219,6 +227,8 @@ class AMLGraphGenerator:
         self.a_susp.append(0)
         self.a_typo.append(0)
         self.a_highrisk.append(False)
+        self.a_memo_tag.append("")
+        self.a_dispute_prone.append(False)
         return len(self.a_type) - 1
 
     def _flag(self, i: int, typo: str) -> None:
@@ -230,6 +240,16 @@ class AMLGraphGenerator:
         """Tag an account as a high-risk-category destination (crypto exchange, gambling operator, or similar
         merchant category), so transactions into it can be flagged category='high_risk_dest'."""
         self.a_highrisk[i] = True
+
+    def _mark_memo_tag(self, i: int, tag: str) -> None:
+        """Tag an account so its outbound transactions carry the given shared memo/reference string -- used to
+        simulate coordinated mules that copy-paste the same (often identically misspelled) reference text."""
+        self.a_memo_tag[i] = tag
+
+    def _mark_dispute_prone(self, i: int) -> None:
+        """Tag an account as one that repeatedly disputes its own transactions -- probing a platform's
+        automated reversal logic, a real red flag distinct from an ordinary occasional dispute."""
+        self.a_dispute_prone[i] = True
 
     def _pool_pick(self, k: int, among: np.ndarray | None = None, home: int | None = None) -> np.ndarray:
         src = among if among is not None and len(among) else np.arange(self.cfg.n_accounts)
@@ -334,9 +354,30 @@ class AMLGraphGenerator:
         k = min(int(rng.integers(80, 201)), max(20, int(0.04 * self.cfg.n_accounts)))    # small graphs get fewer mules
         n_pool = int(k * 0.4)
         mules = [int(x) for x in self._pool_pick(n_pool, self.ind, home)]
-        mules += [self._acct("individual", home) for _ in range(k - n_pool)]
+        # a realistic subset of freshly-created mules share a near-identical registration date (a real batch
+        # account-creation red flag). Created normally first (every mule still draws its own age via self.rng,
+        # keeping the main structural RNG stream identical regardless of batching), then a subset's age is
+        # OVERWRITTEN afterward using the isolated cosmetic RNG -- the same safe pattern as _mark_highrisk,
+        # rather than passing age= conditionally at creation time, which would have skipped self.rng's own age
+        # draw for exactly the batched mules and silently shifted every subsequent pattern's random draws (the
+        # same class of bug the cosmetic-RNG isolation elsewhere in this file exists to prevent).
+        new_mules = [self._acct("individual", home) for _ in range(k - n_pool)]
+        shared_batch_age = float(self._cosmetic_rng.uniform(20, 400))
+        for m in new_mules:
+            if self._cosmetic_rng.random() < 0.4:
+                self.a_age[m] = shared_batch_age
+        mules += new_mules
         for m in mules:
             self._flag(m, name)
+        # a real red flag: coordinated mules sometimes copy-paste the same reference text into the memo line,
+        # typo and all. Only a realistic MINORITY of mules share the tag (never all of them -- a uniform memo
+        # across every single mule would be a far too obvious, unrealistically clean tell), using the cosmetic
+        # RNG so this tagging decision cannot perturb the rest of this pattern's structure (see the a_highrisk
+        # RNG-isolation fix earlier this session for why that separation matters).
+        typo_tag = f"CONSULTNG FEE REF{self._pid:04d}"    # deliberately missing the "I" in "CONSULTING"
+        for m in mules:
+            if self._cosmetic_rng.random() < 0.25:
+                self._mark_memo_tag(m, typo_tag)
         deposits = int(rng.integers(self.cfg.smurf_deposits[0], self.cfg.smurf_deposits[1] + 1))
         deposits = max(50, min(deposits, int(0.3 * self.counts["background_tx"])))        # never dwarf a small graph
         burst = rng.uniform(2, 6) * DAY
@@ -496,6 +537,10 @@ class AMLGraphGenerator:
         home = self._home()
         subject = self._acct("individual" if rng.random() < 0.6 else "business", home)
         self._flag(subject, name)
+        # some accounts running this pattern also probe reversal logic with repeated small disputes -- a real,
+        # imperfect overlay (not every instance, via the cosmetic RNG so it cannot perturb the pattern itself).
+        if self._cosmetic_rng.random() < 0.3:
+            self._mark_dispute_prone(subject)
         n_in = int(rng.integers(15, 45))
         span = rng.uniform(1 * DAY, 10 * DAY)
         counterparties = self._pool_pick(n_in)
@@ -662,6 +707,26 @@ class AMLGraphGenerator:
         highrisk = np.array(self.a_highrisk, dtype=bool)
         category = np.where(highrisk[dst], "high_risk_dest", "standard")
 
+        # memo: a transaction reference/memo line. A tagged source account (see _mark_memo_tag) always uses its
+        # shared (often deliberately misspelled) reference text; everything else draws from a small pool of
+        # ordinary, generic memo strings -- including occasional genuine overlaps between unrelated accounts,
+        # since real legitimate traffic does sometimes coincidentally share a common memo like "PAYMENT" or
+        # "INVOICE", and a feature meant to catch coordinated identical memos needs that realistic background
+        # noise to be a meaningful (imperfect) signal rather than a trivial one.
+        memo_tags = np.array(self.a_memo_tag)
+        generic_memos = np.array(["PAYMENT", "INVOICE PMT", "TRANSFER", "RENT", "SALARY", ""])
+        generic_pick = generic_memos[self._cosmetic_rng.integers(0, len(generic_memos), size=len(src))]
+        memo = np.where(memo_tags[src] != "", memo_tags[src], generic_pick)
+
+        # disputed: whether this transaction was later disputed/reversed. A small baseline rate everywhere
+        # (real disputes happen for mundane reasons -- a wrong amount, a duplicate charge), and a much higher
+        # rate for transactions FROM an account tagged dispute-prone (repeatedly testing reversal logic, a real
+        # red flag distinct from an occasional legitimate dispute).
+        dispute_prone = np.array(self.a_dispute_prone, dtype=bool)
+        baseline_dispute = self._cosmetic_rng.random(len(src)) < 0.015
+        probing_dispute = dispute_prone[src] & (self._cosmetic_rng.random(len(src)) < 0.35)
+        disputed = baseline_dispute | probing_dispute
+
         n_acc = len(self.a_type)
         ids = np.array([f"ACC{i:07d}" for i in range(n_acc)])
         cty = np.array(self.a_cty)
@@ -680,7 +745,8 @@ class AMLGraphGenerator:
             "src": ids[src], "dst": ids[dst], "amount": np.round(amt, 2), "currency": "USD",
             "payment_format": np.array(PAYMENT_FORMATS)[fmt], "timestamp": ts,
             "cross_border": (cty[src] != cty[dst]).astype(np.int64),
-            "is_laundering": lab, "typology": typo_names[typ], "pattern_id": pid, "category": category,
+            "is_laundering": lab, "typology": typo_names[typ], "pattern_id": pid, "category": category, "memo": memo,
+            "disputed": disputed,
         })
         cfg = asdict(self.cfg)
         cfg.update({"resolved": self.counts, "generator_version": __version__, "start_ts": START_TS})

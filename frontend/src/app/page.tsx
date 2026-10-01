@@ -7,10 +7,11 @@ import FloatingDock from "@/components/FloatingDock";
 import type { DockTab } from "@/components/FloatingDock";
 import Glass from "@/components/Glass";
 import { IconBell, IconGraph, IconHome, IconRadar, IconShield } from "@/components/Icons";
+import LoginScreen from "@/components/LoginScreen";
 import NetworkGraph from "@/components/NetworkGraph";
 import RiskGauge from "@/components/RiskGauge";
 import { useCountUp, useTypewriter } from "@/components/hooks";
-import { api, errorMessage, pct, sleep } from "@/lib/api";
+import { api, clearApiKey, errorMessage, hasStoredApiKey, pct, sleep } from "@/lib/api";
 import { isDemo } from "@/lib/demo";
 import type {
   Alert,
@@ -23,6 +24,7 @@ import type {
   TabId,
   Toast,
   ToastKind,
+  WhoamiResponse,
 } from "@/types";
 
 const niceType = (t: string | null): string => (t ? t.replaceAll("_", " ") : "");
@@ -141,7 +143,8 @@ export default function Home(): ReactElement {
   const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null);
   const [accountId, setAccountId] = useState<string>("");
   const [scan, setScan] = useState<ScanResult | null>(null);
-  const [officer, setOfficer] = useState<string>("");
+  const [authedOfficer, setAuthedOfficer] = useState<string | null>(null);
+  const [authChecked, setAuthChecked] = useState<boolean>(demoMode);   // demo mode skips auth entirely
   const [filter, setFilter] = useState<Filter>("all");
   const [busy, setBusy] = useState<string>("");
   const [fresh, setFresh] = useState<Set<number>>(() => new Set<number>());
@@ -171,6 +174,29 @@ export default function Home(): ReactElement {
       setReady(true);
     });
   }, [demoMode]);
+
+  useEffect(() => {
+    if (demoMode) return;   // demo mode has no real backend to authenticate against at all
+    if (!hasStoredApiKey()) {
+      setAuthChecked(true);
+      return;
+    }
+    // a key is already stored (e.g. this tab's sessionStorage survived a reload) -- verify it still works
+    // rather than trusting it blindly, since it may have been revoked since the last page load
+    api<WhoamiResponse>("/whoami")
+      .then((who) => setAuthedOfficer(who.officer))
+      .catch(() => clearApiKey())
+      .finally(() => setAuthChecked(true));
+  }, [demoMode]);
+
+  const handleLoginSuccess = useCallback((officerName: string): void => {
+    setAuthedOfficer(officerName);
+  }, []);
+
+  const handleLogout = useCallback((): void => {
+    clearApiKey();
+    setAuthedOfficer(null);
+  }, []);
 
   useEffect(() => {
     if (!ready) return undefined;
@@ -226,15 +252,11 @@ export default function Home(): ReactElement {
   };
 
   const doDecision = async (id: number, decision: "confirmed" | "dismissed"): Promise<void> => {
-    if (!officer.trim()) {
-      notify("err", "Enter the reviewing officer's name first.");
-      return;
-    }
     setBusy(`d${id}`);
     try {
       const updated = await api<Alert>(`/alerts/${id}/decision`, {
         method: "POST",
-        body: JSON.stringify({ officer: officer.trim(), decision, note: "" }),
+        body: JSON.stringify({ decision, note: "" }),
       });
       setAlerts((list) => list.map((x) => (x.id === id ? updated : x)));
       notify("ok", `Alert #${id} ${decision} and written to the audit ledger`);
@@ -402,7 +424,6 @@ export default function Home(): ReactElement {
             ))}
           </div>
           <div className="row">
-            <input className="input" placeholder="Reviewing officer name" value={officer} onChange={(e) => setOfficer(e.target.value)} />
             <button className="btn ghost" onClick={() => void load()}>Refresh</button>
           </div>
         </div>
@@ -507,6 +528,18 @@ export default function Home(): ReactElement {
     </>
   );
 
+  if (!authChecked) {
+    return <Background />;   // brief, near-instant check of an already-stored key; nothing worth a spinner for
+  }
+  if (!demoMode && !authedOfficer) {
+    return (
+      <>
+        <Background />
+        <LoginScreen onSuccess={handleLoginSuccess} />
+      </>
+    );
+  }
+
   return (
     <>
       <Background />
@@ -533,6 +566,12 @@ export default function Home(): ReactElement {
             <i />
             {online === null ? "Connecting…" : online ? "Backend online" : "Backend offline"}
           </div>
+          {authedOfficer && (
+            <div className="row officer-badge">
+              <span className="muted">Signed in as {authedOfficer}</span>
+              <button className="btn ghost" onClick={handleLogout}>Sign out</button>
+            </div>
+          )}
         </header>
 
         <main key={tab} className="view">
