@@ -4,7 +4,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from gnn_aml_core.evaluation import best_f1_threshold, binary_metrics, full_report, rank_metrics
+from gnn_aml_core.evaluation import (best_f1_threshold, binary_metrics, full_report, precision_targets_table,
+                                     rank_metrics, recall_targets_table)
 from gnn_aml_core.features import (EDGE_DIM, FEATURE_NAMES, NUM_RELATIONS, build_edge_features, build_node_features,
                                    make_bidirectional, merge_reverse_copies, standardize)
 
@@ -185,6 +186,75 @@ class TestEvaluationMetrics:
         rep = full_report(y_val, p_val, y_test, p_test)
         assert rep["threshold"] == best_f1_threshold(y_val, p_val)
         assert "auc_roc" in rep and "f1" in rep and "fpr" in rep
+
+
+class TestRecallTargetsTable:
+    """How far recall can genuinely be pushed, and what it costs in false positives -- built after a real
+    question about whether this project's detectors can "catch everything". They can, in the narrow
+    mathematical sense of flagging every positive, but only ever by also flagging some negatives too once the
+    two classes' scores overlap at all; this reports the real, concrete cost rather than an abstract claim."""
+
+    def test_perfect_separation_reaches_recall_1_with_zero_false_positives(self):
+        y = [0] * 8 + [1, 1]
+        p = [0.1, 0.1, 0.2, 0.2, 0.3, 0.3, 0.4, 0.4, 0.9, 0.8]   # positives score strictly highest
+        rows = recall_targets_table(y, p, targets=(0.5, 1.0))
+        r100 = next(r for r in rows if r["target_recall"] == 1.0)
+        assert r100["recall"] >= 1.0
+        assert r100["fp"] == 0
+
+    def test_overlapping_scores_force_false_positives_at_recall_1(self):
+        # one positive (0.4) scores BELOW two negatives (0.5, 0.9) -- recall=1.0 is only reachable by also
+        # flagging those two negatives, the real, concrete cost this function exists to surface
+        y = [0, 0, 0, 0, 1, 1]
+        p = [0.1, 0.3, 0.5, 0.9, 0.4, 0.6]
+        rows = recall_targets_table(y, p, targets=(1.0,))
+        r = rows[0]
+        assert r["recall"] == 1.0
+        assert r["fp"] >= 2
+
+    def test_results_are_sorted_by_target_recall_ascending_regardless_of_input_order(self):
+        rows = recall_targets_table([0, 1, 0, 1], [0.1, 0.9, 0.2, 0.8], targets=(1.0, 0.5, 0.9))
+        assert [r["target_recall"] for r in rows] == [0.5, 0.9, 1.0]
+
+    def test_higher_recall_targets_never_have_strictly_lower_actual_recall(self):
+        # the function must not report a weaker operating point for a stricter target
+        y = [0] * 20 + [1] * 10
+        import numpy as np
+        rng = np.random.default_rng(3)
+        p = list(rng.random(20) * 0.6) + list(0.4 + rng.random(10) * 0.6)   # realistic overlap
+        rows = recall_targets_table(y, p, targets=(0.5, 0.8, 1.0))
+        recalls = [r["recall"] for r in rows]
+        assert all(a <= b + 1e-9 for a, b in zip(recalls, recalls[1:]))
+
+
+class TestPrecisionTargetsTable:
+    """The mirror of TestRecallTargetsTable: pushing PRECISION toward its own limit, and the real recall cost
+    that imposes -- built after a direct question about pushing precision to its limit."""
+
+    def test_perfect_precision_via_flagging_only_the_top_scoring_item(self):
+        y = [0, 0, 0, 1]
+        p = [0.1, 0.2, 0.3, 0.95]   # the one positive scores strictly highest
+        rows = precision_targets_table(y, p, targets=(1.0,))
+        r = rows[0]
+        assert r["precision"] == 1.0
+        assert r["tp"] == 1 and r["fp"] == 0
+
+    def test_exhaustive_search_finds_the_true_optimum_not_just_the_first_match(self):
+        # precision is NOT guaranteed monotonic as threshold rises (unlike recall): a false positive sitting
+        # just above a cluster of true positives means removing it (raising the threshold slightly) IMPROVES
+        # precision. A naive single-direction scan could stop at a worse point; this checks every threshold.
+        y = [0, 0, 0, 1, 0, 1, 1, 1]                      # one FP (0.85) sits just above 4 true positives
+        p = [0.1, 0.2, 0.3, 0.7, 0.85, 0.75, 0.8, 0.9]
+        rows = precision_targets_table(y, p, targets=(0.8,))
+        r = rows[0]
+        assert r["precision"] >= 0.8
+        assert r["recall"] == 1.0   # the true optimum flags all 4 TPs and excludes the one FP entirely
+
+    def test_an_unreachable_target_does_not_crash(self):
+        y = [1, 1, 1, 0]
+        p = [0.1, 0.2, 0.3, 0.9]   # the one negative scores highest; every real positive scores low
+        rows = precision_targets_table(y, p, targets=(1.0,))
+        assert len(rows) == 1
 
 
 def _mini_graph(rows):
@@ -432,3 +502,46 @@ class TestCounterpartyRegistrationClusterRatio:
         tx = pd.DataFrame([{"tx_id": "T0", "src": "A", "dst": "B", "amount": 100.0, "timestamp": 0, "cross_border": 0}])
         x, names = build_node_features(accounts, tx)
         assert x[0, names.index("counterparty_registration_cluster_ratio")] == 0.0
+
+
+class TestAvgAmtShiftRatio:
+    """Added after a real, privacy-safe finding from evaluating gnn_aml_core.company_fraud against an external
+    dataset: transaction COUNT carried almost no independent fraud signal (0.9%) once average size was known,
+    while the average itself was the strongest single signal (36.8%). volume_shift_ratio's SUM conflates
+    "amounts got bigger" with "there were simply more transactions" (sum = count * mean); this isolates the
+    part that finding says actually matters."""
+
+    def test_a_genuine_shift_in_average_size_is_detected(self):
+        accounts = pd.DataFrame({"account_id": ["A"], "account_type": ["individual"], "country": ["US"],
+                                 "risk_score": [0.0], "opened_ts": [0]})
+        tx = pd.DataFrame([
+            {"tx_id": "T0", "src": "A", "dst": "X", "amount": 10.0, "timestamp": 0, "cross_border": 0},
+            {"tx_id": "T1", "src": "A", "dst": "Y", "amount": 1000.0, "timestamp": 2000, "cross_border": 0},
+        ])
+        x, names = build_node_features(accounts, tx)
+        i = names.index("avg_amt_shift_ratio")
+        assert abs(x[0, i] - 1000 / 11) < 1e-3
+
+    def test_an_account_with_transactions_in_only_one_half_does_not_crash_or_produce_nan(self):
+        # pandas' .mean() of an empty group is NaN, not 0.0, unlike .sum() -- the same class of singleton/
+        # empty-group bug this project has hit more than once already, checked explicitly here
+        accounts = pd.DataFrame({"account_id": ["LATE_ONLY"], "account_type": ["individual"], "country": ["US"],
+                                 "risk_score": [0.0], "opened_ts": [0]})
+        tx = pd.DataFrame([{"tx_id": "T0", "src": "LATE_ONLY", "dst": "X", "amount": 500.0, "timestamp": 1000,
+                           "cross_border": 0}])
+        x, names = build_node_features(accounts, tx)
+        i = names.index("avg_amt_shift_ratio")
+        assert not np.isnan(x[0, i])
+        assert x[0, i] == 500.0   # a single transaction falls entirely into its own "late" half; early is empty
+
+    def test_a_zero_transaction_account_is_zero_not_nan(self):
+        accounts = pd.DataFrame({"account_id": ["ZERO_TX"], "account_type": ["individual"], "country": ["US"],
+                                 "risk_score": [0.0], "opened_ts": [0]})
+        tx = pd.DataFrame([{"tx_id": "T0", "src": "OTHER", "dst": "OTHER2", "amount": 100.0, "timestamp": 0,
+                           "cross_border": 0}])
+        x, names = build_node_features(accounts, tx)
+        i = names.index("avg_amt_shift_ratio")
+        assert x[0, i] == 0.0
+
+    def test_registered_in_feature_names(self):
+        assert "avg_amt_shift_ratio" in FEATURE_NAMES

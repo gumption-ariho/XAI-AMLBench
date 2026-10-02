@@ -27,7 +27,7 @@ FEATURE_NAMES = [
     "age_days", "is_offshore", "kyc_risk",
     "type_individual", "type_business", "type_shell",
     "round_amt_ratio", "micro_tx_ratio", "decimal_precision_ratio",
-    "volume_shift_ratio", "tax_haven_cp_ratio", "hour_concentration", "pass_through_match_ratio",
+    "volume_shift_ratio", "avg_amt_shift_ratio", "tax_haven_cp_ratio", "hour_concentration", "pass_through_match_ratio",
     "high_risk_dest_ratio", "shared_memo_ratio", "dispute_rate", "counterparty_registration_cluster_ratio",
 ]
 _LOG_FEATURES = {
@@ -132,6 +132,24 @@ def build_node_features(accounts: pd.DataFrame, tx: pd.DataFrame, reporting_thre
     early = vol_by_half.get(0, pd.Series(0.0, index=vol_by_half.index))
     late = vol_by_half.get(1, pd.Series(0.0, index=vol_by_half.index))
     df["volume_shift_ratio"] = (late.reindex(df.index).fillna(0.0) / (early.reindex(df.index).fillna(0.0) + 1.0))
+
+    # avg_amt_shift_ratio: same early/late split as volume_shift_ratio, but comparing the MEAN transaction size
+    # in each half rather than the SUMMED volume -- deliberately added after a real, privacy-safe finding from
+    # evaluating against an external company-fraud dataset (gnn_aml_core.company_fraud --analyze): transaction
+    # COUNT carried almost no independent fraud signal there (0.9% of total feature importance) once the
+    # average transaction size was already known, while the average itself was the single strongest signal
+    # (36.8%). volume_shift_ratio's SUM conflates "amounts got bigger" with "there were simply more
+    # transactions" (sum = count * mean); this feature isolates the part that external finding says actually
+    # matters. Reuses half_amt (already computed above) rather than recomputing the early/late split.
+    #
+    # Unlike .sum(), pandas' .mean() of an account with ZERO transactions in a half is NaN, not 0.0 (there is
+    # no "average of nothing") -- filled to 0.0 explicitly below. This is the same class of singleton/empty-
+    # group NaN this project has already hit more than once (aml_synth's shell_company connectivity fix,
+    # gnn_aml_core.company_fraud's singleton-window std), handled here from the start rather than rediscovered.
+    avg_by_half = half_amt.groupby(["acct", "_half"])["amount"].mean().unstack(fill_value=0.0)
+    early_avg = avg_by_half.get(0, pd.Series(0.0, index=avg_by_half.index)).reindex(df.index).fillna(0.0)
+    late_avg = avg_by_half.get(1, pd.Series(0.0, index=avg_by_half.index)).reindex(df.index).fillna(0.0)
+    df["avg_amt_shift_ratio"] = late_avg / (early_avg + 1.0)
 
     # tax_haven_cp_ratio: share of an account's transactions (by count, not just whether ANY counterparty is
     # offshore) that touch a counterparty in a known low-transparency jurisdiction -- reuses the same OFFSHORE

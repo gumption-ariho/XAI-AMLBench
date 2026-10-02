@@ -85,6 +85,48 @@ them in that folder. The loader replicates the paper's own feature engineering e
 summary statistics per alert) and respects its quarter-only date accuracy (any split must fall on a quarter
 boundary, enforced rather than silently accepted).
 
+## The real yardstick for this specific niche: IBM AMLworld (`amlworld.py`)
+
+Elliptic validates against real transactions; SynthAML and company_fraud check tabular generalisation -- but
+none of them is the benchmark this project's own specific niche (GNN-based AML detection) is actually judged
+against in the published literature. IBM's AMLworld (Altman et al., 2023) is: real papers report real F1 scores
+on it, ranging roughly 0.03 to 0.76 depending on model and variant -- a genuinely modest state of the art, not
+a wall this project is far behind.
+
+```bash
+python -m gnn_aml_core.amlworld --data data/amlworld --file LI-Small_Trans.csv
+```
+
+Download the LI-Small (or any other) variant's `_Trans.csv` from
+https://www.kaggle.com/datasets/ealtman2019/ibm-transactions-for-anti-money-laundering-aml. LI = low illicit
+ratio, the realistic setting every published paper found hardest; HI variants are easier.
+
+**A real, stated caveat, not glossed over**: this dataset's real label is per TRANSACTION (edge
+classification -- exactly what the published F1 scores above measure). This loader aggregates it to per
+ACCOUNT to reuse this project's own account-classification pipeline unchanged, which is a genuinely easier
+task than the papers' own setup. Any F1 this produces is directionally informative against the numbers above,
+not a strict apples-to-apples ranking.
+
+
+
+An externally-sourced dataset (5 CSV files: companies, transactions, event order, time-series window ids, and
+fraud labels) -- **its original source or a citable paper could not be identified**, so unlike Elliptic and
+SynthAML above, this is not represented as a validated, peer-reviewed benchmark. It is included purely as
+another tabular sanity check for the baseline classifiers.
+
+**No graph structure here either**, and the task shape is less obvious than it first looks: the fraud label is
+not per-transaction, it is per *(company, time window)* -- confirmed by direct inspection of the real files
+before writing this loader, not assumed. A transaction can belong to more than one window (a real, confirmed
+many-to-many mapping, consistent with overlapping windows), and the loader aggregates each window's
+transactions (mean/std/min/max/count) before joining in that window's company's own static features.
+
+```bash
+python -m gnn_aml_core.company_fraud --data data/company_fraud
+```
+
+Place `companies_{train,test}.csv`, `transactions_{train,test}.csv`, `event_order_{train,test}.csv`,
+`time_series_ids_{train,test}.csv`, and `fraud_labels_{train,test}.csv` in that folder.
+
 ## Does detection degrade if launderers adapt? (`aml_synth/adversarial.py`)
 
 The feedback loop below assumes retraining helps once launderers change behaviour in response to being
