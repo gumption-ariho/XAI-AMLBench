@@ -27,6 +27,7 @@ from typing import Literal
 import httpx
 import psycopg
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException
+from prometheus_fastapi_instrumentator import Instrumentator, metrics
 from psycopg.rows import dict_row
 from pydantic import BaseModel, Field
 
@@ -93,6 +94,20 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="ProjectXY Backend", version="0.1.0", lifespan=lifespan)
+# A real gap, found during a later observability review: this service had zero Prometheus metrics at all,
+# unlike gnn-detection-api and xai-narrative-api, which both already expose /metrics this same way -- the
+# core application layer handling every officer's scan and decision request had no request-rate or latency
+# visibility whatsoever. Matches the same pattern exactly for consistency across all three services.
+_inst = Instrumentator()
+_inst.add(metrics.latency(buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10)))
+_inst.add(metrics.requests())
+# endpoint="/api/metrics", NOT the library's "/metrics" default: a real bug, found on a real run. Unlike
+# gnn-detection-api and xai-narrative-api (both reached through a Traefik PathPrefix route that STRIPS the
+# prefix before forwarding, so their own root-level /metrics is what actually gets hit), backend's own Traefik
+# rule forwards /api/* WITHOUT stripping it -- matching how every one of its real routes is already registered
+# under api = APIRouter(prefix="/api"). Exposing at the bare "/metrics" default put this endpoint at a path
+# Traefik never forwards to this container at all, confirmed unreachable (a 404) on a real run before this fix.
+_inst.instrument(app).expose(app, endpoint="/api/metrics", include_in_schema=False)
 api = APIRouter(prefix="/api")
 
 _immu = None

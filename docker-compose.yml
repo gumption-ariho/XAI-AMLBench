@@ -63,7 +63,23 @@ services:
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:29092,CONTROLLER://:9093
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://apache-kafka:9092,EXTERNAL://localhost:29092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      # EXTERNAL (host/network-reachable, port 29092) requires SASL/PLAIN authentication -- a real finding
+      # from a security hygiene pass: this was unauthenticated PLAINTEXT, letting anyone who could reach the
+      # port read or inject fake transactions/alerts. INTERNAL stays PLAINTEXT deliberately: it is only
+      # reachable from within the trusted Docker network, and this project's own producer (aml_synth.exporters,
+      # default bootstrap apache-kafka:9092) already connects via INTERNAL -- confirmed before making this
+      # change, so this fix needs zero code changes anywhere in this project, only external/host-network
+      # access now needs a password. SASL_PLAINTEXT (not SASL_SSL): authentication without encryption-in-
+      # transit on this one listener -- real TLS certificate provisioning is a separate, larger piece of work,
+      # not attempted here; this closes the "anyone can connect with no credential at all" gap specifically.
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:SASL_PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_SASL_ENABLED_MECHANISMS: PLAIN
+      KAFKA_LISTENER_NAME_EXTERNAL_SASL_ENABLED_MECHANISMS: PLAIN
+      KAFKA_LISTENER_NAME_EXTERNAL_PLAIN_SASL_JAAS_CONFIG: >-
+        org.apache.kafka.common.security.plain.PlainLoginModule required
+        username="${KAFKA_EXTERNAL_USER}"
+        password="${KAFKA_EXTERNAL_PASSWORD}"
+        user_${KAFKA_EXTERNAL_USER}="${KAFKA_EXTERNAL_PASSWORD}";
       KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@apache-kafka:9093
@@ -189,6 +205,24 @@ services:
     #   resources:
     #     reservations:
     #       devices: [{ driver: nvidia, count: 1, capabilities: [gpu] }]
+    networks: [xai-net]
+
+  feedback-drift-monitor:         # closes a real gap: the officer-disagreement drift signal was previously
+                                  # only ever visible in gnn_aml_core.feedback's own CLI output when someone
+                                  # happened to run it manually. Reuses gnn-detection-api's own image unchanged
+                                  # (same codebase, same dependencies already installed) with a different
+                                  # command, rather than building a whole new image just to run one more module
+                                  # from the same package.
+    profiles: [ml]
+    build:
+      context: .
+      dockerfile: gnn_aml_core/Dockerfile
+    command: ["python", "-m", "gnn_aml_core.feedback", "--serve-metrics", "--metrics-port", "9201"]
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@database:5432/${POSTGRES_DB}
+    depends_on:
+      database: { condition: service_healthy }
     networks: [xai-net]
 
   xai-narrative-api:              # Container 8 (FastAPI + in-process vLLM)

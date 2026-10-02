@@ -4,3 +4,5 @@ pydantic
 httpx
 psycopg[binary]
 immudb-py
+prometheus-fastapi-instrumentator   # real gap found: the backend had zero Prometheus metrics at all, unlike
+                                    # gnn-detection-api and xai-narrative-api, which both already use this

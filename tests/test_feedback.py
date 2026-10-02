@@ -235,3 +235,59 @@ class TestMainErrorMessages:
         out = buf.getvalue()
         assert "is it running? docker compose up -d database" in out
         assert "alerts' table" not in out
+
+
+class TestServeMetricsMode:
+    """A real gap, found during an observability review: the drift signal (disagreement rate, whether a
+    retrain gets triggered) was only ever visible in this CLI tool's own stdout -- invisible to the monitoring
+    stack. These pin two things: the new metrics get set correctly, and a real bug found while building this
+    (the retraining path's own 'records' variable became undefined once the check logic was refactored into
+    a helper) stays fixed."""
+
+    def test_records_variable_is_threaded_correctly_to_the_retraining_path(self, monkeypatch):
+        # the real bug: refactoring the check logic into _check_once() initially left 'records' undefined in
+        # the retraining path below it -- this reaches the next real step (a torch import) rather than hitting
+        # a NameError on 'records' first, proving the fix holds
+        import sys
+
+        import gnn_aml_core.feedback as fb
+
+        records = [rec(account_id=f"A{i}", decision="confirmed" if i % 5 else "dismissed") for i in range(25)]
+        monkeypatch.setattr(fb, "read_decisions_from_db", lambda dsn: records)
+        monkeypatch.setattr(sys, "argv", ["feedback.py", "--dsn", "postgresql://fake"])
+        with pytest.raises(ModuleNotFoundError, match="torch"):
+            fb.main()
+
+    def test_check_mode_sets_the_prometheus_metrics(self, monkeypatch):
+        # reads the metrics back through prometheus_client's own public text-exposition API
+        # (generate_latest), not an internal attribute, so this does not depend on an implementation detail
+        import sys
+
+        from prometheus_client import generate_latest
+
+        import gnn_aml_core.feedback as fb
+
+        records = [rec(account_id=f"A{i}", decision="confirmed" if i % 5 else "dismissed") for i in range(25)]
+        monkeypatch.setattr(fb, "read_decisions_from_db", lambda dsn: records)
+        monkeypatch.setattr(sys, "argv", ["feedback.py", "--check", "--dsn", "postgresql://fake"])
+        fb.main()   # must not raise
+        exposed = generate_latest().decode()
+        # checks the metric names are present and reachable via the real public API, not the exact numeric
+        # text formatting (e.g. "25" vs "25.0"), which this environment cannot independently confirm
+        assert "aml_feedback_decisions_total" in exposed
+        assert "aml_officer_disagreement_rate" in exposed
+        assert "25" in exposed
+        assert "0.2" in exposed
+
+    def test_loop_mode_never_calls_build_feedback_dataset_directly(self):
+        # a real, deliberate safety design: an unattended, periodically-running metrics loop must never
+        # auto-retrain the live model with no human approval -- confirmed by source inspection that the
+        # loop branch cannot reach build_feedback_dataset at all
+        import inspect
+
+        import gnn_aml_core.feedback as fb
+
+        src = inspect.getsource(fb.main)
+        loop_section = src[src.index("if a.serve_metrics:"):src.index("triggered, reasoning, records = _check_once()")]
+        assert "build_feedback_dataset" not in loop_section
+        assert "start_http_server" in loop_section

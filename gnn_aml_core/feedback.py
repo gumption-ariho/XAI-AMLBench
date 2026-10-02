@@ -23,9 +23,24 @@ from __future__ import annotations
 
 import argparse
 import logging
+import time
 from dataclasses import dataclass
 
+from prometheus_client import Counter, Gauge, start_http_server
+
 log = logging.getLogger("gnn_aml_core.feedback")
+
+# A real gap, found during an observability review: this module's drift signal (officer disagreement rate,
+# whether a retrain gets triggered) was only ever visible to whoever happened to read this CLI tool's own
+# stdout -- completely invisible to the monitoring stack, even though the document's own architecture promised
+# "model data drift values" scraped into Grafana. These three are updated every time should_retrain() runs
+# (see main()'s --serve-metrics loop below) and exposed for Prometheus to scrape, matching the same
+# prometheus_client pattern already used by gnn_aml_core.main and xai_explainer.main.
+DISAGREEMENT_RATE = Gauge("aml_officer_disagreement_rate", "Current officer disagreement rate (None-safe: only "
+                         "set once at least min_decisions real decisions exist)")
+FEEDBACK_DECISIONS_TOTAL = Gauge("aml_feedback_decisions_total", "Officer decisions available for drift detection")
+RETRAIN_TRIGGERED_TOTAL = Counter("aml_retrain_triggered_total", "Times the disagreement-rate threshold has "
+                                 "been met or exceeded, since this process started")
 
 
 @dataclass
@@ -181,27 +196,61 @@ def main() -> None:
     ap.add_argument("--retrain-threshold", type=float, default=0.15)
     ap.add_argument("--min-decisions", type=int, default=20)
     ap.add_argument("--feedback-weight", type=int, default=5)
+    ap.add_argument("--serve-metrics", action="store_true",
+                    help="expose the drift signal for Prometheus to scrape (aml_officer_disagreement_rate, "
+                         "aml_feedback_decisions_total, aml_retrain_triggered_total) and re-check on a loop "
+                         "rather than exiting after one check -- run this as its own long-lived process "
+                         "(e.g. a container, or a node_agent scheduled job) so Prometheus has something "
+                         "continuously running to scrape, the same way gnn-detection-api and xai-narrative-api "
+                         "already do for their own metrics")
+    ap.add_argument("--metrics-port", type=int, default=9201)
+    ap.add_argument("--loop-interval", type=int, default=300, help="seconds between drift checks in --serve-metrics mode")
     a = ap.parse_args()
 
-    try:
-        records = read_decisions_from_db(a.dsn)
-    except ImportError:
-        print("psycopg is not installed -> pip install 'psycopg[binary]' (already in gnn_aml_core/requirements.txt)")
-        raise SystemExit(1)
-    except Exception as exc:  # noqa: BLE001 -- deliberately broad; the two branches below cover the specific,
-                              # actionable cases, and the final else covers anything else with a generic hint
-        import psycopg.errors
+    def _check_once() -> tuple[bool, dict, list]:
+        try:
+            records = read_decisions_from_db(a.dsn)
+        except ImportError:
+            print("psycopg is not installed -> pip install 'psycopg[binary]' (already in gnn_aml_core/requirements.txt)")
+            raise SystemExit(1)
+        except Exception as exc:  # noqa: BLE001 -- deliberately broad; the two branches below cover the specific,
+                                  # actionable cases, and the final else covers anything else with a generic hint
+            import psycopg.errors
 
-        if isinstance(exc, psycopg.errors.UndefinedTable):
-            print("connected to Postgres, but the 'alerts' table does not exist yet\n"
-                  "-> the backend service creates it on startup (backend/main.py's lifespan hook); "
-                  "start it at least once: python3 run_local.py , or docker compose up -d backend")
-        else:
-            print(f"could not reach Postgres at the given --dsn ({exc.__class__.__name__}: {exc})\n"
-                  "-> is it running? docker compose up -d database , or check DATABASE_URL / --dsn")
-        raise SystemExit(1)
-    triggered, reasoning = should_retrain(records, threshold=a.retrain_threshold, min_decisions=a.min_decisions)
-    log.info("feedback status: %s", reasoning["reason"])
+            if isinstance(exc, psycopg.errors.UndefinedTable):
+                print("connected to Postgres, but the 'alerts' table does not exist yet\n"
+                      "-> the backend service creates it on startup (backend/main.py's lifespan hook); "
+                      "start it at least once: python3 run_local.py , or docker compose up -d backend")
+            else:
+                print(f"could not reach Postgres at the given --dsn ({exc.__class__.__name__}: {exc})\n"
+                      "-> is it running? docker compose up -d database , or check DATABASE_URL / --dsn")
+            raise SystemExit(1)
+        triggered, reasoning = should_retrain(records, threshold=a.retrain_threshold, min_decisions=a.min_decisions)
+        log.info("feedback status: %s", reasoning["reason"])
+        FEEDBACK_DECISIONS_TOTAL.set(reasoning["n_decisions"])
+        if reasoning["disagreement_rate"] is not None:
+            DISAGREEMENT_RATE.set(reasoning["disagreement_rate"])
+        if triggered:
+            RETRAIN_TRIGGERED_TOTAL.inc()
+        return triggered, reasoning, records
+
+    if a.serve_metrics:
+        start_http_server(a.metrics_port)
+        log.info("serving metrics on :%d/metrics, checking every %ds (Ctrl+C to stop)", a.metrics_port, a.loop_interval)
+        while True:
+            try:
+                _check_once()   # loop mode only reports drift status; it never retrains automatically, since an
+                                # unattended, periodically-running process silently retraining the live model
+                                # with no human in the loop is a materially different, bigger decision than
+                                # just reporting a metric -- real retraining stays an explicit, manually-invoked
+                                # action (the non-loop path below), not something this loop does on its own
+            except SystemExit:
+                log.warning("a check failed (see above) -- will retry on the next interval rather than exiting, "
+                           "since this process is meant to keep running")
+            time.sleep(a.loop_interval)
+        return  # pragma: no cover -- unreachable (the loop above only exits via Ctrl+C/SIGTERM), kept for clarity
+
+    triggered, reasoning, records = _check_once()
     if a.check or not triggered:
         return
 

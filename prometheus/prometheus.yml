@@ -9,6 +9,16 @@ scrape_configs:
     static_configs: [{ targets: ["traefik-edge-router:8082"] }]
 
   # Requires /metrics in the FastAPI apps (prometheus-fastapi-instrumentator)
+  # backend was a real gap: it had no Prometheus metrics at all until this was added, even though it is the
+  # core application layer every officer's scan and decision request goes through.
+  - job_name: backend
+    # /api/metrics, not the library's usual /metrics default: Prometheus scrapes the backend container
+    # DIRECTLY (bypassing Traefik entirely), so this must match wherever the app itself actually registered
+    # the endpoint -- backend/main.py exposes it at /api/metrics specifically (see that file's own comment for
+    # why), unlike gnn-detection-api and xai-narrative-api below, which both genuinely use the plain default.
+    metrics_path: /api/metrics
+    static_configs: [{ targets: ["backend:8000"] }]
+
   - job_name: gnn-detection-api
     metrics_path: /metrics
     static_configs: [{ targets: ["gnn-detection-api:8000"] }]
@@ -19,6 +29,12 @@ scrape_configs:
 
   - job_name: immudb
     static_configs: [{ targets: ["immudb-audit-ledger:9497"] }]
+
+  # The officer-disagreement drift signal (gnn_aml_core.feedback), now actually running continuously as its
+  # own service (feedback-drift-monitor in docker-compose.yml) rather than only existing as a manually-invoked
+  # CLI tool -- this closes that gap rather than leaving it as a commented-out placeholder.
+  - job_name: feedback-drift-monitor
+    static_configs: [{ targets: ["feedback-drift-monitor:9201"] }]
 
   # GPU temperature needs NVIDIA dcgm-exporter (not one of the 14 containers).
   # Add it later and scrape it here.
