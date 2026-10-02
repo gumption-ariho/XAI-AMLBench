@@ -129,6 +129,10 @@ services:
       XAI_API_URL: http://xai-narrative-api:8000
       IMMUDB_HOST: immudb-audit-ledger
       IMMUDB_PORT: 3322
+      # Off by default. Setting this to "true" in .env skips all officer authentication for a reviewer demo --
+      # see backend/main.py's own loud startup warning and get_current_officer docstring. Remove it from .env
+      # and restart this service to restore real per-officer login.
+      DEMO_LOGIN_BYPASS: ${DEMO_LOGIN_BYPASS:-false}
     depends_on:
       database: { condition: service_healthy }
     labels:
@@ -164,7 +168,11 @@ services:
       NEO4J_PASSWORD: ${NEO4J_PASSWORD}
     depends_on:
       apache-kafka: { condition: service_healthy }
-      neo4j-compliance-db: { condition: service_healthy }
+      # neo4j-compliance-db deliberately NOT a hard dependency here either, for the same reason as
+      # gnn-detection-api above: Neo4j export is OPTIONAL, controlled entirely by this worker's own --to flag
+      # (--to csv,kafka,neo4j vs --to csv alone) -- a run that never asked for Neo4j export should not be
+      # blocked by it being unavailable. aml_synth/exporters.py's own export_neo4j already retries on its own
+      # (confirmed: up to 15 attempts) if Neo4j genuinely isn't ready yet when neo4j export IS requested.
     volumes:
       - ./data:/app/data
     networks: [xai-net]
@@ -189,7 +197,12 @@ services:
       GNN_AUC_TARGET: ${GNN_AUC_TARGET}
     depends_on:
       redis-feature-cache: { condition: service_healthy }
-      neo4j-compliance-db: { condition: service_healthy }
+      # neo4j-compliance-db deliberately NOT a dependency here: a real architectural flaw, found on a real run
+      # (a Neo4j startup failure took the entire detection API down with it, blocking every scan and explain
+      # request). gnn_aml_core/main.py has zero references to Neo4j anywhere -- confirmed by direct search --
+      # it is used purely for the separate, optional human-investigation/visualization feature
+      # (aml_synth.exporters.export_neo4j + Neo4j Browser), never for scoring or explaining an account. The
+      # core detection pipeline's availability should never be hostage to an unrelated database's health.
     volumes:
       - ./models:/app/models
       - ./data:/app/data

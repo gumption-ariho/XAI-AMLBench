@@ -22,7 +22,7 @@ import shutil
 import sys
 from pathlib import Path
 
-VERSION = "v5  (a real login screen (LoginScreen.tsx) replaces the prompt() placeholder: verifies the key via /api/whoami before accepting it, shows who is signed in, removes the now-stale free-text officer-name input; pairs with setup_backend_v47; includes v4)"
+VERSION = "v6  (auto-detects the backend's DEMO_LOGIN_BYPASS: an unauthenticated /whoami call now always gets tried, so a reviewer demo skips the login screen automatically with zero frontend changes needed -- normal, auth-required mode behaves exactly as before; pairs with setup_backend_v65; includes v5)"
 MARK_FILE, MARK_END, PAYLOAD = "@@@@FILE: ", "@@@@END", "#==== PAYLOAD BELOW ===="
 OLD_JS = ["src/app/layout.js", "src/app/page.js"]
 BACKUP = "_old_js_backup"
@@ -2908,9 +2908,18 @@ if __name__ == "__main__":
 #|  }, [demoMode]);
 #|
 #|  useEffect(() => {
-#|    if (demoMode) return;   // demo mode has no real backend to authenticate against at all
+#|    if (demoMode) return;   // demo mode (sample-data mode) has no real backend to authenticate against at all
+#|    // Always attempt /whoami, even with no key stored at all: if the backend's own DEMO_LOGIN_BYPASS is on
+#|    // (a reviewer-demo convenience, off by default -- see backend/main.py), an unauthenticated call to this
+#|    // same endpoint succeeds and returns "Reviewer (DEMO MODE)", letting this skip the login screen
+#|    // automatically with no frontend-side flag needed at all. With bypass off (the normal case), an
+#|    // unauthenticated call here correctly fails with 401 and the login screen still shows, same as before --
+#|    // this only ever makes login EASIER when the backend explicitly allows it, never less secure on its own.
 #|    if (!hasStoredApiKey()) {
-#|      setAuthChecked(true);
+#|      api<WhoamiResponse>("/whoami")
+#|        .then((who) => setAuthedOfficer(who.officer))
+#|        .catch(() => {})   // no stored key and bypass is off: expected, fall through to the login screen
+#|        .finally(() => setAuthChecked(true));
 #|      return;
 #|    }
 #|    // a key is already stored (e.g. this tab's sessionStorage survived a reload) -- verify it still works

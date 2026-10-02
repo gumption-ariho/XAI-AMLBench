@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import numpy as np
 import scipy.sparse as sp
-from sklearn.ensemble import HistGradientBoostingClassifier, IsolationForest
+from sklearn.ensemble import HistGradientBoostingClassifier, IsolationForest, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 
 from gnn_aml_core.evaluation import full_report
@@ -50,6 +50,13 @@ def evaluate_baselines(x, y, idx_train, idx_val, idx_test, edges=None, seed: int
         out[name] = full_report(y[idx_val], score(idx_val), y[idx_test], score(idx_test))
 
     run("Logistic Regression", LogisticRegression(max_iter=3000, class_weight="balanced"), x)
+    # Random Forest: a genuinely different algorithmic family from everything else here -- bagging, not
+    # boosting (XGBoost/HistGradientBoosting), not linear (Logistic Regression), not unsupervised (Isolation
+    # Forest). A standard, widely-used tabular comparison point that was never actually in this project despite
+    # the other three families all being represented; n_estimators/max_depth kept modest and comparable to the
+    # boosting model's own settings above, rather than tuned specifically to flatter this one dataset.
+    run("Random Forest", RandomForestClassifier(n_estimators=300, max_depth=6, class_weight="balanced",
+                                                n_jobs=2, random_state=seed), x)
     gb, gb_name = _boosting(y[idx_train], seed)
     run(gb_name, gb, x)
     run("Isolation Forest (unsupervised score)", IsolationForest(random_state=seed, contamination=0.05), x, scorer="anomaly")

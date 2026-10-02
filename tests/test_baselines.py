@@ -35,18 +35,21 @@ class TestNeighbourAggregates:
 
 
 class TestEvaluateBaselines:
-    def test_returns_four_models(self, features_and_splits):
+    def test_returns_five_models(self, features_and_splits):
+        # Random Forest added after this test was first written -- a genuinely different algorithmic family
+        # (bagging) from everything else here (boosting, linear, unsupervised), previously missing entirely.
         xs, y, tr, va, te, src, dst = features_and_splits
         out = evaluate_baselines(xs, y, tr, va, te, edges=(src, dst), seed=0)
-        assert len(out) == 4
+        assert len(out) == 5
         assert any("Logistic Regression" in k for k in out)
+        assert any("Random Forest" in k for k in out)
         assert any("Isolation Forest" in k for k in out)
         assert any("neighbour averages" in k for k in out)
 
-    def test_without_edges_returns_three_models(self, features_and_splits):
+    def test_without_edges_returns_four_models(self, features_and_splits):
         xs, y, tr, va, te, _, _ = features_and_splits
         out = evaluate_baselines(xs, y, tr, va, te, edges=None, seed=0)
-        assert len(out) == 3
+        assert len(out) == 4
 
     def test_every_model_reports_full_metric_set(self, features_and_splits):
         xs, y, tr, va, te, src, dst = features_and_splits
@@ -67,6 +70,12 @@ class TestEvaluateBaselines:
         # dramatically worse than the plain model on the same data.
         xs, y, tr, va, te, src, dst = features_and_splits
         out = evaluate_baselines(xs, y, tr, va, te, edges=(src, dst), seed=0)
-        plain = next(v for k, v in out.items() if "neighbour" not in k and "Logistic" not in k and "Isolation" not in k)
+        # a real, subtle bug this test would otherwise have silently had: adding Random Forest means it now
+        # ALSO matches this filter (it contains none of "neighbour"/"Logistic"/"Isolation" either), so without
+        # explicitly excluding it too, next() could grab Random Forest's report instead of plain boosting's,
+        # depending on dict insertion order -- "Random Forest" must be excluded here for "plain" to reliably
+        # mean the plain BOOSTING model specifically, which is what this comparison is actually about.
+        plain = next(v for k, v in out.items()
+                    if "neighbour" not in k and "Logistic" not in k and "Isolation" not in k and "Random Forest" not in k)
         graph = next(v for k, v in out.items() if "neighbour" in k)
         assert graph["auc_roc"] >= plain["auc_roc"] - 0.15

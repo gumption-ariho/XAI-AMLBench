@@ -166,3 +166,26 @@ class TestWhoami:
     def test_returns_the_authenticated_officer_name(self):
         import backend.main as m
         assert m.whoami(officer="Jane Smith") == {"officer": "Jane Smith"}
+
+
+class TestDemoLoginBypass:
+    """Off by default. A deliberate, clearly-labelled convenience for a reviewer demo -- see backend/main.py's
+    own loud startup warning. Must never silently look like a real authenticated identity."""
+
+    def test_off_by_default_still_requires_real_auth(self, monkeypatch):
+        monkeypatch.setattr(m, "DEMO_LOGIN_BYPASS", False)
+        with pytest.raises(HTTPException) as exc:
+            m.get_current_officer(authorization=None)
+        assert exc.value.status_code == 401
+
+    def test_when_on_skips_auth_entirely_with_no_header_at_all(self, monkeypatch):
+        monkeypatch.setattr(m, "DEMO_LOGIN_BYPASS", True)
+        officer = m.get_current_officer(authorization=None)
+        assert officer == "Reviewer (DEMO MODE)"
+
+    def test_the_returned_identity_unmistakably_says_demo_mode(self, monkeypatch):
+        # the whole point of this project's earlier security work was making sure the audit trail's identity
+        # is always genuine -- this bypass must never produce a name that could pass as a real officer's
+        monkeypatch.setattr(m, "DEMO_LOGIN_BYPASS", True)
+        officer = m.get_current_officer(authorization=None)
+        assert "DEMO" in officer.upper()

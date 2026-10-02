@@ -112,7 +112,10 @@ def export_cypher(graph, out_dir: str = "data", batch: int = 1000) -> None:
             f.write(f"UNWIND [\n  {rows}\n] AS row\nMERGE (a:Account {{account_id: row.account_id}}) SET a += row;\n")
         for i in range(0, len(txs), batch):
             rows = ",\n  ".join(_map(r, tx_keys) for r in txs[i:i + batch])
-            f.write("UNWIND [\n  " + rows + "\n] AS row\nMATCH (s:Account {account_id: row.src}), (d:Account {account_id: row.dst})\n"
+            # Two separate MATCH clauses, not one comma-joined pattern: the same real "cartesian product"
+            # warning found and fixed in export_neo4j() below applies identically here -- this is a static
+            # .cypher file a human runs later via cypher-shell, and would show the same warning there.
+            f.write("UNWIND [\n  " + rows + "\n] AS row\nMATCH (s:Account {account_id: row.src})\nMATCH (d:Account {account_id: row.dst})\n"
                     "CREATE (s)-[:TRANSFERRED {tx_id: row.tx_id, amount: row.amount, currency: row.currency, payment_format: row.payment_format, "
                     "timestamp: row.timestamp, cross_border: row.cross_border, is_laundering: row.is_laundering, typology: row.typology, "
                     "pattern_id: row.pattern_id}]->(d);\n")
@@ -188,6 +191,18 @@ def export_neo4j(graph, uri: str | None = None, user: str | None = None,
         if wipe:
             s.run("MATCH (n:Account) DETACH DELETE n")
         s.run("CREATE CONSTRAINT account_id IF NOT EXISTS FOR (a:Account) REQUIRE a.account_id IS UNIQUE")
+        # CREATE CONSTRAINT returns immediately while Neo4j builds the backing index in the background;
+        # awaitIndexes() blocks here until it genuinely exists before any bulk loading begins, rather than
+        # risking an early batch running against a not-yet-ready index. Kept as a real, worthwhile safety
+        # measure -- but an earlier version of this comment incorrectly attributed the "cartesian product"
+        # warning seen on a real run to this same race. Re-tested directly on a run where the index already
+        # existed from a prior load (ruling the race out entirely) and the warning still fired identically,
+        # disproving that theory. The real, confirmed cause (per Neo4j's own documented notification
+        # reference): this warning is purely about QUERY SYNTAX -- two node patterns joined by a comma in one
+        # MATCH clause with no shared relationship between them -- not about whether an index makes each
+        # lookup fast. See the MATCH clauses below (now split into two sequential MATCH statements, the
+        # documented fix) for where this was actually resolved.
+        s.run("CALL db.awaitIndexes()")
         for i in range(0, len(accounts), batch):
             s.run("UNWIND $rows AS row MERGE (a:Account {account_id: row.account_id}) SET a += row",
                   rows=accounts[i:i + batch])
@@ -195,7 +210,8 @@ def export_neo4j(graph, uri: str | None = None, user: str | None = None,
             s.run(
                 """
                 UNWIND $rows AS row
-                MATCH (s:Account {account_id: row.src}), (d:Account {account_id: row.dst})
+                MATCH (s:Account {account_id: row.src})
+                MATCH (d:Account {account_id: row.dst})
                 MERGE (s)-[t:TRANSFERRED {tx_id: row.tx_id}]->(d)
                 SET t += row{.amount, .currency, .payment_format, .timestamp,
                              .cross_border, .is_laundering, .typology, .pattern_id}

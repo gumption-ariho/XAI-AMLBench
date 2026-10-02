@@ -153,6 +153,15 @@ class TestExportCypher:
         assert n_account_maps == len(acc)
         assert n_tx_maps == len(tx)
 
+    def test_relationship_match_uses_two_separate_clauses_not_a_comma_joined_pattern(self, small_graph, tmp_path):
+        # the same real "cartesian product" root cause found and fixed in export_neo4j (see TestExportNeo4j) --
+        # this static .cypher file would show the identical Neo4j warning when a human later runs it via
+        # cypher-shell, fixed the same documented way: two sequential MATCH clauses instead of one comma-joined
+        exporters.export_cypher(small_graph, tmp_path)
+        text = (tmp_path / "import.cypher").read_text()
+        assert "MATCH (s:Account {account_id: row.src})\nMATCH (d:Account {account_id: row.dst})" in text
+        assert "MATCH (s:Account {account_id: row.src}), (d:Account" not in text
+
     def test_batching_produces_multiple_unwind_blocks_for_a_large_graph(self, small_graph, tmp_path):
         exporters.export_cypher(small_graph, tmp_path, batch=50)
         text = (tmp_path / "import.cypher").read_text()
@@ -261,6 +270,69 @@ class TestExportNeo4j:
         assert any("CONSTRAINT" in q for q, _ in calls)
         assert any("MERGE (a:Account" in q for q, _ in calls)
         assert any("MATCH (s:Account" in q for q, _ in calls)
+
+    def test_awaits_the_index_before_loading_any_data(self, small_graph, monkeypatch):
+        # a real bug, found on a real run: CREATE CONSTRAINT returns immediately while Neo4j builds the
+        # backing index in the background. On a freshly-wiped database, the relationship-loading queries could
+        # start before that index was actually online, so the query planner fell back to a full scan (a real,
+        # repeated "cartesian product" warning from Neo4j itself) instead of an indexed lookup. This confirms
+        # db.awaitIndexes() is called, and specifically AFTER the constraint but BEFORE any data loads --
+        # calling it in the wrong position would not actually fix the race.
+        neo4j = pytest.importorskip("neo4j")
+        calls = []
+
+        class FakeSession:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def run(self, query, **kw):
+                calls.append(" ".join(query.split()))
+
+        class FakeDriver:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def verify_connectivity(self): pass
+            def session(self): return FakeSession()
+
+        monkeypatch.setattr(neo4j.GraphDatabase, "driver", lambda *a, **kw: FakeDriver())
+        exporters.export_neo4j(small_graph, uri="bolt://fake:7687", user="u", password="p", batch=100, wipe=True)
+
+        assert any("awaitIndexes" in q for q in calls), "db.awaitIndexes() was never called"
+        constraint_idx = next(i for i, q in enumerate(calls) if "CONSTRAINT" in q)
+        await_idx = next(i for i, q in enumerate(calls) if "awaitIndexes" in q)
+        first_merge_idx = next(i for i, q in enumerate(calls) if "MERGE (a:Account" in q)
+        assert constraint_idx < await_idx < first_merge_idx, (
+            f"wrong order: constraint={constraint_idx}, await={await_idx}, first merge={first_merge_idx}"
+        )
+
+    def test_relationship_query_uses_two_separate_match_clauses_not_a_comma_joined_pattern(self, small_graph, monkeypatch):
+        # a real, confirmed root cause, found by direct testing and Neo4j's own documented notification
+        # reference: "MATCH (a), (b)" (comma-joined, no shared relationship) is flagged as a "cartesian
+        # product" by Neo4j's query planner PURELY based on this syntactic structure -- regardless of whether
+        # an index makes each individual lookup fast. An earlier fix attempt (awaiting the index before
+        # loading) did NOT resolve this, confirmed by re-testing against an already-indexed database where the
+        # warning still fired identically. The documented, correct fix is two separate sequential MATCH
+        # clauses instead of one comma-joined MATCH -- functionally identical, but avoids the warning.
+        neo4j = pytest.importorskip("neo4j")
+        calls = []
+
+        class FakeSession:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def run(self, query, **kw):
+                calls.append(" ".join(query.split()))
+
+        class FakeDriver:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def verify_connectivity(self): pass
+            def session(self): return FakeSession()
+
+        monkeypatch.setattr(neo4j.GraphDatabase, "driver", lambda *a, **kw: FakeDriver())
+        exporters.export_neo4j(small_graph, uri="bolt://fake:7687", user="u", password="p", batch=100, wipe=True)
+
+        tx_query = next(q for q in calls if "TRANSFERRED" in q)
+        assert "MATCH (s:Account {account_id: row.src}) MATCH (d:Account {account_id: row.dst})" in tx_query
+        assert "MATCH (s:Account {account_id: row.src}), (d:Account" not in tx_query
 
     def test_skips_wipe_when_wipe_is_false(self, small_graph, monkeypatch):
         neo4j = pytest.importorskip("neo4j")

@@ -142,10 +142,28 @@ def _call(method: str, url: str, timeout: float = 30, **kw):
     return r.json()
 
 
+DEMO_LOGIN_BYPASS = os.getenv("DEMO_LOGIN_BYPASS", "").lower() in ("1", "true", "yes")
+if DEMO_LOGIN_BYPASS:
+    log.warning("=" * 70)
+    log.warning("DEMO_LOGIN_BYPASS is ON: every request is accepted with NO real credential check at all.")
+    log.warning("This is for a reviewer demo ONLY. Remove DEMO_LOGIN_BYPASS from .env and restart to")
+    log.warning("restore real per-officer authentication before this touches anything but a throwaway demo.")
+    log.warning("=" * 70)
+
+
 def get_current_officer(authorization: str | None = Header(None)) -> str:
     """Every route but /health depends on this. Returns the officer name tied to a valid, non-revoked API key --
     the real fix for the free-text 'officer' field decide() used to accept as-is: identity now comes from an
-    authenticated credential, never from request input a caller could set to anything."""
+    authenticated credential, never from request input a caller could set to anything.
+
+    DEMO_LOGIN_BYPASS (off by default) skips all of that for a reviewer demo: every request is treated as a
+    fixed "Reviewer (DEMO MODE)" identity with no credential needed at all. The returned name deliberately says
+    "DEMO MODE" rather than a real-looking name, so it is unmistakable in the UI and the audit trail that these
+    actions were not actually authenticated -- the whole point of this project's own earlier security work was
+    making sure the audit trail's identity is always genuine, so this bypass must never look like it still is.
+    """
+    if DEMO_LOGIN_BYPASS:
+        return "Reviewer (DEMO MODE)"
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "missing or malformed Authorization header (expected 'Bearer <api-key>')")
     key = authorization.removeprefix("Bearer ").strip()
