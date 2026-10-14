@@ -1,11 +1,75 @@
 /** Types shared between the UI and the backend JSON (see backend/main.py and gnn_aml_core/main.py). */
 
 export type AlertStatus = "open" | "confirmed" | "dismissed";
-export type TabId = "overview" | "scan" | "alerts" | "network";
+export type TabId = "overview" | "pipeline" | "scan" | "intake" | "alerts" | "investigate" | "network" | "activity" | "connect";
 export type ToastKind = "ok" | "err" | "warn";
+
+/* ---- GET /api/activity -- a merged, real feedback-log feed (see backend/main.py's activity() docstring) ---- */
+export interface ActivityEntry {
+  ts: number;
+  pipeline: "model1" | "model2";
+  kind: string;
+  account_id: string;
+  by: string | null;
+  detail: string;
+  ref_id: number;
+}
+
+/* ---- GET /api/system/status -- live reachability + Kafka wiring info (see backend/main.py) ---- */
+export interface ServiceStatus {
+  name: string;
+  ok: boolean;
+  latency_ms: number | null;
+  error?: string;
+}
+
+export interface SystemStatus {
+  services: ServiceStatus[];
+  all_ok: boolean;
+  kafka: {
+    external_listener: string;
+    transactions_topic: string;
+    alerts_topic: string;
+    note: string;
+  };
+}
 
 export interface WhoamiResponse {
   officer: string;
+  /** Set for a bank-tenant session (signed in with that bank's own BANK_PASSKEYS passkey) -- every alert,
+   * anomaly, and account this session can see or touch is scoped to this one bank. null for an admin or
+   * legacy shared-analyst session, which still sees every bank's data, exactly as before this field existed. */
+  bank: string | null;
+}
+
+export interface LoginResponse {
+  token: string;
+  name: string;
+  role: "admin" | "analyst";
+  bank: string | null;
+}
+
+/* ---- Model 2 (anomaly detector) -- see gnn_aml_core/anomaly.py and backend/main.py's /api/anomalies/* ---- */
+export type AnomalyStatus = "new" | "under_investigation" | "confirmed_mule" | "cleared";
+
+export interface InvestigationLogEntry {
+  ts: number;
+  by: string;
+  status: string;
+  note: string;
+}
+
+export interface AnomalyAlert {
+  id: number;
+  account_id: string;
+  anomaly_score: number;
+  threshold: number;
+  status: AnomalyStatus;
+  assigned_to: string | null;
+  investigation_log: InvestigationLogEntry[];
+  created_at: string;
+  updated_at: string | null;
+  trained_at: string | null;
 }
 
 export interface Alert {
@@ -13,6 +77,8 @@ export interface Alert {
   account_id: string;
   risk_score: number;
   status: AlertStatus;
+  source_bank: string;   // which bank this account's data came from ("unknown" if it predates attribution
+                         // or was never tagged -- see backend/main.py's account_banks table)
   typology: string | null;
   narrative: string | null;
   narrative_source: string | null;
@@ -96,6 +162,32 @@ export interface Explanation {
   nodes: ExplainNode[];
   edges: ExplainEdge[];
   top_features: TopFeature[];
+}
+
+/* ---- POST /intake/ingest -- the Intake tab's real-transaction ingestion path (see backend/main.py and
+   gnn_aml_core/livegraph.py). Adds the given transactions to the live, non-synthetic account population and
+   rebuilds the served graph standardized with the already-trained model's own mean/std -- no weights change,
+   nothing is retrained. ---- */
+export interface IntakeIngestResponse {
+  status: string;
+  ingested_rows: number;
+  n_accounts: number;
+  n_transactions: number;
+  bank?: string;
+  model_version?: string;
+  [key: string]: unknown;   // _reload_model() may include extra fields (e.g. reload timing); pass through as-is
+}
+
+/* ---- POST /api/intake/clear (backend/main.py's intake_clear -- Option 1's "clear temporary data" control,
+   gnn_aml_core/livegraph.py's remove_accounts). Removes a bank's accounts from the live graph only --
+   alerts/anomaly_alerts and the immudb audit trail are deliberately never touched by this call. ---- */
+export interface IntakeClearResponse {
+  status: string;
+  bank: string;
+  removed_accounts: number;
+  remaining_live_accounts?: number;
+  remaining_live_transactions?: number;
+  [key: string]: unknown;
 }
 
 export interface Toast {
