@@ -1,0 +1,13 @@
+# torch + CUDA come from the base image
+fastapi
+uvicorn[standard]
+pydantic
+torch_geometric
+numpy
+pandas
+scikit-learn
+redis
+kafka-python
+immudb-py
+prometheus-client
+prometheus-fastapi-instrumentator

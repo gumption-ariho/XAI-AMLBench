@@ -6,7 +6,7 @@ more than speed.
 ## Getting started
 
 ```bash
-git clone https://github.com/OWNER/xai-amlbench.git
+git clone https://github.com/gumption-ariho/xai-amlbench.git
 cd xai-amlbench
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"          # editable install with test, GNN and XAI extras

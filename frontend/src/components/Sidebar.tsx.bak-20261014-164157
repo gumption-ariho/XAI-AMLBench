@@ -1,0 +1,39 @@
+"use client";
+
+import type { ReactNode } from "react";
+import type { TabId } from "@/types";
+
+export interface DockTab {
+  id: TabId;
+  label: string;
+  icon: ReactNode;
+  badge?: number;
+}
+
+interface SidebarProps {
+  tabs: DockTab[];
+  active: TabId;
+  onChange: (id: TabId) => void;
+}
+
+/** Fixed left-hand navigation, the standard SaaS dashboard pattern: a static list of sections, the current
+ * one highlighted, nothing sliding or animating on load. Replaces the earlier floating bottom dock. */
+export default function Sidebar({ tabs, active, onChange }: SidebarProps) {
+  return (
+    <nav className="sidebar" aria-label="Sections">
+      {tabs.map((t) => (
+        <button
+          key={t.id}
+          type="button"
+          className={`sidebar-tab ${t.id === active ? "on" : ""}`}
+          onClick={() => onChange(t.id)}
+          aria-current={t.id === active ? "page" : undefined}
+        >
+          <span className="sidebar-ico">{t.icon}</span>
+          <span className="sidebar-label">{t.label}</span>
+          {t.badge !== undefined && t.badge > 0 && <span className="sidebar-badge">{t.badge}</span>}
+        </button>
+      ))}
+    </nav>
+  );
+}

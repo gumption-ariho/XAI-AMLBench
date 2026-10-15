@@ -1,0 +1,767 @@
+"""ProjectXY core backend (container: backend).
+
+Two detection pipelines feed this console now:
+  Model 1 (gnn_aml_core.main): known-typology classifier -- scan account -> alert -> SAR narrative -> officer
+    decision (audited in immudb). Unchanged from before.
+  Model 2 (gnn_aml_core.anomaly): a deep graph autoencoder trained only on whatever Model 1 currently calls
+    normal, scoped away from anything Model 1 already flags. It raises an alert into the SEPARATE
+    anomaly_alerts table below -- never auto-decided. The /api/anomalies/* routes are the investigation
+    workflow those alerts go through: claim -> investigate (notes) -> resolve as confirmed_mule or cleared. A
+    resolve to confirmed_mule is the ONLY thing that ever teaches Model 1 a new pattern (via
+    gnn_aml_core.anomaly.sync_confirmed_to_model1, running in the anomaly-detector container) -- the routine
+    confirm/dismiss clicks on Model 1's own alerts below are deliberately NEVER used to train anything; that
+    was an earlier, explicit design decision (see gnn_aml_core/feedback.py's module docstring) since
+    everyday rubber-stamp decisions on already-obvious cases carry far less signal than a specifically
+    investigated, previously-invisible pattern, and training on them would make the model drift with officer
+    habits rather than with genuinely new information.
+
+All routes live under /api (Traefik forwards /api/* here without stripping the prefix).
+
+Authentication: a single simple login -- POST /api/login with one of two PREDEFINED passkeys (ADMIN_PASSKEY /
+ANALYST_PASSKEY, set in .env) plus the person's own name. This replaces the earlier per-officer
+database-managed API key system (manage_keys.py) with something much simpler to operate, while keeping the one
+thing that system existed for: every decision in the audit trail is still attributed to a SPECIFIC named
+person, not just "an analyst" -- the passkey only proves which ROLE you have; the name you type is what the
+audit trail actually records against every action you take, exactly as before. The server signs a session
+token (name + role + issued-at, HMAC'd with AUTH_TOKEN_SECRET) and every other route verifies that signature --
+there's no database lookup and no credential to issue, revoke or manage, which is the whole point of this
+change: a predefined passkey needs no administration at all. If someone can't be trusted to type their own
+real name honestly, that's a people problem no login mechanism solves; what this DOES still guarantee is that
+the audit trail can't be forged by request input alone, since the name is bound into a server-signed token, not
+read fresh off each request body.
+"""
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import json
+import logging
+import os
+import secrets
+import time
+from contextlib import asynccontextmanager
+from typing import Literal
+
+import httpx
+import psycopg
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException
+from prometheus_fastapi_instrumentator import Instrumentator, metrics
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+from pydantic import BaseModel, Field
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("backend")
+
+DATABASE_URL = os.environ["DATABASE_URL"]
+GNN_API_URL = os.getenv("GNN_API_URL", "http://gnn-detection-api:8000")
+GNN_ADMIN_TOKEN = os.getenv("GNN_ADMIN_TOKEN", "")   # forwarded as Bearer auth to gnn-detection-api's
+                                                      # admin-only routes (POST /admin/ingest-live), see
+                                                      # the Intake tab's "real accounts" ingestion route below
+XAI_API_URL = os.getenv("XAI_API_URL", "http://xai-narrative-api:8000")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS alerts (
+    id            SERIAL PRIMARY KEY,
+    account_id    TEXT        NOT NULL,
+    risk_score    DOUBLE PRECISION NOT NULL,
+    status        TEXT        NOT NULL DEFAULT 'open',      -- open | confirmed | dismissed
+    typology      TEXT,
+    narrative     TEXT,
+    narrative_source TEXT,
+    narrative_sha256 TEXT,
+    reviewed_by   TEXT,
+    review_note   TEXT,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    reviewed_at   TIMESTAMPTZ
+);
+-- Added for multi-bank attribution: every alert should say which bank's data it came from. A plain ADD
+-- COLUMN (not inside the CREATE TABLE above) so this lands correctly on a database that already has the
+-- alerts table from before this feature existed -- CREATE TABLE IF NOT EXISTS is a no-op there.
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS source_bank TEXT NOT NULL DEFAULT 'unknown';
+CREATE INDEX IF NOT EXISTS alerts_status_idx ON alerts (status);
+CREATE INDEX IF NOT EXISTS alerts_source_bank_idx ON alerts (source_bank);
+
+-- Which bank an account belongs to, for every account that arrived through Intake or Connect (Options 1/2).
+-- Deliberately first-seen-wins (ON CONFLICT DO NOTHING in tag_accounts_bank() below): an account id that
+-- later shows up tagged with a different bank keeps its original attribution rather than being silently
+-- reassigned, since the same account id being claimed by two different banks is itself worth noticing, not
+-- something to paper over. Accounts that predate this feature (SynthAML's training/demo accounts) simply
+-- have no row here -- looked up as 'unknown', not fabricated into belonging to some bank they never did.
+CREATE TABLE IF NOT EXISTS account_banks (
+    account_id TEXT PRIMARY KEY,
+    bank       TEXT        NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Model 2's alerts. Deliberately a SEPARATE table from `alerts` above (Model 1's), never merged: the two
+-- pipelines have different purposes (known-typology vs. "this is unlike anything normal"), different alert
+-- volumes expected (Model 2 should be rare -- it only fires in Model 1's blind spot), and a different
+-- lifecycle (Model 1's alerts go straight to a decision; Model 2's alerts require an actual investigation
+-- before anyone calls them a verdict).
+CREATE TABLE IF NOT EXISTS anomaly_alerts (
+    id                SERIAL PRIMARY KEY,
+    account_id        TEXT        NOT NULL,
+    anomaly_score     DOUBLE PRECISION NOT NULL,
+    threshold         DOUBLE PRECISION NOT NULL,
+    status            TEXT        NOT NULL DEFAULT 'new',   -- new | under_investigation | confirmed_mule | cleared
+    assigned_to       TEXT,
+    investigation_log JSONB       NOT NULL DEFAULT '[]',    -- append-only [{ts, by, note, status}, ...]
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at        TIMESTAMPTZ,
+    trained_at        TIMESTAMPTZ   -- set once gnn_aml_core.anomaly has fed a confirmed_mule case into Model 1
+);
+CREATE INDEX IF NOT EXISTS anomaly_alerts_status_idx ON anomaly_alerts (status);
+"""
+
+
+def db():
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    for attempt in range(20):                       # wait for Postgres on cold start
+        try:
+            with db() as conn:
+                conn.execute(SCHEMA)
+            log.info("database ready")
+            break
+        except psycopg.OperationalError:
+            log.warning("database not ready (attempt %d)", attempt + 1)
+            time.sleep(2)
+    yield
+
+
+app = FastAPI(title="ProjectXY Backend", version="0.1.0", lifespan=lifespan)
+# A real gap, found during a later observability review: this service had zero Prometheus metrics at all,
+# unlike gnn-detection-api and xai-narrative-api, which both already expose /metrics this same way -- the
+# core application layer handling every officer's scan and decision request had no request-rate or latency
+# visibility whatsoever. Matches the same pattern exactly for consistency across all three services.
+_inst = Instrumentator()
+_inst.add(metrics.latency(buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10)))
+_inst.add(metrics.requests())
+# endpoint="/api/metrics", NOT the library's "/metrics" default: a real bug, found on a real run. Unlike
+# gnn-detection-api and xai-narrative-api (both reached through a Traefik PathPrefix route that STRIPS the
+# prefix before forwarding, so their own root-level /metrics is what actually gets hit), backend's own Traefik
+# rule forwards /api/* WITHOUT stripping it -- matching how every one of its real routes is already registered
+# under api = APIRouter(prefix="/api"). Exposing at the bare "/metrics" default put this endpoint at a path
+# Traefik never forwards to this container at all, confirmed unreachable (a 404) on a real run before this fix.
+_inst.instrument(app).expose(app, endpoint="/api/metrics", include_in_schema=False)
+api = APIRouter(prefix="/api")
+
+_immu = None
+
+
+def audit(kind: str, payload: dict) -> None:
+    """Append to the immudb ledger (officer decisions, narratives). Never raises."""
+    global _immu
+    host = os.getenv("IMMUDB_HOST")
+    if not host:
+        return
+    try:
+        if _immu is None:
+            from immudb import ImmudbClient
+            c = ImmudbClient(f"{host}:{os.getenv('IMMUDB_PORT', '3322')}")
+            c.login(os.getenv("IMMUDB_USER", "immudb"), os.getenv("IMMUDB_ADMIN_PASSWORD", "immudb"))
+            _immu = c
+        key = f"{kind}:{payload.get('alert_id', '-')}:{time.time_ns()}".encode()
+        _immu.verifiedSet(key, json.dumps({"kind": kind, "ts": time.time(), **payload}, sort_keys=True).encode())
+    except Exception as exc:  # noqa: BLE001
+        log.warning("immudb audit failed (%s)", exc.__class__.__name__)
+        _immu = None
+
+
+def tag_accounts_bank(account_ids: list[str], bank: str) -> None:
+    """Records which bank each of these accounts came from, first-seen-wins (see account_banks' own comment
+    in SCHEMA above). Called from both ingestion paths -- /intake/ingest (Option 1, one bank per pasted
+    document) and /system/live-ingest (Option 2, per Kafka message or a per-deployment default) -- so every
+    account that enters the live graph through either route gets attributed, not just one of them."""
+    if not account_ids:
+        return
+    with db() as conn:
+        conn.executemany(
+            "INSERT INTO account_banks (account_id, bank) VALUES (%s, %s) ON CONFLICT (account_id) DO NOTHING",
+            [(a, bank) for a in account_ids],
+        )
+
+
+def lookup_bank(account_id: str) -> str:
+    """'unknown' for an account that predates bank attribution (e.g. a SynthAML training/demo account) or was
+    never tagged for some other reason -- never guessed."""
+    with db() as conn:
+        row = conn.execute("SELECT bank FROM account_banks WHERE account_id = %s", (account_id,)).fetchone()
+    return row["bank"] if row else "unknown"
+
+
+def _call(method: str, url: str, timeout: float = 30, **kw):
+    try:
+        r = httpx.request(method, url, timeout=timeout, **kw)
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"upstream unreachable: {exc.__class__.__name__}") from exc
+    if r.status_code >= 400:
+        raise HTTPException(r.status_code, r.text)
+    return r.json()
+
+
+DEMO_LOGIN_BYPASS = os.getenv("DEMO_LOGIN_BYPASS", "").lower() in ("1", "true", "yes")
+if DEMO_LOGIN_BYPASS:
+    log.warning("=" * 70)
+    log.warning("DEMO_LOGIN_BYPASS is ON: every request is accepted with NO real credential check at all.")
+    log.warning("This is for a reviewer demo ONLY. Remove DEMO_LOGIN_BYPASS from .env and restart to")
+    log.warning("restore real per-officer authentication before this touches anything but a throwaway demo.")
+    log.warning("=" * 70)
+
+
+# ------------------------------------------------------------------ passkey + name auth
+ADMIN_PASSKEY = os.getenv("ADMIN_PASSKEY")
+ANALYST_PASSKEY = os.getenv("ANALYST_PASSKEY")
+AUTH_TOKEN_SECRET = os.getenv("AUTH_TOKEN_SECRET")
+if not AUTH_TOKEN_SECRET:
+    AUTH_TOKEN_SECRET = secrets.token_urlsafe(32)
+    log.warning("AUTH_TOKEN_SECRET not set -- generated a random one for this process. Every session this "
+               "service issues becomes invalid the moment the process restarts (everyone gets signed out). "
+               "Set AUTH_TOKEN_SECRET in .env so sessions survive a restart.")
+SESSION_MAX_AGE_S = int(os.getenv("SESSION_MAX_AGE_S", 12 * 3600))
+
+
+def _sign(payload: str) -> str:
+    return hmac.new(AUTH_TOKEN_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+
+
+def issue_session_token(name: str, role: str) -> str:
+    """A stateless, server-signed session token: base64(json payload) + '.' + HMAC-SHA256 of that payload.
+    Nothing is stored server-side -- there is no session table to manage, expire or look up, which is the
+    whole appeal of a predefined-passkey login over the per-officer database-backed API keys this replaces.
+    The signature is what stops a caller from just typing a different name into the request later and having
+    it believed: the name is bound into the token at issue time, verified on every later request, never
+    re-read from anything the caller sends after login."""
+    payload = json.dumps({"name": name, "role": role, "iat": time.time()}, sort_keys=True)
+    encoded = base64.urlsafe_b64encode(payload.encode()).decode()
+    return f"{encoded}.{_sign(payload)}"
+
+
+def _decode_session_token(token: str) -> dict:
+    try:
+        encoded, sig = token.split(".", 1)
+        payload = base64.urlsafe_b64decode(encoded.encode()).decode()
+    except Exception as exc:  # noqa: BLE001 -- any malformed token (wrong shape, bad base64, ...) is just an
+                              # invalid session from the caller's point of view, not a server error
+        raise HTTPException(401, "malformed session token") from exc
+    if not hmac.compare_digest(_sign(payload), sig):
+        raise HTTPException(401, "invalid session token (bad signature)")
+    data = json.loads(payload)
+    if time.time() - data["iat"] > SESSION_MAX_AGE_S:
+        raise HTTPException(401, "session expired -- please sign in again")
+    return data
+
+
+def get_current_officer(authorization: str | None = Header(None)) -> str:
+    """Every route but /health and /login depends on this. Returns the NAME the person typed at login, bound
+    into a server-signed session token -- identity for the audit trail still comes from an authenticated
+    credential (the signature), never from request input a caller could set to anything, exactly as before
+    this module moved from per-officer database-managed API keys to a predefined admin/analyst passkey.
+
+    DEMO_LOGIN_BYPASS (off by default) skips all of that for a reviewer demo: every request is treated as a
+    fixed "Reviewer (DEMO MODE)" identity with no credential needed at all. The returned name deliberately says
+    "DEMO MODE" rather than a real-looking name, so it is unmistakable in the UI and the audit trail that these
+    actions were not actually authenticated -- the whole point of this project's own earlier security work was
+    making sure the audit trail's identity is always genuine, so this bypass must never look like it still is.
+    """
+    if DEMO_LOGIN_BYPASS:
+        return "Reviewer (DEMO MODE)"
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "missing or malformed Authorization header (expected 'Bearer <session-token>')")
+    token = authorization.removeprefix("Bearer ").strip()
+    if not token:
+        raise HTTPException(401, "empty session token")
+    return _decode_session_token(token)["name"]
+
+
+def get_current_role(authorization: str | None = Header(None)) -> str:
+    """Same token, but returns the ROLE ('admin'/'analyst') instead of the name -- for the handful of routes
+    that need to know which passkey was used, not just who's signed in. Not currently used to gate anything
+    (both roles can do everything below), but kept available since the login already carries it."""
+    if DEMO_LOGIN_BYPASS:
+        return "admin"
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "missing or malformed Authorization header")
+    token = authorization.removeprefix("Bearer ").strip()
+    return _decode_session_token(token)["role"]
+
+
+# ------------------------------------------------------------------ schemas
+class ScanRequest(BaseModel):
+    account_id: str
+    force_alert: bool = False       # create an alert even if the score is below the threshold
+
+
+class DecisionRequest(BaseModel):
+    decision: Literal["confirmed", "dismissed"]
+    note: str = Field("", max_length=2000)
+
+
+class LoginRequest(BaseModel):
+    passkey: str
+    name: str = Field(..., min_length=1, max_length=200)
+
+
+class AnomalyNoteRequest(BaseModel):
+    note: str = Field(..., min_length=1, max_length=4000)
+
+
+class AnomalyResolveRequest(BaseModel):
+    outcome: Literal["confirmed_mule", "cleared"]
+    note: str = Field("", max_length=4000)
+
+
+class IntakeIngestRow(BaseModel):
+    src: str
+    dst: str
+    amount: float
+    timestamp: int | None = None
+    cross_border: int | None = None
+    bank: str | None = None   # per-row override -- lets one Kafka batch carry transactions from several
+                              # banks at once (each message says which); /intake/ingest's paste path doesn't
+                              # use this, since one pasted document is always treated as one bank
+
+
+class IntakeIngestRequest(BaseModel):
+    rows: list[IntakeIngestRow] = Field(min_length=1, max_length=5000)
+    bank: str | None = None   # the whole-batch bank/institution name. REQUIRED by /intake/ingest (one
+                              # analyst paste = one bank, enforced there); used by /system/live-ingest only
+                              # as the fallback for a row that didn't carry its own `bank` field.
+
+
+# ------------------------------------------------------------------ routes
+@api.get("/health")
+def health():
+    with db() as conn:
+        conn.execute("SELECT 1")
+    return {"status": "ok"}
+
+
+@api.post("/login")
+def login(req: LoginRequest):
+    """The only unauthenticated route besides /health. Checks the submitted passkey against the two
+    predefined, shared role passkeys (ADMIN_PASSKEY / ANALYST_PASSKEY) -- there is no per-person credential to
+    issue or revoke here, by design. The name is NOT verified against anything (there's nothing to verify it
+    against -- that's the tradeoff of a shared passkey instead of per-officer accounts), but it IS what gets
+    signed into the session token and used for every action this person takes afterward, so the audit trail
+    still reflects a specific person's name on every decision, not just 'an analyst'."""
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(400, "name is required")
+    if ADMIN_PASSKEY and req.passkey == ADMIN_PASSKEY:
+        role = "admin"
+    elif ANALYST_PASSKEY and req.passkey == ANALYST_PASSKEY:
+        role = "analyst"
+    else:
+        raise HTTPException(401, "invalid passkey")
+    token = issue_session_token(name, role)
+    audit("login", {"name": name, "role": role})
+    return {"token": token, "name": name, "role": role}
+
+
+@api.get("/whoami")
+def whoami(officer: str = Depends(get_current_officer)):
+    """Lets the frontend verify a stored session token still works (e.g. after a page reload), and display who
+    is signed in, without needing to decode anything client-side -- the name comes from the signed token, the
+    same way every other route's identity does."""
+    return {"officer": officer}
+
+
+@api.get("/accounts/sample")
+def sample_accounts(officer: str = Depends(get_current_officer)):
+    return _call("GET", f"{GNN_API_URL}/accounts/sample", params={"n": 5})
+
+
+@api.get("/model/info")
+def model_info(officer: str = Depends(get_current_officer)):
+    return _call("GET", f"{GNN_API_URL}/model/info")
+
+
+@api.get("/activity")
+def activity(limit: int = 80, officer: str = Depends(get_current_officer)):
+    """A real feedback/activity feed, so an analyst can see what's happening across both pipelines without
+    opening a terminal or a database client. Built from data this service already has in Postgres -- it does
+    NOT reach into the immudb ledger that audit() writes to (that's a separate, deliberately write-oriented
+    tamper-evident store, not meant for casual browsing); this is the operational "what just happened" view,
+    the ledger is the forensic "prove what happened" one. Three real sources, merged and sorted by time:
+      - Model 1 alerts being created (a scan flagged something)
+      - Model 1 alerts being decided (an officer confirmed/dismissed one)
+      - Model 2 investigation_log entries (claimed / noted / resolved), flattened out of each anomaly alert's
+        own JSONB history so they interleave with everything else on one timeline instead of being buried
+        inside each alert's own record.
+    """
+    limit = min(max(limit, 1), 300)
+    events: list[dict] = []
+    with db() as conn:
+        for row in conn.execute(
+            "SELECT id, account_id, risk_score, created_at FROM alerts ORDER BY created_at DESC LIMIT %s",
+            (limit,),
+        ).fetchall():
+            events.append({
+                "ts": row["created_at"].timestamp(), "pipeline": "model1", "kind": "alert_created",
+                "account_id": row["account_id"], "by": None,
+                "detail": f"flagged (risk {row['risk_score']:.2f})", "ref_id": row["id"],
+            })
+        for row in conn.execute(
+            "SELECT id, account_id, status, reviewed_by, review_note, reviewed_at FROM alerts "
+            "WHERE reviewed_at IS NOT NULL ORDER BY reviewed_at DESC LIMIT %s",
+            (limit,),
+        ).fetchall():
+            events.append({
+                "ts": row["reviewed_at"].timestamp(), "pipeline": "model1", "kind": "decision",
+                "account_id": row["account_id"], "by": row["reviewed_by"],
+                "detail": row["status"] + (f" -- {row['review_note']}" if row["review_note"] else ""),
+                "ref_id": row["id"],
+            })
+        for row in conn.execute(
+            "SELECT id, account_id, investigation_log FROM anomaly_alerts "
+            "WHERE jsonb_array_length(investigation_log) > 0 ORDER BY updated_at DESC NULLS LAST LIMIT %s",
+            (limit,),
+        ).fetchall():
+            for entry in row["investigation_log"]:
+                events.append({
+                    "ts": entry["ts"], "pipeline": "model2", "kind": entry["status"],
+                    "account_id": row["account_id"], "by": entry.get("by"),
+                    "detail": entry.get("note") or entry["status"], "ref_id": row["id"],
+                })
+    events.sort(key=lambda e: e["ts"], reverse=True)
+    return events[:limit]
+
+
+@api.get("/system/status")
+def system_status(officer: str = Depends(get_current_officer)):
+    """Live reachability of everything this backend depends on, plus the Kafka topic a real bank feed would
+    publish onto -- the "how does live data actually get into this system" page. Two honest, different kinds
+    of information: the health checks below are REAL requests made right now; the Kafka fields are
+    configuration this deployment already has (docker-compose.yml / .env), shown so an analyst doesn't need to
+    go find them in a file -- this endpoint does not itself verify anything is currently publishing to that
+    topic."""
+    def check(name: str, url: str) -> dict:
+        t0 = time.monotonic()
+        try:
+            httpx.get(url, timeout=4).raise_for_status()
+            return {"name": name, "ok": True, "latency_ms": round((time.monotonic() - t0) * 1000, 1)}
+        except httpx.HTTPError as exc:
+            return {"name": name, "ok": False, "latency_ms": None, "error": exc.__class__.__name__}
+
+    db_ok = True
+    try:
+        with db() as conn:
+            conn.execute("SELECT 1")
+    except psycopg.OperationalError:
+        db_ok = False
+
+    services = [
+        {"name": "database", "ok": db_ok, "latency_ms": None},
+        check("gnn-detection-api (Model 1 + Model 2 scoring)", f"{GNN_API_URL}/health"),
+        check("xai-narrative-api (SAR narratives)", f"{XAI_API_URL}/health"),
+    ]
+    return {
+        "services": services,
+        "all_ok": all(s["ok"] for s in services),
+        "kafka": {
+            "external_listener": "localhost:29092 (SASL/PLAIN -- KAFKA_EXTERNAL_USER/PASSWORD in .env)",
+            "transactions_topic": os.getenv("KAFKA_TOPIC_TRANSACTIONS", "aml.transactions"),
+            "alerts_topic": os.getenv("KAFKA_TOPIC_ALERTS", "aml.alerts"),
+            "note": "A bank's own feed publishes transaction records onto the transactions topic above. The "
+                    "live-feed-consumer service (gnn_aml_core.kafka_ingest) actually consumes this topic and "
+                    "adds every transaction's accounts to the live graph through the same trained, frozen "
+                    "model the Intake tab uses -- this is a real, wired pipeline now, not just a display of "
+                    "config. aml_synth.exporters is this project's own reference producer for that same topic, "
+                    "used to generate the synthetic data this console was demoed against; pointing a real "
+                    "bank's own producer at this topic with the external-listener credentials above is the "
+                    "only step left to go from synthetic to real traffic -- this page cannot do that external "
+                    "wiring itself, only show whether this deployment's own services are currently reachable.",
+        },
+    }
+
+
+@api.get("/accounts/{account_id}/explain")
+def explain_account(account_id: str, officer: str = Depends(get_current_officer)):
+    """GNNExplainer subgraph + edge importances, drawn as the network view in the UI."""
+    return _call("POST", f"{GNN_API_URL}/explain", timeout=120, json={"account_id": account_id})
+
+
+@api.post("/alerts/scan")
+def scan(req: ScanRequest, officer: str = Depends(get_current_officer)):
+    pred = _call("POST", f"{GNN_API_URL}/predict", json={"account_ids": [req.account_id]})
+    res = pred["results"][0]
+    alert = None
+    if res["flagged"] or req.force_alert:
+        with db() as conn:
+            alert = conn.execute(
+                "INSERT INTO alerts (account_id, risk_score, source_bank) VALUES (%s, %s, %s) RETURNING *",
+                (req.account_id, res["score"], lookup_bank(req.account_id)),
+            ).fetchone()
+        audit("alert_created", {"alert_id": alert["id"], "account_id": req.account_id, "score": res["score"],
+                                "scanned_by": officer})
+    # "score"/"threshold" (raw) are what the flagged decision and the stored alert are based on, and stay
+    # exactly as before; "calibrated_score"/"calibrated_threshold" are the same pair mapped through isotonic
+    # calibration, meaningful as an actual probability -- meant for display (a risk gauge showing "99.9%" for
+    # every flagged account is not informative), never used for the flagged decision itself. .get() with a
+    # fallback keeps this working against an older gnn-detection-api that predates calibration.
+    return {"score": res["score"], "calibrated_score": res.get("calibrated_score", res["score"]),
+            "flagged": res["flagged"], "threshold": pred["threshold"],
+            "calibrated_threshold": pred.get("calibrated_threshold", pred["threshold"]),
+            "latency_ms": pred["latency_ms"], "alert": alert}
+
+
+@api.post("/intake/ingest")
+def intake_ingest(req: IntakeIngestRequest, officer: str = Depends(get_current_officer)):
+    """Option 1's real ingestion path: a document of real transactions pasted/uploaded on the Intake tab lands
+    here, gets forwarded to gnn-detection-api's POST /admin/ingest-live (which appends them to the live,
+    non-synthetic account population, rebuilds graph.pt standardized with the already-trained model's own
+    mean/std, and hot-reloads -- see gnn_aml_core.livegraph's module docstring), and the resulting account/
+    transaction counts come straight back to the frontend. No model weights are retrained by this call.
+
+    req.bank is required here (one pasted document = one bank, enforced below) -- every account it touches is
+    recorded in account_banks (tag_accounts_bank()) so every alert raised on it later, by any path, can say
+    which bank it came from."""
+    bank = (req.bank or "").strip()
+    if not bank:
+        raise HTTPException(422, "bank is required -- name the institution this document's accounts belong to")
+    gnn_rows = [{k: v for k, v in r.model_dump().items() if k != "bank"} for r in req.rows]
+    headers = {"Authorization": f"Bearer {GNN_ADMIN_TOKEN}"} if GNN_ADMIN_TOKEN else {}
+    result = _call("POST", f"{GNN_API_URL}/admin/ingest-live", timeout=60, json={"rows": gnn_rows}, headers=headers)
+    account_ids = sorted({r.src for r in req.rows} | {r.dst for r in req.rows})
+    tag_accounts_bank(account_ids, bank)
+    audit("intake_ingest", {"ingested_rows": result.get("ingested_rows"), "n_accounts": result.get("n_accounts"),
+                            "n_transactions": result.get("n_transactions"), "bank": bank, "by": officer})
+    return {**result, "bank": bank}
+
+
+@api.post("/system/live-ingest")
+def live_ingest(req: IntakeIngestRequest, authorization: str | None = Header(None)):
+    """Option 2's automated half of the same ingestion path /intake/ingest (Option 1) uses -- the
+    live-feed-consumer service (gnn_aml_core.kafka_ingest) calls this for every batch it reads off the Kafka
+    transactions topic, so a live feed does the exact same thing a pasted document does: it never stops,
+    delays, or otherwise touches the transaction itself, it only (a) adds the accounts to the live graph via
+    gnn-detection-api's POST /admin/ingest-live, standardized with the already-trained model's own frozen
+    mean/std -- no retraining -- and (b) scores every account the batch touched and raises an alert, exactly
+    as if an analyst had scanned it from the Scan tab, for the ones that come back flagged. That alert is the
+    ENTIRE effect this has on anything: no transaction is blocked, delayed, or altered, here or anywhere else
+    in this call chain.
+
+    No officer is signed in to a background consumer, so this route authenticates with the GNN_ADMIN_TOKEN
+    shared secret instead of a session token -- the same secret gnn-detection-api already requires on its own
+    admin routes, not a new credential."""
+    if GNN_ADMIN_TOKEN:
+        token = (authorization or "").removeprefix("Bearer ").strip()
+        if token != GNN_ADMIN_TOKEN:
+            raise HTTPException(401, "missing or invalid Authorization header (expected 'Bearer <GNN_ADMIN_TOKEN>')")
+    else:
+        log.warning("POST /system/live-ingest called with GNN_ADMIN_TOKEN unset -- this endpoint is "
+                    "unauthenticated. Fine for local dev; set GNN_ADMIN_TOKEN before exposing this beyond one machine.")
+
+    headers = {"Authorization": f"Bearer {GNN_ADMIN_TOKEN}"} if GNN_ADMIN_TOKEN else {}
+    gnn_rows = [{k: v for k, v in r.model_dump().items() if k != "bank"} for r in req.rows]
+    ingest_result = _call("POST", f"{GNN_API_URL}/admin/ingest-live", timeout=60, json={"rows": gnn_rows}, headers=headers)
+
+    # Each row says which bank it came from (a Kafka message can carry its own "bank"/"institution" field);
+    # a row with none falls back to req.bank, the per-deployment default a single-topic consumer is
+    # configured with (LIVE_FEED_DEFAULT_BANK -- see gnn_aml_core/kafka_ingest.py), and finally "unknown" if
+    # neither is set, same as an account that arrives with no attribution at all.
+    bank_by_account: dict[str, str] = {}
+    for r in req.rows:
+        b = (r.bank or req.bank or "unknown").strip() or "unknown"
+        bank_by_account.setdefault(r.src, b)
+        bank_by_account.setdefault(r.dst, b)
+    for b in set(bank_by_account.values()):
+        tag_accounts_bank([a for a, ab in bank_by_account.items() if ab == b], b)
+
+    account_ids = sorted(bank_by_account)
+    alerts_created: list[int] = []
+    if account_ids:
+        pred = _call("POST", f"{GNN_API_URL}/predict", timeout=60, json={"account_ids": account_ids})
+        for account_id, res in zip(account_ids, pred["results"]):
+            if not res["flagged"]:
+                continue
+            with db() as conn:
+                alert = conn.execute(
+                    "INSERT INTO alerts (account_id, risk_score, source_bank) VALUES (%s, %s, %s) RETURNING *",
+                    (account_id, res["score"], lookup_bank(account_id)),
+                ).fetchone()
+            alerts_created.append(alert["id"])
+            audit("alert_created", {"alert_id": alert["id"], "account_id": account_id, "score": res["score"],
+                                    "scanned_by": "system:live-feed"})
+
+    return {**ingest_result, "accounts_scanned": len(account_ids), "alerts_created": alerts_created}
+
+
+@api.get("/alerts")
+def list_alerts(status: str | None = None, bank: str | None = None, limit: int = 100,
+                officer: str = Depends(get_current_officer)):
+    q, args, where = "SELECT * FROM alerts", [], []
+    if status:
+        where.append("status = %s")
+        args.append(status)
+    if bank:
+        where.append("source_bank = %s")
+        args.append(bank)
+    if where:
+        q += " WHERE " + " AND ".join(where)
+    q += " ORDER BY created_at DESC LIMIT %s"
+    args.append(min(limit, 500))
+    with db() as conn:
+        return conn.execute(q, args).fetchall()
+
+
+@api.get("/banks")
+def list_banks(officer: str = Depends(get_current_officer)):
+    """Every distinct bank name seen so far across alerts, for the Alerts tab's filter dropdown -- not
+    account_banks directly, since what an analyst wants to filter by is "banks that actually have alerts",
+    not every bank that's ever sent a transaction with nothing flagged in it."""
+    with db() as conn:
+        rows = conn.execute("SELECT DISTINCT source_bank FROM alerts ORDER BY source_bank").fetchall()
+    return [r["source_bank"] for r in rows]
+
+
+@api.post("/alerts/{alert_id}/narrative")
+def generate_narrative(alert_id: int, officer: str = Depends(get_current_officer)):
+    with db() as conn:
+        alert = conn.execute("SELECT * FROM alerts WHERE id = %s", (alert_id,)).fetchone()
+    if not alert:
+        raise HTTPException(404, "alert not found")
+    out = _call("POST", f"{XAI_API_URL}/narrative", timeout=180, json={"account_id": alert["account_id"]})
+    with db() as conn:
+        alert = conn.execute(
+            "UPDATE alerts SET narrative=%s, narrative_source=%s, narrative_sha256=%s, typology=%s "
+            "WHERE id=%s RETURNING *",
+            (out["narrative"], out["source"], out["narrative_sha256"], out["typology"], alert_id),
+        ).fetchone()
+    return alert
+
+
+@api.post("/alerts/{alert_id}/decision")
+def decide(alert_id: int, req: DecisionRequest, officer: str = Depends(get_current_officer)):
+    with db() as conn:
+        alert = conn.execute("SELECT * FROM alerts WHERE id = %s", (alert_id,)).fetchone()
+        if not alert:
+            raise HTTPException(404, "alert not found")
+        if alert["status"] != "open":
+            raise HTTPException(409, f"alert already {alert['status']}")
+        alert = conn.execute(
+            "UPDATE alerts SET status=%s, reviewed_by=%s, review_note=%s, reviewed_at=now() "
+            "WHERE id=%s RETURNING *",
+            (req.decision, officer, req.note, alert_id),
+        ).fetchone()
+    # Record hash of the exact reviewed content so later tampering with Postgres is detectable.
+    record = {"alert_id": alert_id, "account_id": alert["account_id"], "decision": req.decision,
+              "officer": officer, "note": req.note, "narrative_sha256": alert["narrative_sha256"]}
+    record["record_sha256"] = hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
+    audit("officer_decision", record)
+    return alert
+
+
+# ------------------------------------------------------------------ Model 2 (anomaly) investigation workflow
+# These alerts are written directly by gnn_aml_core.anomaly (its own container, running continuously -- see
+# that module's docstring) straight into Postgres, not through this API; this API only handles what happens
+# to an alert AFTER it exists: new -> under_investigation -> confirmed_mule | cleared. A resolve to
+# confirmed_mule is read back out by gnn_aml_core.anomaly.sync_confirmed_to_model1 on its own schedule (not
+# triggered synchronously by this request) and is the only thing that ever teaches Model 1 a new pattern.
+@api.get("/anomalies")
+def list_anomalies(status: str | None = None, limit: int = 100, officer: str = Depends(get_current_officer)):
+    q, args = "SELECT * FROM anomaly_alerts", []
+    if status:
+        q += " WHERE status = %s"
+        args.append(status)
+    q += " ORDER BY created_at DESC LIMIT %s"
+    args.append(min(limit, 500))
+    with db() as conn:
+        return conn.execute(q, args).fetchall()
+
+
+@api.get("/anomalies/{anomaly_id}")
+def get_anomaly(anomaly_id: int, officer: str = Depends(get_current_officer)):
+    with db() as conn:
+        row = conn.execute("SELECT * FROM anomaly_alerts WHERE id = %s", (anomaly_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "anomaly alert not found")
+    return row
+
+
+def _append_investigation_log(conn, anomaly_id: int, entry: dict) -> dict:
+    row = conn.execute("SELECT investigation_log FROM anomaly_alerts WHERE id = %s", (anomaly_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "anomaly alert not found")
+    updated_log = [*row["investigation_log"], entry]
+    return conn.execute(
+        "UPDATE anomaly_alerts SET investigation_log = %s, updated_at = now() WHERE id = %s RETURNING *",
+        (Jsonb(updated_log), anomaly_id),
+    ).fetchone()
+
+
+@api.post("/anomalies/{anomaly_id}/claim")
+def claim_anomaly(anomaly_id: int, officer: str = Depends(get_current_officer)):
+    """Moves an alert from 'new' into 'under_investigation' and assigns it to the person claiming it -- this is
+    a real state transition, not a label: it's what turns a raw statistical flag into something a specific
+    person is now responsible for looking into (account history, related accounts, and -- outside this
+    system's reach -- things like calling the account holder or looping in investigators, as the real workflow
+    this is meant to support)."""
+    with db() as conn:
+        alert = conn.execute("SELECT * FROM anomaly_alerts WHERE id = %s", (anomaly_id,)).fetchone()
+        if not alert:
+            raise HTTPException(404, "anomaly alert not found")
+        if alert["status"] != "new":
+            raise HTTPException(409, f"alert already {alert['status']}, cannot claim")
+        alert = conn.execute(
+            "UPDATE anomaly_alerts SET status='under_investigation', assigned_to=%s, updated_at=now() "
+            "WHERE id=%s RETURNING *",
+            (officer, anomaly_id),
+        ).fetchone()
+        alert = _append_investigation_log(conn, anomaly_id,
+                                          {"ts": time.time(), "by": officer, "status": "under_investigation",
+                                           "note": "claimed for investigation"})
+    audit("anomaly_claimed", {"anomaly_id": anomaly_id, "account_id": alert["account_id"], "by": officer})
+    return alert
+
+
+@api.post("/anomalies/{anomaly_id}/notes")
+def add_anomaly_note(anomaly_id: int, req: AnomalyNoteRequest, officer: str = Depends(get_current_officer)):
+    """Documents a step of the actual investigation -- e.g. 'called the account holder, no answer', 'cross-
+    checked against the related shell account from last quarter', 'escalated to [investigator]' -- without
+    changing the alert's status. This is the running case file; resolve() below is the final verdict."""
+    with db() as conn:
+        alert = conn.execute("SELECT * FROM anomaly_alerts WHERE id = %s", (anomaly_id,)).fetchone()
+        if not alert:
+            raise HTTPException(404, "anomaly alert not found")
+        if alert["status"] not in ("under_investigation",):
+            raise HTTPException(409, f"alert is '{alert['status']}' -- claim it before adding investigation notes")
+        alert = _append_investigation_log(conn, anomaly_id,
+                                          {"ts": time.time(), "by": officer, "status": alert["status"], "note": req.note})
+    return alert
+
+
+@api.post("/anomalies/{anomaly_id}/resolve")
+def resolve_anomaly(anomaly_id: int, req: AnomalyResolveRequest, officer: str = Depends(get_current_officer)):
+    """The only way an anomaly alert becomes a verdict. 'confirmed_mule' means the investigation (account
+    history, related accounts, direct contact, escalation -- whatever that took) actually established this is
+    a real mule account; this is what gnn_aml_core.anomaly.sync_confirmed_to_model1 picks up and feeds into
+    Model 1's fine-tune, teaching it this specific newly-discovered pattern. 'cleared' means the investigation
+    found nothing -- logged as evidence, and deliberately NEVER fed into training (an unconfirmed or cleared
+    alert must never quietly become a training example)."""
+    with db() as conn:
+        alert = conn.execute("SELECT * FROM anomaly_alerts WHERE id = %s", (anomaly_id,)).fetchone()
+        if not alert:
+            raise HTTPException(404, "anomaly alert not found")
+        if alert["status"] != "under_investigation":
+            raise HTTPException(409, f"alert is '{alert['status']}' -- claim it and investigate before resolving")
+        alert = conn.execute(
+            "UPDATE anomaly_alerts SET status=%s, updated_at=now() WHERE id=%s RETURNING *",
+            (req.outcome, anomaly_id),
+        ).fetchone()
+        alert = _append_investigation_log(conn, anomaly_id,
+                                          {"ts": time.time(), "by": officer, "status": req.outcome, "note": req.note})
+    record = {"anomaly_id": anomaly_id, "account_id": alert["account_id"], "outcome": req.outcome,
+              "officer": officer, "note": req.note}
+    record["record_sha256"] = hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
+    audit("anomaly_resolved", record)
+    return alert
+
+
+app.include_router(api)

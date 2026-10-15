@@ -4,39 +4,48 @@ import { useState } from "react";
 import type { FormEvent, ReactElement } from "react";
 import Glass from "@/components/Glass";
 import { IconShield } from "@/components/Icons";
-import { api, setApiKey } from "@/lib/api";
-import type { WhoamiResponse } from "@/types";
+import { api, setSessionToken } from "@/lib/api";
+import type { LoginResponse } from "@/types";
 
 interface LoginScreenProps {
-  /** Called once the entered key is verified against /whoami -- the real officer name comes back from the
-   * backend, never from anything typed into this form, so the audit trail always reflects who actually
-   * authenticated, not a self-reported name. */
-  onSuccess: (officer: string) => void;
+  /** Called once POST /api/login accepts the passkey -- the signed-in name is whatever was typed below,
+   * since there's no per-person account to look it up against (see backend/main.py's module docstring on why
+   * that's an intentional tradeoff of a shared, predefined passkey). `bank` is set when this passkey belongs
+   * to one specific institution (a BANK_PASSKEYS tenant login) rather than an admin/global session. */
+  onSuccess: (name: string, bank: string | null) => void;
 }
 
-/** Replaces the earlier prompt()-based placeholder with a real form: the key is verified against /whoami
- * before it is treated as valid, and a wrong or revoked key gets a clear, specific error rather than silently
- * failing on the first real request. */
+/** One shared passkey per role (admin/analyst), plus one passkey per bank for a multi-tenant deployment --
+ * no per-person account to create or manage either way. The name typed here is what every action gets
+ * attributed to afterward, so it's asked for up front, not assumed. */
 export default function LoginScreen({ onSuccess }: LoginScreenProps): ReactElement {
-  const [key, setKey] = useState<string>("");
+  const [name, setName] = useState<string>("");
+  const [passkey, setPasskey] = useState<string>("");
   const [error, setError] = useState<string>("");
   const [busy, setBusy] = useState<boolean>(false);
 
   const handleSubmit = async (e: FormEvent): Promise<void> => {
     e.preventDefault();
-    const trimmed = key.trim();
-    if (!trimmed) {
-      setError("Enter your officer API key.");
+    const trimmedName = name.trim();
+    if (!trimmedName) {
+      setError("Enter your name.");
+      return;
+    }
+    if (!passkey) {
+      setError("Enter the admin or analyst passkey.");
       return;
     }
     setBusy(true);
     setError("");
-    setApiKey(trimmed);   // must be stored before calling api(), which reads the key from storage
     try {
-      const who = await api<WhoamiResponse>("/whoami");
-      onSuccess(who.officer);
+      const res = await api<LoginResponse>("/login", {
+        method: "POST",
+        body: JSON.stringify({ name: trimmedName, passkey }),
+      });
+      setSessionToken(res.token);
+      onSuccess(res.name, res.bank);
     } catch {
-      setError("That key was not accepted. Check it for typos, or ask whoever ran manage_keys.py to confirm it hasn't been revoked.");
+      setError("That passkey wasn't accepted. Check it for typos, or ask whoever set up this console for your passkey.");
     } finally {
       setBusy(false);
     }
@@ -54,22 +63,31 @@ export default function LoginScreen({ onSuccess }: LoginScreenProps): ReactEleme
             </div>
           </div>
           <p className="login-hint">
-            Sign in with your officer API key. Issued with <code>manage_keys.py create</code> -- ask your
-            administrator for one if you don&apos;t have it.
+            Sign in with your name and your passkey -- the admin/analyst passkey, or your bank's own passkey if
+            this is a multi-bank deployment. Every action you take is recorded under the name you enter here.
           </p>
           <input
             className="input login-input"
-            type="password"
-            placeholder="officer_…"
-            value={key}
-            onChange={(e) => setKey(e.target.value)}
+            type="text"
+            placeholder="Your name"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
             autoFocus
+            disabled={busy}
+            autoComplete="name"
+          />
+          <input
+            className="input login-input"
+            type="password"
+            placeholder="Passkey"
+            value={passkey}
+            onChange={(e) => setPasskey(e.target.value)}
             disabled={busy}
             autoComplete="off"
             spellCheck={false}
           />
           {error && <p className="login-error">{error}</p>}
-          <button className="btn shine login-submit" type="submit" disabled={busy || !key.trim()}>
+          <button className="btn shine login-submit" type="submit" disabled={busy || !name.trim() || !passkey}>
             {busy ? "Checking…" : "Sign in"}
           </button>
         </Glass>

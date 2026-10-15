@@ -1,0 +1,9 @@
+numpy
+pandas
+networkx
+faker
+kafka-python
+neo4jnumpy
+pandas
+kafka-python
+neo4j

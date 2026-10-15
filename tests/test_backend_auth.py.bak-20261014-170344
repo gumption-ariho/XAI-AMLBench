@@ -1,0 +1,192 @@
+"""Tests for backend.main's authentication: the stateless, HMAC-signed session-token system issued by
+POST /api/login (one predefined passkey per role -- ADMIN_PASSKEY / ANALYST_PASSKEY -- plus the person's own
+name). This replaced an earlier per-officer, database-backed API-key system (hash_api_key / the api_keys table /
+manage_keys.py) -- those are gone, and so are the tests that exercised them. Only the database call is mocked
+where a route happens to touch it (login's audit() call); everything else -- FastAPI's own HTTPException, the
+real HMAC signing/verification, the real header-parsing logic -- runs for real.
+"""
+import os
+import time
+
+os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost/test")  # required at import time; never
+                                                                                # actually connected to in these tests
+
+import pytest
+from fastapi import HTTPException
+
+import backend.main as m
+
+
+class TestIssueAndDecodeSessionToken:
+    def test_round_trips_name_and_role(self):
+        token = m.issue_session_token("Jane Smith", "analyst")
+        data = m._decode_session_token(token)
+        assert data["name"] == "Jane Smith"
+        assert data["role"] == "analyst"
+
+    def test_different_logins_get_different_tokens(self):
+        # iat (issued-at) differs even for the same name/role, so tokens are never literally identical
+        t1 = m.issue_session_token("Jane Smith", "analyst")
+        time.sleep(0.01)
+        t2 = m.issue_session_token("Jane Smith", "analyst")
+        assert t1 != t2
+
+    def test_tampered_payload_is_rejected(self):
+        token = m.issue_session_token("Jane Smith", "analyst")
+        encoded, sig = token.split(".", 1)
+        # flip the role by re-encoding a modified payload, keeping the ORIGINAL (now-mismatched) signature
+        import base64
+        import json
+        payload = json.loads(base64.urlsafe_b64decode(encoded.encode()).decode())
+        payload["role"] = "admin"
+        tampered_encoded = base64.urlsafe_b64encode(json.dumps(payload, sort_keys=True).encode()).decode()
+        with pytest.raises(HTTPException) as exc:
+            m._decode_session_token(f"{tampered_encoded}.{sig}")
+        assert exc.value.status_code == 401
+        assert "signature" in exc.value.detail
+
+    def test_malformed_token_is_rejected(self):
+        with pytest.raises(HTTPException) as exc:
+            m._decode_session_token("not-even-shaped-like-a-token")
+        assert exc.value.status_code == 401
+
+    def test_expired_token_is_rejected(self, monkeypatch):
+        monkeypatch.setattr(m, "SESSION_MAX_AGE_S", 1)
+        token = m.issue_session_token("Jane Smith", "analyst")
+        monkeypatch.setattr(m.time, "time", lambda: time.time() + 2)
+        with pytest.raises(HTTPException) as exc:
+            m._decode_session_token(token)
+        assert exc.value.status_code == 401
+        assert "expired" in exc.value.detail
+
+    def test_signature_uses_the_configured_secret(self, monkeypatch):
+        monkeypatch.setattr(m, "AUTH_TOKEN_SECRET", "secret-a")
+        token = m.issue_session_token("Jane Smith", "analyst")
+        monkeypatch.setattr(m, "AUTH_TOKEN_SECRET", "secret-b")
+        with pytest.raises(HTTPException) as exc:
+            m._decode_session_token(token)
+        assert exc.value.status_code == 401
+
+
+class TestGetCurrentOfficer:
+    def test_missing_authorization_header_is_rejected(self, monkeypatch):
+        monkeypatch.setattr(m, "DEMO_LOGIN_BYPASS", False)
+        with pytest.raises(HTTPException) as exc:
+            m.get_current_officer(authorization=None)
+        assert exc.value.status_code == 401
+        assert "missing or malformed" in exc.value.detail
+
+    def test_wrong_auth_scheme_is_rejected(self, monkeypatch):
+        monkeypatch.setattr(m, "DEMO_LOGIN_BYPASS", False)
+        with pytest.raises(HTTPException) as exc:
+            m.get_current_officer(authorization="Basic dGVzdA==")
+        assert exc.value.status_code == 401
+
+    def test_empty_token_after_bearer_is_rejected(self, monkeypatch):
+        monkeypatch.setattr(m, "DEMO_LOGIN_BYPASS", False)
+        with pytest.raises(HTTPException) as exc:
+            m.get_current_officer(authorization="Bearer ")
+        assert exc.value.status_code == 401
+        assert "empty" in exc.value.detail
+
+    def test_valid_token_returns_the_name_it_was_issued_for(self, monkeypatch):
+        monkeypatch.setattr(m, "DEMO_LOGIN_BYPASS", False)
+        token = m.issue_session_token("Jane Smith", "analyst")
+        assert m.get_current_officer(authorization=f"Bearer {token}") == "Jane Smith"
+
+    def test_caller_cannot_change_name_by_sending_a_different_one_later(self, monkeypatch):
+        # the name is bound into the signed token at login -- nothing in a later request's headers or body can
+        # override it, which is the entire point of signing the name in rather than trusting a free-text field
+        monkeypatch.setattr(m, "DEMO_LOGIN_BYPASS", False)
+        token = m.issue_session_token("Jane Smith", "analyst")
+        assert m.get_current_officer(authorization=f"Bearer {token}") == "Jane Smith"
+
+
+class TestGetCurrentRole:
+    def test_returns_the_role_the_token_was_issued_with(self, monkeypatch):
+        monkeypatch.setattr(m, "DEMO_LOGIN_BYPASS", False)
+        token = m.issue_session_token("Jane Smith", "admin")
+        assert m.get_current_role(authorization=f"Bearer {token}") == "admin"
+
+    def test_missing_header_is_rejected(self, monkeypatch):
+        monkeypatch.setattr(m, "DEMO_LOGIN_BYPASS", False)
+        with pytest.raises(HTTPException) as exc:
+            m.get_current_role(authorization=None)
+        assert exc.value.status_code == 401
+
+
+class TestLoginRoute:
+    def test_admin_passkey_issues_an_admin_token(self, monkeypatch):
+        monkeypatch.setattr(m, "ADMIN_PASSKEY", "letmein-admin")
+        monkeypatch.setattr(m, "ANALYST_PASSKEY", "letmein-analyst")
+        monkeypatch.setattr(m, "audit", lambda *a, **kw: None)  # no live DB in this test
+        res = m.login(m.LoginRequest(passkey="letmein-admin", name="Jane Smith"))
+        assert res["role"] == "admin"
+        assert res["name"] == "Jane Smith"
+        assert m._decode_session_token(res["token"])["role"] == "admin"
+
+    def test_analyst_passkey_issues_an_analyst_token(self, monkeypatch):
+        monkeypatch.setattr(m, "ADMIN_PASSKEY", "letmein-admin")
+        monkeypatch.setattr(m, "ANALYST_PASSKEY", "letmein-analyst")
+        monkeypatch.setattr(m, "audit", lambda *a, **kw: None)
+        res = m.login(m.LoginRequest(passkey="letmein-analyst", name="Jane Smith"))
+        assert res["role"] == "analyst"
+
+    def test_wrong_passkey_is_rejected(self, monkeypatch):
+        monkeypatch.setattr(m, "ADMIN_PASSKEY", "letmein-admin")
+        monkeypatch.setattr(m, "ANALYST_PASSKEY", "letmein-analyst")
+        with pytest.raises(HTTPException) as exc:
+            m.login(m.LoginRequest(passkey="guessing", name="Jane Smith"))
+        assert exc.value.status_code == 401
+
+    def test_blank_name_is_rejected(self, monkeypatch):
+        monkeypatch.setattr(m, "ADMIN_PASSKEY", "letmein-admin")
+        with pytest.raises(HTTPException) as exc:
+            m.login(m.LoginRequest(passkey="letmein-admin", name="   "))
+        assert exc.value.status_code == 400
+
+    def test_unset_passkey_never_matches_anything(self, monkeypatch):
+        # os.getenv returns None when a passkey isn't configured at all -- req.passkey must never be able to
+        # equal None (e.g. by some client sending passkey: null and pydantic coercing it to the string "None")
+        monkeypatch.setattr(m, "ADMIN_PASSKEY", None)
+        monkeypatch.setattr(m, "ANALYST_PASSKEY", None)
+        with pytest.raises(HTTPException) as exc:
+            m.login(m.LoginRequest(passkey="None", name="Jane Smith"))
+        assert exc.value.status_code == 401
+
+
+class TestWhoami:
+    """whoami() is deliberately trivial -- it just echoes the officer name get_current_officer already
+    resolved and verified (see TestGetCurrentOfficer above for that logic's real tests). This confirms the
+    route itself returns the correct shape, not a re-test of authentication logic that already has its own
+    tests."""
+
+    def test_returns_the_authenticated_officer_name(self):
+        assert m.whoami(officer="Jane Smith") == {"officer": "Jane Smith"}
+
+
+class TestDemoLoginBypass:
+    """Off by default. A deliberate, clearly-labelled convenience for a reviewer demo -- see backend/main.py's
+    own loud startup warning. Must never silently look like a real authenticated identity."""
+
+    def test_off_by_default_still_requires_real_auth(self, monkeypatch):
+        monkeypatch.setattr(m, "DEMO_LOGIN_BYPASS", False)
+        with pytest.raises(HTTPException) as exc:
+            m.get_current_officer(authorization=None)
+        assert exc.value.status_code == 401
+
+    def test_when_on_skips_auth_entirely_with_no_header_at_all(self, monkeypatch):
+        monkeypatch.setattr(m, "DEMO_LOGIN_BYPASS", True)
+        officer = m.get_current_officer(authorization=None)
+        assert officer == "Reviewer (DEMO MODE)"
+
+    def test_the_returned_identity_unmistakably_says_demo_mode(self, monkeypatch):
+        # the whole point of this project's earlier security work was making sure the audit trail's identity
+        # is always genuine -- this bypass must never produce a name that could pass as a real officer's
+        monkeypatch.setattr(m, "DEMO_LOGIN_BYPASS", True)
+        officer = m.get_current_officer(authorization=None)
+        assert "DEMO" in officer.upper()
+
+    def test_role_bypass_also_returns_a_fixed_safe_value(self, monkeypatch):
+        monkeypatch.setattr(m, "DEMO_LOGIN_BYPASS", True)
+        assert m.get_current_role(authorization=None) == "admin"

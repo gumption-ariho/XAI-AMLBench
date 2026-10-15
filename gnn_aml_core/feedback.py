@@ -18,6 +18,35 @@ needs one, and it is a single, small, swappable function.
 
     python -m gnn_aml_core.feedback --check                     # just report the current drift, do nothing else
     python -m gnn_aml_core.feedback --data data --out models    # retrain if warranted, using the current graph
+
+Auto-retrain, gated before deploy (--serve-metrics --auto-retrain): closes the loop fully -- when the drift
+trigger above fires, retrain_and_maybe_promote() FINE-TUNES the model already in production (warm-starting from
+its exact saved weights, a short run at a low learning rate -- see fit_gnn's init_state_dict param and
+--finetune-lr/--finetune-epochs/--finetune-patience) rather than training a brand-new model from random weights.
+It then EVALUATES that fine-tuned candidate against the exact same held-out test split as the CURRENT production
+model (not the candidate's own reported number against some other split, and not trusting the current model's
+originally-stored metric, which could be stale or from a different split seed -- see evaluate_checkpoint()). The
+candidate is promoted into production ONLY if it beats the current model's test AUC-ROC by at least
+--min-improvement (default: any improvement at all, however small, beats nothing). If it does not beat the
+current model, NOTHING changes on disk -- the current model keeps serving, this is logged and counted (not
+silently discarded), and the next drift-trigger cycle will try again with more accumulated feedback. This
+mirrors the reasoning that already kept retraining itself a manual-only action for years: an unattended process
+is fine to DECIDE when retraining is warranted and even to DO the retraining work, but letting it skip
+validation and replace a working model with a worse one is a materially bigger, riskier decision for a
+compliance system -- so that step stays gated on a real comparison, every time, with no exceptions and no
+"it's probably fine."
+
+On promotion: the current checkpoint is backed up (gnn_model.pt.bak-<timestamp>, never deleted automatically),
+the new one is written to the same path gnn-detection-api reads, and that service is asked to hot-swap it in via
+POST /admin/reload-model -- no container restart, no served-traffic gap (see gnn_aml_core/main.py's module
+docstring for how the prediction cache is kept correct across that swap). If the live reload call fails (service
+unreachable, wrong token), the new checkpoint is still safely on disk and gets picked up on that service's next
+restart regardless -- promotion-on-disk and live-reload are two separate, independently-recoverable steps, not
+one atomic operation that can half-fail. Every promotion AND every rejection is appended to
+models/retrain_history.jsonl -- an auditable record of every time the live model changed (or didn't), and why,
+which a compliance system needs to be able to produce on demand.
+
+    python -m gnn_aml_core.feedback --serve-metrics --auto-retrain --gnn-api http://127.0.0.1:8001
 """
 from __future__ import annotations
 
@@ -41,6 +70,14 @@ DISAGREEMENT_RATE = Gauge("aml_officer_disagreement_rate", "Current officer disa
 FEEDBACK_DECISIONS_TOTAL = Gauge("aml_feedback_decisions_total", "Officer decisions available for drift detection")
 RETRAIN_TRIGGERED_TOTAL = Counter("aml_retrain_triggered_total", "Times the disagreement-rate threshold has "
                                  "been met or exceeded, since this process started")
+# --auto-retrain only: ATTEMPTS counts every automatic retrain this process has run; PROMOTED and REJECTED
+# split that by outcome, so "is auto-retrain actually promoting anything, or always rejecting" is visible at a
+# glance on a dashboard without reading logs or retrain_history.jsonl.
+AUTO_RETRAIN_ATTEMPTS = Counter("aml_auto_retrain_attempts_total", "Automatic retrains run (--auto-retrain only)")
+AUTO_RETRAIN_PROMOTED = Counter("aml_auto_retrain_promoted_total", "Automatic retrains that beat the current "
+                               "model and were promoted into production")
+AUTO_RETRAIN_REJECTED = Counter("aml_auto_retrain_rejected_total", "Automatic retrains that did NOT beat the "
+                               "current model and were discarded -- the current model kept serving")
 
 
 @dataclass
@@ -158,6 +195,179 @@ def retrain_with_feedback(arrays: dict, tr, va, te, feedback_ids: list[str], fee
     return fit_gnn(arrays, tr_with_feedback, va, te, **fit_kwargs)
 
 
+def evaluate_checkpoint(ckpt: dict, arrays: dict, te) -> float:
+    """Test-set AUC-ROC of an ALREADY-TRAINED checkpoint, measured fresh against a given (numpy) graph + test
+    index split. Used to score the CURRENT production model on the exact same split a retrain candidate is
+    about to be judged against, rather than trusting the current checkpoint's own stored metric -- which could
+    have been computed on a different graph snapshot, a different split seed, or simply be out of date. An
+    apples-to-apples comparison requires both models to be evaluated the same way, right now, on the same data."""
+    import numpy as np
+    import torch
+    from sklearn.metrics import roc_auc_score
+
+    from gnn_aml_core.models import build_model
+
+    model = build_model(ckpt["model_name"], arrays["x"].shape[1], **ckpt["hparams"])
+    model.load_state_dict(ckpt["state_dict"])
+    model.eval()
+    x = torch.from_numpy(np.array(arrays["x"]))
+    ei = torch.from_numpy(np.array(arrays["edge_index"]))
+    ea = torch.from_numpy(np.array(arrays["edge_attr"]))
+    et = torch.from_numpy(np.array(arrays["edge_type"]))
+    with torch.no_grad():
+        prob = torch.sigmoid(model(x, ei, ea, et)).numpy()
+    return float(roc_auc_score(arrays["y"][te], prob[te]))
+
+
+def _append_retrain_history(out_dir, outcome: dict) -> None:
+    """Append-only audit trail of every automatic retrain decision (promoted or rejected), one JSON line per
+    attempt, never overwritten or rotated by this module. A compliance system needs to be able to answer "when
+    did the live model last change, and why" without digging through container logs that may have rolled over."""
+    import json
+    from pathlib import Path
+
+    p = Path(out_dir) / "retrain_history.jsonl"
+    with p.open("a") as f:
+        f.write(json.dumps(outcome, default=str) + "\n")
+
+
+def retrain_and_maybe_promote(records: list[DecisionRecord], *, data_dir: str = "data", out_dir: str = "models",
+                              feedback_weight: int = 5, min_improvement: float = 0.0,
+                              gnn_api: str | None = None, gnn_admin_token: str | None = None,
+                              finetune_lr: float = 0.0005, finetune_epochs: int = 30,
+                              finetune_patience: int = 5) -> dict:
+    """The automatic half of the feedback loop (see the module docstring's "Auto-retrain, gated before deploy"
+    section for the full reasoning). FINE-TUNES the model already in production -- warm-starting from its exact
+    weights (current_ckpt["state_dict"], via fit_gnn's new init_state_dict param) and continuing training for a
+    short run (finetune_epochs, default 30, vs. a from-scratch training run's 150) at a low learning rate
+    (finetune_lr, default 0.0005, 10x lower than train.py's from-scratch default of 0.005) -- rather than
+    building a brand-new model from random weights on every cycle. A fresh random init on every drift trigger
+    would (a) throw away everything the current model already learned and (b) make the gating comparison noisy
+    for the wrong reason: a candidate could lose purely to bad luck in its random seed, not because the
+    feedback data didn't help. Fine-tuning changes one thing at a time -- the same model, nudged by the new
+    officer-verified examples -- which is also the more defensible compliance story ("the model was adjusted
+    using N new real examples" vs. "the model was replaced by an unrelated one trained from scratch").
+
+    Evaluates the candidate against the SAME held-out test split as the CURRENT production model
+    (evaluate_checkpoint(), not either model's own possibly-stale stored metric), and promotes into production
+    ONLY if the candidate's test AUC-ROC beats the current model's by at least `min_improvement`. Always returns
+    a dict describing what happened (promoted, rejected, and why) and always appends it to
+    models/retrain_history.jsonl -- a rejection is a normal, expected, logged outcome, not a failure of this
+    function."""
+    import shutil
+    import time as _time
+    from pathlib import Path
+
+    import torch
+
+    from gnn_aml_core.train import make_splits
+
+    out = Path(out_dir)
+    g = torch.load(out / "graph.pt", map_location="cpu", weights_only=False)
+    for key in ("x", "edge_index", "edge_attr", "edge_type", "y"):
+        if hasattr(g[key], "numpy"):
+            g[key] = g[key].numpy()
+    current_ckpt = torch.load(out / "gnn_model.pt", map_location="cpu", weights_only=False)
+
+    ids, labels = build_feedback_dataset(records, set(g["account_ids"]))
+    tr, va, te = make_splits(g["y"], seed=current_ckpt["hparams"].get("seed", 42))
+
+    AUTO_RETRAIN_ATTEMPTS.inc()
+    current_auc = evaluate_checkpoint(current_ckpt, g, te)
+    log.info("auto-retrain: fine-tuning the current production model (not training a new one from scratch) "
+            "with %d real officer-verified example(s) blended in, %d epoch(s) max at lr=%.5f "
+            "(current production model's test AUC on this split: %.4f)",
+            len(ids), finetune_epochs, finetune_lr, current_auc)
+
+    # Pass the FULL saved hparams dict through (not just hidden/num_layers) -- fit_gnn stores every
+    # build_model() kwarg it was given (heads, dropout, edge_dim, etc., whatever that model actually uses)
+    # under "hparams", and warm-starting via init_state_dict requires the rebuilt model's shapes to match the
+    # saved state_dict EXACTLY. Cherry-picking just hidden/num_layers here would silently rebuild the wrong
+    # architecture for any model trained with a non-default heads/dropout/etc., and load_state_dict would then
+    # raise a shape-mismatch error -- failing loudly, which is the right failure mode for a mismatch like this,
+    # rather than quietly training a differently-shaped model that was never actually warm-started.
+    saved_hp = dict(current_ckpt["hparams"])
+    hidden = saved_hp.pop("hidden")
+    layers = saved_hp.pop("num_layers")
+    res = retrain_with_feedback(g, tr, va, te, ids, labels, feedback_weight=feedback_weight,
+                                model_name=current_ckpt["model_name"], hidden=hidden, layers=layers, **saved_hp,
+                                init_state_dict=current_ckpt["state_dict"],
+                                lr=finetune_lr, epochs=finetune_epochs, patience=finetune_patience,
+                                seed=current_ckpt["hparams"].get("seed", 42))
+    candidate_auc = res["report"]["auc_roc"]
+
+    outcome = {
+        "ts": _time.time(), "n_feedback_examples": len(ids), "current_test_auc": current_auc,
+        "candidate_test_auc": candidate_auc, "min_improvement": min_improvement,
+    }
+
+    if candidate_auc <= current_auc + min_improvement:
+        outcome["decision"] = "rejected"
+        outcome["reason"] = (f"candidate test AUC {candidate_auc:.4f} did not beat current {current_auc:.4f} "
+                             f"by the required margin ({min_improvement:.4f}) -- current model stays in production")
+        AUTO_RETRAIN_REJECTED.inc()
+        log.warning("auto-retrain: %s", outcome["reason"])
+        _append_retrain_history(out, outcome)
+        return outcome
+
+    # Promote: build the same checkpoint schema gnn_aml_core.train's main() writes, so gnn_aml_core.main's
+    # _load_model() (which /admin/reload-model calls) can read it with zero special-casing.
+    calibrated_threshold = float(res["calibrator"](res["report"]["threshold"]))
+    new_metrics = {
+        "val_auc_roc": res["best_val_auc"], "best_epoch": res["best_epoch"], "test_auc_roc": res["report"]["auc_roc"],
+        "test_pr_auc": res["report"]["pr_auc"], "test_precision": res["report"]["precision"],
+        "test_recall": res["report"]["recall"], "test_f1": res["report"]["f1"], "test_fpr": res["report"]["fpr"],
+        "threshold": res["report"]["threshold"], "auc_target": current_ckpt["metrics"].get("auc_target", 0.87),
+        "meets_auc_target": bool(res["report"]["auc_roc"] >= current_ckpt["metrics"].get("auc_target", 0.87)),
+        **{f"calibration_{k}": v for k, v in res["calibration_report"].items()},
+        "retrained_from_feedback": True, "fine_tuned_from_existing_model": True, "n_feedback_examples": len(ids),
+        "finetune_lr": finetune_lr, "finetune_epochs_run": res["epochs_run"],
+    }
+    new_ckpt = {
+        "model_name": current_ckpt["model_name"], "hparams": res["hparams"], "in_dim": current_ckpt["in_dim"],
+        "state_dict": res["state_dict"], "feature_names": current_ckpt["feature_names"],
+        "mean": current_ckpt["mean"], "std": current_ckpt["std"],
+        "threshold": res["report"]["threshold"], "metrics": new_metrics,
+        "calibration": res["calibrator"].to_dict(), "calibrated_threshold": calibrated_threshold,
+    }
+
+    backup_path = out / f"gnn_model.pt.bak-{_time.strftime('%Y%m%d-%H%M%S')}"
+    shutil.copy2(out / "gnn_model.pt", backup_path)
+    torch.save(new_ckpt, out / "gnn_model.pt")
+
+    outcome["decision"] = "promoted"
+    outcome["reason"] = (f"candidate test AUC {candidate_auc:.4f} beat current {current_auc:.4f} "
+                         f"by {candidate_auc - current_auc:.4f}")
+    outcome["backup_path"] = str(backup_path)
+    AUTO_RETRAIN_PROMOTED.inc()
+    log.info("auto-retrain: %s -- promoted, old model backed up to %s", outcome["reason"], backup_path)
+
+    if gnn_api:
+        import json
+        import urllib.error
+        import urllib.request
+
+        req = urllib.request.Request(f"{gnn_api.rstrip('/')}/admin/reload-model", method="POST")
+        if gnn_admin_token:
+            req.add_header("Authorization", f"Bearer {gnn_admin_token}")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                outcome["reload"] = json.loads(resp.read())
+            log.info("auto-retrain: live reload succeeded -- %s", outcome["reload"])
+        except Exception as exc:  # noqa: BLE001 -- the new checkpoint is already safely on disk regardless of
+                                  # whether this network call succeeds; a failure here is never the reason the
+                                  # new model fails to eventually serve, only a delay until the next restart
+            outcome["reload_error"] = f"{exc.__class__.__name__}: {exc}"
+            log.warning("auto-retrain: promoted on disk, but the live reload call failed (%s) -- the new model "
+                       "will be picked up on gnn-detection-api's next restart in the meantime", outcome["reload_error"])
+    else:
+        outcome["reload"] = "skipped (no --gnn-api given) -- new model written to disk, will be picked up on next restart"
+        log.info("auto-retrain: %s", outcome["reload"])
+
+    _append_retrain_history(out, outcome)
+    return outcome
+
+
 def _default_dsn() -> str:
     """The local (host-machine) Postgres connection string, read from this project's own .env file -- the
     same source of truth every other tool here uses (run_local.py, backend/main.py's DATABASE_URL). An earlier
@@ -205,6 +415,36 @@ def main() -> None:
                          "already do for their own metrics")
     ap.add_argument("--metrics-port", type=int, default=9201)
     ap.add_argument("--loop-interval", type=int, default=300, help="seconds between drift checks in --serve-metrics mode")
+    ap.add_argument("--auto-retrain", action="store_true",
+                    default=os.getenv("FEEDBACK_AUTO_RETRAIN", "").strip().lower() in ("1", "true", "yes"),
+                    help="(--serve-metrics only) when the drift trigger fires, automatically retrain AND "
+                         "evaluate the candidate against the current production model -- promoting it only if "
+                         "it measurably wins; see the module docstring's 'Auto-retrain, gated before deploy' "
+                         "section. Off by default (also settable via FEEDBACK_AUTO_RETRAIN=true)")
+    ap.add_argument("--gnn-api", default=os.getenv("GNN_API_URL"),
+                    help="base URL of the running gnn-detection-api, used to call POST /admin/reload-model "
+                         "after a promotion so the new model goes live without a container restart. Omit to "
+                         "promote on disk only (the new model is picked up on that service's next restart)")
+    ap.add_argument("--gnn-admin-token", default=os.getenv("GNN_ADMIN_TOKEN"),
+                    help="sent as 'Authorization: Bearer <token>' on the reload call; must match "
+                         "gnn-detection-api's own GNN_ADMIN_TOKEN if that service has one set")
+    ap.add_argument("--min-improvement", type=float, default=float(os.getenv("FEEDBACK_MIN_IMPROVEMENT", 0.0)),
+                    help="a retrained candidate must beat the current production model's test AUC-ROC by at "
+                         "least this much to be promoted (default 0.0: any real improvement, however small, "
+                         "beats none)")
+    ap.add_argument("--finetune-lr", type=float, default=float(os.getenv("FEEDBACK_FINETUNE_LR", 0.0005)),
+                    help="learning rate for the auto-retrain fine-tune (--auto-retrain warm-starts from the "
+                         "CURRENT production model's own weights rather than training a new model from "
+                         "scratch -- see retrain_and_maybe_promote's docstring). Kept low (default 0.0005, vs. "
+                         "train.py's from-scratch default of 0.005) since this is a short nudge, not a full "
+                         "training run")
+    ap.add_argument("--finetune-epochs", type=int, default=int(os.getenv("FEEDBACK_FINETUNE_EPOCHS", 30)),
+                    help="max epochs for the auto-retrain fine-tune (default 30, vs. train.py's from-scratch "
+                         "default of 150) -- a warm-started model needs far fewer epochs to incorporate new "
+                         "feedback than a model starting from random weights")
+    ap.add_argument("--finetune-patience", type=int, default=int(os.getenv("FEEDBACK_FINETUNE_PATIENCE", 5)),
+                    help="early-stop the fine-tune after this many eval checkpoints (every 5 epochs) without a "
+                         "validation improvement")
     a = ap.parse_args()
 
     def _check_once() -> tuple[bool, dict, list]:
@@ -236,14 +476,28 @@ def main() -> None:
 
     if a.serve_metrics:
         start_http_server(a.metrics_port)
-        log.info("serving metrics on :%d/metrics, checking every %ds (Ctrl+C to stop)", a.metrics_port, a.loop_interval)
+        mode = "auto-retrain ENABLED (gated: promotes only if it beats the current model)" if a.auto_retrain \
+            else "report-only (pass --auto-retrain, or set FEEDBACK_AUTO_RETRAIN=true, to close the loop)"
+        log.info("serving metrics on :%d/metrics, checking every %ds -- %s (Ctrl+C to stop)",
+                 a.metrics_port, a.loop_interval, mode)
         while True:
             try:
-                _check_once()   # loop mode only reports drift status; it never retrains automatically, since an
-                                # unattended, periodically-running process silently retraining the live model
-                                # with no human in the loop is a materially different, bigger decision than
-                                # just reporting a metric -- real retraining stays an explicit, manually-invoked
-                                # action (the non-loop path below), not something this loop does on its own
+                triggered, reasoning, records = _check_once()
+                if triggered and a.auto_retrain:
+                    log.info("auto-retrain: drift trigger met (%s) -- starting an automatic retrain attempt",
+                             reasoning["reason"])
+                    try:
+                        retrain_and_maybe_promote(records, data_dir=a.data, out_dir=a.out,
+                                                  feedback_weight=a.feedback_weight, min_improvement=a.min_improvement,
+                                                  gnn_api=a.gnn_api, gnn_admin_token=a.gnn_admin_token,
+                                                  finetune_lr=a.finetune_lr, finetune_epochs=a.finetune_epochs,
+                                                  finetune_patience=a.finetune_patience)
+                    except Exception as exc:  # noqa: BLE001 -- a failed retrain attempt must never take this
+                                              # long-lived loop down; the current model keeps serving regardless,
+                                              # and the next drift cycle will simply try again
+                        log.error("auto-retrain: attempt failed with an unexpected error (%s) -- current model "
+                                 "stays in production, will retry on the next drift-triggered cycle",
+                                 exc.__class__.__name__)
             except SystemExit:
                 log.warning("a check failed (see above) -- will retry on the next interval rather than exiting, "
                            "since this process is meant to keep running")

@@ -1,0 +1,660 @@
+"""GNN detection API (container: gnn-detection-api).
+
+Endpoints
+  GET  /health            liveness + model status
+  GET  /model/info        training metrics, decision threshold, targets
+  GET  /accounts/sample   a few suspicious / benign account ids to try
+  POST /predict           risk scores for one or more accounts (2-hop subgraph inference)
+  POST /explain           GNNExplainer subgraph + edge importances (input for xai-narrative-api)
+
+Before starting, train a model:
+  python -m aml_synth.graph_generator --out data --to csv
+  python -m gnn_aml_core.train --data data --out models
+
+Startup warm-up (cold-start latency): the first forward pass through a freshly-loaded torch model is much
+slower than every subsequent one -- torch lazily initialises its CPU thread pool and operator dispatch paths,
+and torch_geometric's scatter/gather ops used by k_hop_subgraph pay a similar one-time cost. Measured without a
+fix, that one-time cost landed on whichever real account happened to be scored first after the container
+started, making check_latency_v1.py's per-account "cold" (cache-miss) p95 look far worse than it actually is in
+steady state (the brief's <100ms target is a per-request number, and a request that only loses to a startup
+cost nobody can avoid isn't the same failure as one that's slow on every call). _warm_up_model() below runs a
+few real forward passes (same code path as /predict, via _score()) during startup, before the server accepts
+traffic, so that cost is paid once at deploy time instead of on a user-facing request. It runs before
+_connect_redis(), so it never touches the prediction cache -- see lifespan().
+
+Async audit writes (cold-start latency, part 2): measured on a real run (check_latency_v1.py against a locally
+running stack), the warm-up above fixed the one-time JIT cost but a stratified cold/warm check still showed p95
+latencies for from both the cold AND warm (cache-hit) passes -- a Redis cache hit should never be slow, which
+was the tell. The actual cause: audit() below writes to immudb with verifiedSet(), a cryptographically-verified
+write (real round trip + proof check, unlike Redis's SETEX), called SYNCHRONOUSLY inside /predict for every
+flagged account, before the response returns -- on both the cold and the warm path, since it runs after the
+cache-hit/cache-miss branch has already resolved. A flagged account's response was paying immudb's write
+latency on every single call, cached or not. audit() now only enqueues onto AUDIT_QUEUE; a single background
+worker thread (started in lifespan(), see _start_audit_worker()) does the actual immudb write off the request
+path, so /predict and /explain return as soon as scoring is done, the same as an unflagged account.
+
+Request batching (remaining cold-start cost): after the two fixes above, a real stratified measurement still
+showed ~300ms p95 for accounts with a large k-hop neighbourhood (hub-adjacent accounts) -- genuine compute time
+for a GATv2 forward pass over a few-thousand-node subgraph on CPU, not a bug. _score() was already called under
+a single global lock (S.lock), which means concurrent /predict calls were ALREADY fully serialized -- each one
+independently re-extracting its own k-hop subgraph and running its own forward pass, even when two concurrent
+requests' neighbourhoods overlapped heavily (which is the common case for hub-adjacent accounts: thousands of a
+hub's individual customers share nearly the same 2-hop neighbourhood -- see check_latency_v1.py's
+stratify_by_degree and its docstring for why). _BatchScorer below coalesces /predict calls that land within a
+short window (GNN_BATCH_WINDOW_MS, default 8ms) into ONE combined forward pass over the union of their
+requested indices, then slices the result back out per caller -- same _score(), same accuracy, no approximation,
+just fewer redundant subgraph extractions and forward passes under real concurrent traffic. A request with no
+concurrent sibling pays at most one extra window's wait (a few ms) before being scored alone.
+
+This deliberately does NOT change scores or the flagged decision for any account -- an earlier option (score
+fast at 1 hop, backfill the real score later) was considered and rejected because it would let a flagged
+account's first-touch decision (and the audit record of it) be based on a less-accurate score, in a compliance
+context where that trade-off needs an explicit, informed choice, not a default. Batching has no such cost; it
+also does not improve latency under check_latency_v1.py's default (sequential, one-account-at-a-time)
+measurement -- see its --concurrency flag for a test that actually exercises this path.
+
+Background cache precompute (what's left after the three fixes above): even with warm-up, async audit, and
+batching, a real stratified run still showed a FAIL on "cold" p95 -- 288-515 ms for a never-before-scored
+account, because that cost is genuine GATv2 inference, not a bug the three fixes above could remove. The
+warm-up at startup only ever primes a handful of SYNTHETIC indices (WARMUP_REQUESTS, default 8) to pay torch's
+one-time JIT cost; it was never meant to (and does not) populate the Redis prediction cache for the real
+account population, so every real account's genuine first touch still pays full inference cost once.
+_precompute_worker() below closes that gap directly: a background daemon thread that walks every account this
+model knows about (S.id2idx) and makes sure each one has a live entry in the SAME Redis cache /predict reads
+from (_cache_get/_cache_set) -- using the exact same _score() a live request would use, so a precomputed score
+is byte-for-byte what a live cold call would have produced, never an approximation. It re-walks the account
+list on a loop (GNN_PRECOMPUTE_INTERVAL_S between passes) so entries get refreshed before PRED_CACHE_TTL lapses,
+and on each pass it skips any account that's already cached (a single cheap Redis GET) rather than re-running
+inference on accounts nothing has evicted yet -- so steady-state passes after the first one are fast, and only
+newly-expired or never-yet-seen accounts actually pay for a forward pass. The practical effect: once the first
+full pass completes (logged at startup), a real /predict call for any account in this model's training graph
+hits the warm (cache) path essentially always, and the genuinely-cold path becomes rare rather than the default
+-- it only still happens for an account precompute hasn't reached yet (a brief window right after startup) or
+if Redis itself is down (same as today: _cache_get/_cache_set both degrade to a no-op cache miss, never raise).
+GNN_PRECOMPUTE_INTERVAL_S=0 disables this entirely, reverting to the pre-existing behaviour (every account cold
+until a real caller asks about it) -- worth doing on hardware where continuously scoring the whole account
+population in the background isn't an acceptable CPU cost.
+
+A real run against a 5k-account graph caught a genuine regression in the first version of this: with no pause,
+this thread re-acquires S.lock hundreds/thousands of times back-to-back for as long as the first pass takes,
+and a live cold /predict call (also needing S.lock) ended up queuing behind it more than it would behind other
+live traffic alone -- measured cold p50 went UP after adding precompute, not down, on accounts precompute
+hadn't reached yet. _precompute_pass() now sleeps GNN_PRECOMPUTE_PAUSE_MS (default 25ms) after every account it
+actually scores (never after a cache-hit skip, which takes no lock), opening a real window for a waiting live
+request to win the lock first. This only slows down how long a large, mostly-cold population's first pass
+takes -- a deliberate trade, since that first pass competing unfairly with live traffic was the actual bug.
+
+One measurement consequence worth knowing: once this is running, check_latency_v1.py's "cold" column mostly
+stops measuring a genuine cold path for accounts already in models/graph.pt, because precompute will usually
+have reached them first. That is the intended effect, not a test artifact to chase -- if you need to force a
+real no-cache measurement, set GNN_PRECOMPUTE_INTERVAL_S=0 before starting the service for that run.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import queue
+import threading
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+import torch
+from fastapi import FastAPI, HTTPException, Query
+from prometheus_client import Counter, Gauge, Histogram
+from prometheus_fastapi_instrumentator import Instrumentator, metrics
+from pydantic import BaseModel, Field
+from torch_geometric.utils import k_hop_subgraph
+
+from gnn_aml_core.models import build_model
+from xai_explainer.extractor import extract_explanation
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("gnn_aml_core.api")
+
+MODEL_DIR = Path(os.getenv("MODEL_DIR", "models"))
+LATENCY_TARGET_MS = float(os.getenv("GNN_LATENCY_TARGET_MS", 100))
+AUC_TARGET = float(os.getenv("GNN_AUC_TARGET", 0.87))
+CACHE_TTL = int(os.getenv("PRED_CACHE_TTL", 300))
+REPORTING_THRESHOLD = float(os.getenv("REPORTING_THRESHOLD", 10_000))
+WARMUP_REQUESTS = int(os.getenv("GNN_WARMUP_REQUESTS", 8))   # 0 disables startup warm-up
+BATCH_WINDOW_S = float(os.getenv("GNN_BATCH_WINDOW_MS", 8)) / 1000.0   # 0 disables batching (score alone)
+BATCH_MAX = int(os.getenv("GNN_BATCH_MAX", 64))   # flush early if a batch reaches this many requests
+PRECOMPUTE_INTERVAL_S = float(os.getenv("GNN_PRECOMPUTE_INTERVAL_S", 30))   # 0 disables background precompute
+PRECOMPUTE_PAUSE_S = float(os.getenv("GNN_PRECOMPUTE_PAUSE_MS", 25)) / 1000.0   # pause after each real score;
+                                                                                  # see _precompute_pass's docstring
+MAX_EXPLAIN_EDGES = 8000        # counts both the forward and the reversed copy of every transaction
+MAX_SCORE_EDGES = int(os.getenv("MAX_SCORE_EDGES", 30_000))   # higher budget than explaining: one forward pass
+                                                                # is far cheaper per edge than GNNExplainer's
+                                                                # repeated optimisation passes
+
+# ---- custom Prometheus metrics (scraped by prometheus-metrics -> Grafana) ----
+FLAGGED = Counter("aml_flagged_accounts_total", "Accounts scored above the alert threshold")
+CACHE_HITS = Counter("aml_prediction_cache_hits_total", "Predictions served from Redis")
+INFER_LAT = Histogram("aml_inference_latency_seconds", "End-to-end /predict latency",
+                      buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5))
+AUC_GAUGE = Gauge("aml_model_auc_roc", "Test AUC-ROC of the loaded model")
+AUDIT_DROPPED = Counter("aml_audit_dropped_total",
+                        "Audit records dropped because the background queue was full (immudb unreachable or falling behind)")
+PRECOMPUTE_COVERAGE = Gauge("aml_precompute_cache_coverage", "Fraction of known accounts with a live prediction-cache entry, as of the last background precompute pass")
+PRECOMPUTE_SCORED = Counter("aml_precompute_scored_total", "Accounts the background precompute worker actually ran inference for (cache misses it filled in), cumulative")
+
+# audit() (below) only enqueues here; a background worker thread does the actual immudb write, off the
+# /predict and /explain request path -- see the module docstring's "Async audit writes" section and
+# _start_audit_worker(). Bounded so a slow-or-down immudb degrades into dropped (and counted, and logged)
+# audit records under sustained flagged traffic, rather than unbounded memory growth.
+AUDIT_QUEUE: "queue.Queue[tuple[str, dict]]" = queue.Queue(maxsize=1000)
+
+
+class State:
+    model = None
+    ckpt: dict | None = None
+    g: dict | None = None
+    id2idx: dict[str, int] = {}
+    hops = 2
+    calibrator = None             # set at load time: Calibrator from the checkpoint, or an identity fallback
+    redis = None
+    immu = None
+    warmed_up = False             # set by _warm_up_model(); see /health and the module docstring
+    precompute_passes = 0         # completed full passes of _precompute_worker(); see /health
+    lock = threading.Lock()      # torch modules + GNNExplainer mask hooks are not thread-safe
+
+
+S = State()
+
+
+# ------------------------------------------------------------------ startup
+def _load_model() -> None:
+    mp, gp = MODEL_DIR / "gnn_model.pt", MODEL_DIR / "graph.pt"
+    if not (mp.exists() and gp.exists()):
+        log.warning("no model found in %s -- run gnn_aml_core.train first", MODEL_DIR)
+        return
+    # These files are produced by our own train.py, so full unpickling is acceptable here.
+    ckpt = torch.load(mp, map_location="cpu", weights_only=False)
+    g = torch.load(gp, map_location="cpu", weights_only=False)
+    model = build_model(ckpt["model_name"], ckpt["in_dim"], **ckpt["hparams"])
+    model.load_state_dict(ckpt["state_dict"])
+    model.eval()
+    from gnn_aml_core.calibration import Calibrator
+    # Older checkpoints (trained before calibration was added) have no "calibration" key: fall back to an
+    # identity mapping so loading an old model.pt still works, just without the calibration benefit.
+    S.calibrator = Calibrator.from_dict(ckpt["calibration"]) if "calibration" in ckpt else Calibrator.identity()
+    S.model, S.ckpt, S.g = model, ckpt, g
+    S.id2idx = {a: i for i, a in enumerate(g["account_ids"])}
+    S.hops = int(ckpt["hparams"].get("num_layers", 2))
+    AUC_GAUGE.set(ckpt["metrics"]["test_auc_roc"])
+    log.info("loaded %s: %d nodes, %d edges, threshold %.3f",
+             ckpt["model_name"], len(S.id2idx), g["edge_index"].size(1), ckpt["threshold"])
+
+
+def _warm_up_model() -> None:
+    """Run a few real forward passes through the freshly-loaded model, before the server accepts traffic, so
+    torch/torch_geometric's one-time lazy-init cost (CPU thread pool setup, operator dispatch, scatter/gather
+    kernel paths) lands at deploy time instead of on a user's first /predict call. See the module docstring.
+
+    Calls _score() directly rather than going through predict()'s cache-checking wrapper -- this runs before
+    _connect_redis() in lifespan() below, so S.redis is still None at this point anyway, but calling _score()
+    directly keeps that true by construction rather than by call order, and makes it explicit that warm-up
+    never writes a prediction cache entry for an account nobody actually asked about.
+
+    Never raises: a failed warm-up should degrade to "the first real request pays the cold-start cost", the
+    same as before this existed -- not crash startup over what is purely a latency optimization.
+    """
+    if S.model is None or WARMUP_REQUESTS <= 0:
+        return
+    n = len(S.id2idx)
+    if n == 0:
+        return
+    k = min(WARMUP_REQUESTS, n)
+    t0 = time.perf_counter()
+    try:
+        step = max(n // k, 1)
+        indices = list(range(0, n, step))[:k]
+        # Spread across the node list rather than always the first k, and deliberately include the single
+        # largest-degree node: an all-low-degree warm-up would never exercise _score's MAX_SCORE_EDGES fallback
+        # branch (the one that matters most for a hub-adjacent account on real traffic -- see _score below).
+        degrees = torch.bincount(S.g["edge_index"][0], minlength=n)
+        largest = int(torch.argmax(degrees))
+        if largest not in indices:
+            indices[-1] = largest
+        for idx in indices:
+            _score([idx])
+        S.warmed_up = True
+        log.info("model warm-up: %d forward passes in %.0f ms", len(indices), (time.perf_counter() - t0) * 1000)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("model warm-up failed (%s) -- first real request will pay the cold-start cost instead",
+                    exc.__class__.__name__)
+
+
+def _connect_redis() -> None:
+    url = os.getenv("REDIS_URL")
+    if not url:
+        return
+    try:
+        import redis
+        r = redis.Redis.from_url(url, decode_responses=True, socket_timeout=0.25)
+        r.ping()
+        S.redis = r
+        log.info("redis feature/prediction cache connected")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("redis unavailable (%s) -- continuing without cache", exc.__class__.__name__)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    _load_model()
+    _warm_up_model()   # before _connect_redis(): see _warm_up_model's docstring for why that order matters
+    _connect_redis()
+    _start_audit_worker()   # immudb writes happen here now, off the /predict and /explain request path
+    _start_precompute_worker()   # keeps the prediction cache warm for the whole account population in the background
+    yield
+
+
+app = FastAPI(title="XAI-AMLBench GNN Detection API", version="0.1.0", lifespan=lifespan)
+_inst = Instrumentator()
+_inst.add(metrics.latency(buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10)))
+_inst.add(metrics.requests())
+_inst.instrument(app).expose(app, include_in_schema=False)
+
+
+# ------------------------------------------------------------------ helpers
+def _require_model() -> None:
+    if S.model is None:
+        raise HTTPException(503, "Model not loaded. Run: python -m gnn_aml_core.train")
+
+
+def _idx(account_id: str) -> int:
+    if account_id not in S.id2idx:
+        raise HTTPException(404, f"unknown account_id '{account_id}'")
+    return S.id2idx[account_id]
+
+
+def _cache_get(account_id: str) -> float | None:
+    if S.redis is None:
+        return None
+    try:
+        v = S.redis.get(f"pred:{account_id}")
+        return float(v) if v is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _cache_set(account_id: str, p: float) -> None:
+    if S.redis is None:
+        return
+    try:
+        S.redis.setex(f"pred:{account_id}", CACHE_TTL, f"{p:.6f}")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def audit(kind: str, payload: dict) -> None:
+    """Queue an event for the audit ledger (immudb). Never raises, never blocks: the actual network write
+    happens on a background thread (_audit_worker), not on the calling request. See the module docstring's
+    "Async audit writes" section for why this used to be synchronous and why that was a real latency bug."""
+    if not os.getenv("IMMUDB_HOST"):
+        return
+    try:
+        AUDIT_QUEUE.put_nowait((kind, payload))
+    except queue.Full:
+        AUDIT_DROPPED.inc()
+        log.warning("audit queue full (immudb unreachable or falling behind) -- dropped a %s record", kind)
+
+
+def _audit_write(kind: str, payload: dict) -> None:
+    """The actual immudb write (cryptographically-verified, so genuinely slow compared to Redis) -- only ever
+    called from _audit_worker's background thread, never from a request handler. Never raises."""
+    host = os.getenv("IMMUDB_HOST")
+    if not host:
+        return
+    try:
+        if S.immu is None:
+            from immudb import ImmudbClient
+            client = ImmudbClient(f"{host}:{os.getenv('IMMUDB_PORT', '3322')}")
+            client.login(os.getenv("IMMUDB_USER", "immudb"), os.getenv("IMMUDB_ADMIN_PASSWORD", "immudb"))
+            S.immu = client
+        record = {"kind": kind, "ts": time.time(), **payload}
+        key = f"{kind}:{payload.get('account_id', '-')}:{time.time_ns()}".encode()
+        S.immu.verifiedSet(key, json.dumps(record, sort_keys=True).encode())
+    except Exception as exc:  # noqa: BLE001
+        log.warning("immudb audit failed (%s)", exc.__class__.__name__)
+        S.immu = None
+
+
+def _audit_worker() -> None:
+    """Background thread body: pulls (kind, payload) pairs off AUDIT_QUEUE and writes them one at a time.
+    One worker, not one thread per request, so a slow or down immudb can only ever block this single thread
+    (and build up a bounded queue) -- never a request handler, and never spawn unbounded threads under a burst
+    of flagged accounts."""
+    while True:
+        kind, payload = AUDIT_QUEUE.get()
+        try:
+            _audit_write(kind, payload)
+        finally:
+            AUDIT_QUEUE.task_done()
+
+
+def _start_audit_worker() -> None:
+    t = threading.Thread(target=_audit_worker, name="audit-worker", daemon=True)
+    t.start()
+
+
+def _precompute_pass() -> None:
+    """One full walk over every account this model knows about, filling in any missing/expired Redis
+    prediction-cache entry via the same _score() a live /predict call would use. See the module docstring's
+    "Background cache precompute" section. Cheap on a steady-state pass (most accounts are already cached, so
+    each costs one Redis GET), and only pays real inference cost for accounts that are actually missing.
+
+    Sleeps PRECOMPUTE_PAUSE_S after every account it actually scores (never after a cache hit, which takes no
+    lock and costs nothing to wait for). This matters more than it looks: a first pass over a large, mostly-cold
+    account population means this thread calls _score() -> S.lock back-to-back, hundreds or thousands of times
+    in a row, for as long as that first pass takes. Measured on a 5k-account graph, that made REAL /predict
+    calls for not-yet-cached accounts slower than before this feature existed (a live cold call's own p50 went
+    UP, not down) -- the live request was simply more likely to arrive while this thread already held or was
+    about to immediately re-acquire S.lock, so it queued behind precompute far more than it would queue behind
+    other live traffic alone. The pause opens a real window after every release for a waiting live request to
+    win the lock first; it has no effect on steady-state passes (almost everything is a fast cache-hit skip, no
+    lock involved) and only slows down how quickly a large COLD population gets its first full pass -- a
+    deliberate trade since that first pass competing with live traffic was the actual bug, not the time it
+    takes to complete."""
+    ids = S.g["account_ids"]
+    n = len(ids)
+    if n == 0:
+        return
+    t0 = time.perf_counter()
+    scored = cached_already = 0
+    for i, account_id in enumerate(ids):
+        if _cache_get(account_id) is not None:
+            cached_already += 1
+            continue
+        try:
+            p = _score([i])[0]
+        except Exception as exc:  # noqa: BLE001
+            log.warning("precompute: scoring %s failed (%s) -- will retry next pass",
+                        account_id, exc.__class__.__name__)
+            continue
+        _cache_set(account_id, p)
+        scored += 1
+        if PRECOMPUTE_PAUSE_S > 0:
+            time.sleep(PRECOMPUTE_PAUSE_S)
+    PRECOMPUTE_SCORED.inc(scored)
+    PRECOMPUTE_COVERAGE.set((cached_already + scored) / n if n else 0.0)
+    S.precompute_passes += 1
+    log.info("precompute: pass %d -- %d/%d accounts already warm, %d newly scored, %.0f ms total",
+             S.precompute_passes, cached_already, n, scored, (time.perf_counter() - t0) * 1000)
+
+
+def _precompute_worker() -> None:
+    """Background thread body: repeatedly calls _precompute_pass(), waiting GNN_PRECOMPUTE_INTERVAL_S between
+    passes so entries get refreshed well before PRED_CACHE_TTL lapses. Never exits on an error from one pass --
+    a bad pass just means this cycle's accounts stay however they were (cached from before, or still cold) and
+    the next pass tries again."""
+    while True:
+        try:
+            _precompute_pass()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("precompute pass crashed (%s) -- will retry next cycle", exc.__class__.__name__)
+        time.sleep(max(PRECOMPUTE_INTERVAL_S, 1.0))
+
+
+def _start_precompute_worker() -> None:
+    if S.model is None or S.redis is None or PRECOMPUTE_INTERVAL_S <= 0:
+        return
+    t = threading.Thread(target=_precompute_worker, name="precompute-worker", daemon=True)
+    t.start()
+
+
+def _extract(indices: list[int]):
+    """The k-hop subgraph extraction half of scoring, split out from _score() so _BatchScorer can run it
+    once for a WHOLE batch's union of indices to measure how big that union actually is, before committing to
+    (or rejecting) a single merged forward pass over it -- see _BatchScorer._flush(). Pure graph traversal on
+    S.g's static tensors (no model call, no mutation), so unlike _score() this does not need S.lock: concurrent
+    callers each reading the same immutable graph is safe.
+
+    Falls back to fewer hops if the subgraph would be unreasonably large: without this, a single /predict
+    request for an account near a high-degree hub (e.g. a smurfing collection account with thousands of
+    transactions) pulls in the hub's entire neighbourhood and can turn one request that should take
+    milliseconds into one that takes seconds. Mirrors the same protection /explain already has (MAX_EXPLAIN_EDGES),
+    just with a higher budget, since a single forward pass is far cheaper per edge than GNNExplainer's repeated
+    optimisation passes. Reducing hops does reduce the model's receptive field for that call -- a deliberate,
+    rare trade-off for the handful of very large hub accounts, not something that affects ordinary accounts.
+
+    Returns (subset, edge_index, mapping, edge_mask)."""
+    g = S.g
+    idx_t = torch.tensor(indices)
+    hops = S.hops
+    subset, ei, mapping, emask = k_hop_subgraph(idx_t, hops, g["edge_index"], relabel_nodes=True, num_nodes=g["x"].size(0))
+    while ei.size(1) > MAX_SCORE_EDGES and hops > 1:
+        hops -= 1
+        subset, ei, mapping, emask = k_hop_subgraph(idx_t, hops, g["edge_index"], relabel_nodes=True, num_nodes=g["x"].size(0))
+    return subset, ei, mapping, emask
+
+
+def _score(indices: list[int]) -> list[float]:
+    """Run the model on the union of the k-hop in-neighbourhoods of the requested nodes. See _extract() for
+    the subgraph-extraction logic and the hop-reduction fallback; this just runs the model over it under
+    S.lock (the model itself, unlike _extract()'s static graph reads, is not thread-safe -- see State.lock)."""
+    g = S.g
+    with S.lock, torch.no_grad():
+        subset, ei, mapping, emask = _extract(indices)
+        out = S.model(g["x"][subset], ei, g["edge_attr"][emask], g["edge_type"][emask])
+        return torch.sigmoid(out[mapping]).tolist()
+
+
+class _BatchScorer:
+    """Coalesces _score() calls that land within a short window, AND whose combined subgraph stays within
+    MAX_SCORE_EDGES, into one forward pass over the union of everyone's requested indices -- then slices the
+    combined result back out per caller. See the module docstring's "Request batching" section for why, and
+    why this is accuracy-preserving (it calls the exact same model forward pass with the exact same semantics
+    as scoring each individually -- it just may call it once for several concurrent callers instead of once
+    each, when that's cheap).
+
+    The size check in _flush() is load-bearing, not an optimization: a first version of this merged everyone
+    unconditionally, on the assumption that concurrent requests for large-neighbourhood accounts would mostly
+    share the same hub (so their union wouldn't be much bigger than any one of them). Measured against a real
+    running stack, that assumption was WRONG -- 10 concurrent hub-adjacent accounts near DIFFERENT hubs produced
+    a union roughly the sum of all 10 neighbourhoods, and one forward pass over that was 3-10x SLOWER than
+    scoring each of the 10 separately (see check_latency_v1.py's --concurrency flag, which is what caught this).
+    _flush() now extracts the union's subgraph first (cheap: pure traversal, no model call -- see _extract())
+    and only commits to ONE merged forward pass if that union is no bigger than MAX_SCORE_EDGES, the same
+    budget a single large unbatched request already has to respect. If the union is bigger than that, batching
+    falls back to scoring each caller's own request independently, exactly as if there were no batching for
+    that group. This makes batching provably unable to be slower than having no batching at all: the worst
+    case is the same per-request cost as before this feature existed, plus one wasted (cheap) union-extraction.
+
+    _score() was already serialized by S.lock, so none of this introduces new interleaving of model state. A
+    caller with no concurrent sibling pays at most one window's wait (BATCH_WINDOW_S) before being scored alone
+    -- see score() below.
+    """
+
+    def __init__(self, window_s: float, max_batch: int):
+        self.window_s = window_s
+        self.max_batch = max_batch
+        self._lock = threading.Lock()
+        self._pending: list[dict] = []
+        self._timer: threading.Timer | None = None
+
+    def score(self, indices: list[int]) -> list[float]:
+        if self.window_s <= 0:
+            return _score(indices)   # batching disabled (GNN_BATCH_WINDOW_MS=0): score alone, as before
+        entry = {"indices": indices, "event": threading.Event(), "result": None, "error": None}
+        flush_now = False
+        with self._lock:
+            self._pending.append(entry)
+            if len(self._pending) == 1:
+                self._timer = threading.Timer(self.window_s, self._flush)
+                self._timer.daemon = True
+                self._timer.start()
+            elif len(self._pending) >= self.max_batch:
+                flush_now = True
+        if flush_now:
+            self._flush()
+        entry["event"].wait()
+        if entry["error"] is not None:
+            raise entry["error"]
+        return entry["result"]
+
+    def _flush(self) -> None:
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            batch, self._pending = self._pending, []
+        if not batch:
+            return
+        if len(batch) == 1:
+            self._score_alone(batch[0])
+            return
+
+        all_indices: list[int] = []
+        spans: list[tuple[int, int]] = []
+        for entry in batch:
+            spans.append((len(all_indices), len(entry["indices"])))
+            all_indices.extend(entry["indices"])
+
+        try:
+            subset, ei, mapping, emask = _extract(all_indices)
+        except Exception as exc:  # noqa: BLE001
+            for entry in batch:
+                entry["error"] = exc
+                entry["event"].set()
+            return
+
+        if ei.size(1) > MAX_SCORE_EDGES:
+            # The union is too big to merge cheaply (see the class docstring) -- fall back to scoring each
+            # caller's own request independently, same cost as if there were no batching for this group.
+            for entry in batch:
+                self._score_alone(entry)
+            return
+
+        try:
+            with S.lock, torch.no_grad():
+                g = S.g
+                out = S.model(g["x"][subset], ei, g["edge_attr"][emask], g["edge_type"][emask])
+                scores = torch.sigmoid(out[mapping]).tolist()
+            for entry, (start, n) in zip(batch, spans):
+                entry["result"] = scores[start:start + n]
+        except Exception as exc:  # noqa: BLE001
+            for entry in batch:
+                entry["error"] = exc
+        finally:
+            for entry in batch:
+                entry["event"].set()
+
+    @staticmethod
+    def _score_alone(entry: dict) -> None:
+        try:
+            entry["result"] = _score(entry["indices"])
+        except Exception as exc:  # noqa: BLE001
+            entry["error"] = exc
+        finally:
+            entry["event"].set()
+
+
+BATCHER = _BatchScorer(BATCH_WINDOW_S, BATCH_MAX)
+
+
+# ------------------------------------------------------------------ schemas
+class PredictRequest(BaseModel):
+    account_ids: list[str] = Field(min_length=1, max_length=200)
+
+
+class ExplainRequest(BaseModel):
+    account_id: str
+    top_k: int = Field(40, ge=5, le=200)
+    epochs: int = Field(100, ge=20, le=300)
+
+
+# ------------------------------------------------------------------ routes
+@app.get("/health")
+def health():
+    return {"status": "ok", "model_loaded": S.model is not None, "redis": S.redis is not None,
+            "model": S.ckpt["model_name"] if S.ckpt else None, "warmed_up": S.warmed_up,
+            "precompute_passes": S.precompute_passes}
+
+
+@app.get("/model/info")
+def model_info():
+    _require_model()
+    return {"model": S.ckpt["model_name"], "hparams": S.ckpt["hparams"], "threshold": S.ckpt["threshold"],
+            "metrics": S.ckpt["metrics"], "targets": {"auc_roc": AUC_TARGET, "latency_ms": LATENCY_TARGET_MS},
+            "n_nodes": len(S.id2idx), "n_features": len(S.ckpt["feature_names"])}
+
+
+@app.get("/accounts/sample")
+def sample(n: int = Query(5, ge=1, le=50)):
+    _require_model()
+    y = S.g["y"]
+    sus = (y == 1).nonzero().view(-1)[:n].tolist()
+    ben = (y == 0).nonzero().view(-1)[:n].tolist()
+    ids = S.g["account_ids"]
+    return {"suspicious": [ids[i] for i in sus], "benign": [ids[i] for i in ben]}
+
+
+@app.post("/predict")
+def predict(req: PredictRequest):
+    _require_model()
+    t0 = time.perf_counter()
+    scores: dict[str, tuple[float, bool]] = {}
+    todo: list[str] = []
+    for a in dict.fromkeys(req.account_ids):
+        _idx(a)  # 404 if unknown
+        cached = _cache_get(a)
+        if cached is not None:
+            scores[a] = (cached, True)
+            CACHE_HITS.inc()
+        else:
+            todo.append(a)
+    if todo:
+        # BATCHER.score (not _score directly): lets this request's uncached accounts share one forward pass
+        # with any OTHER /predict call landing within the same short window -- see _BatchScorer's docstring.
+        for a, p in zip(todo, BATCHER.score([S.id2idx[a] for a in todo])):
+            scores[a] = (p, False)
+            _cache_set(a, p)
+
+    thr = S.ckpt["threshold"]
+    results = []
+    for a, (p, cached) in scores.items():
+        flagged = p >= thr
+        # "score" (raw) drives the flagged decision and stays backward-compatible; "calibrated_score" is the
+        # same account mapped through isotonic calibration -- meaningful as a probability, meant for display
+        # (a risk gauge, a narrative's "risk score: X%"), and never used for the flagged decision itself, so
+        # existing behaviour and caching (keyed on the raw score) are unaffected.
+        results.append({"account_id": a, "score": round(p, 5), "calibrated_score": round(S.calibrator(p), 5),
+                        "flagged": flagged, "cached": cached})
+        if flagged:
+            FLAGGED.inc()
+            audit("inference_flagged", {"account_id": a, "score": round(p, 5),
+                                        "model": S.ckpt["model_name"], "threshold": thr})
+    dt = time.perf_counter() - t0
+    INFER_LAT.observe(dt)
+    return {"results": results, "threshold": thr, "calibrated_threshold": S.ckpt.get("calibrated_threshold", thr),
+            "latency_ms": round(dt * 1000, 2), "meets_latency_target": dt * 1000 <= LATENCY_TARGET_MS}
+
+
+@app.post("/explain")
+def explain(req: ExplainRequest):
+    _require_model()
+    if S.ckpt["model_name"] != "gatv2":
+        raise HTTPException(501, "GNNExplainer is wired for the GATv2 model. Train with --model gatv2.")
+    _idx(req.account_id)  # 404 if unknown, before we take the lock
+
+    with S.lock:
+        try:
+            result = extract_explanation(
+                S.model, S.g, S.ckpt["feature_names"], req.account_id,
+                hops=S.hops, reporting_threshold=REPORTING_THRESHOLD,
+                top_k=req.top_k, epochs=req.epochs, max_explain_edges=MAX_EXPLAIN_EDGES,
+            )
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    audit("explanation_generated", {"account_id": req.account_id, "score": result["risk_score"],
+                                    "n_edges": len(result["edges"]), "method": "GNNExplainer"})
+    # Replace the raw risk_score with its calibrated value for display (a risk gauge showing "99.9%" for
+    # every flagged account is not informative); the paired threshold is calibrated the same way, so anything
+    # comparing risk_score against threshold stays on a consistent scale. The raw value stays available as
+    # raw_risk_score for anyone who needs the model's unmodified output (e.g. audit records already logged it).
+    return {**result, "risk_score": round(S.calibrator(result["risk_score"]), 5), "raw_risk_score": result["risk_score"],
+            "threshold": S.ckpt.get("calibrated_threshold", S.ckpt["threshold"]), "model": S.ckpt["model_name"], "method": "GNNExplainer"}

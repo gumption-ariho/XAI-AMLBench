@@ -1,0 +1,23 @@
+"use client";
+
+import { useEffect, useRef } from "react";
+
+/** Was an animated count-up sweep; now just returns `target` directly. Kept as a hook (rather than deleting
+ * every call site) so RiskGauge and the overview stats keep calling it unchanged -- it's simply a no-op pass
+ * through now, per the "reduce animation completely" direction. */
+export function useCountUp(target: number, _duration = 900): number {
+  return target;
+}
+
+/** Was a character-by-character typing reveal; now just returns `text` immediately and fires `onDone` once,
+ * same call signature so Narrative's existing animate/onDone usage keeps working unchanged. */
+export function useTypewriter(text: string, enabled: boolean, onDone?: () => void): string {
+  const firedFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (enabled && firedFor.current !== text) {
+      firedFor.current = text;
+      onDone?.();
+    }
+  }, [text, enabled, onDone]);
+  return text;
+}

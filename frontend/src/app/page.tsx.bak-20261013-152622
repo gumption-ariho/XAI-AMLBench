@@ -1,0 +1,1140 @@
+"use client";
+
+import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
+import type { ReactElement } from "react";
+import Background from "@/components/Background";
+import FloatingDock from "@/components/FloatingDock";
+import type { DockTab } from "@/components/FloatingDock";
+import Glass from "@/components/Glass";
+import {
+  IconBell, IconFlow, IconGraph, IconHome, IconList, IconPlug, IconRadar, IconSearch, IconShield, IconUpload,
+} from "@/components/Icons";
+import LoginScreen from "@/components/LoginScreen";
+import NetworkGraph from "@/components/NetworkGraph";
+import RiskGauge from "@/components/RiskGauge";
+import { useCountUp, useTypewriter } from "@/components/hooks";
+import { api, clearApiKey, errorMessage, hasStoredApiKey, pct, sleep } from "@/lib/api";
+import { isDemo } from "@/lib/demo";
+import type {
+  ActivityEntry,
+  Alert,
+  AlertStatus,
+  AnomalyAlert,
+  AnomalyStatus,
+  Explanation,
+  ModelInfo,
+  SampleAccounts,
+  ScanResponse,
+  ScanResult,
+  SystemStatus,
+  TabId,
+  Toast,
+  ToastKind,
+  WhoamiResponse,
+} from "@/types";
+
+const niceType = (t: string | null): string => (t ? t.replaceAll("_", " ") : "");
+
+type Tone = "blue" | "amber" | "red" | "cyan";
+type Filter = "all" | AlertStatus;
+const FILTERS: Filter[] = ["all", "open", "confirmed", "dismissed"];
+
+/* ----------------------------------------------------------------- small pieces */
+interface StatProps {
+  label: string;
+  value: number;
+  tone: Tone;
+  hint: string;
+  suffix?: string;
+}
+
+function Stat({ label, value, tone, hint, suffix = "" }: StatProps) {
+  const v = useCountUp(value);
+  return (
+    <Glass as="div" className={`stat tone-${tone}`}>
+      <div className="stat-label">{label}</div>
+      <div className="stat-value">
+        {v.toFixed(0)}
+        {suffix}
+      </div>
+      <div className="stat-hint">{hint}</div>
+      <span className="stat-spark" />
+    </Glass>
+  );
+}
+
+const PIPE: string[] = ["Transactions", "Kafka stream", "GNN detection", "Explainability", "SAR narrative", "immudb ledger"];
+
+function Pipeline() {
+  return (
+    <div className="pipe">
+      {PIPE.map((s, i) => (
+        <Fragment key={s}>
+          <div className="pipe-item">
+            <div className="pipe-node" style={{ animationDelay: `${i * 0.4}s` }}>
+              <b>{i + 1}</b>
+            </div>
+            <span>{s}</span>
+          </div>
+          {i < PIPE.length - 1 && <i className="pipe-link" style={{ animationDelay: `${i * 0.25}s` }} />}
+        </Fragment>
+      ))}
+    </div>
+  );
+}
+
+interface NarrativeProps {
+  text: string;
+  source: string | null;
+  sha256: string | null;
+  animate: boolean;
+  onDone: () => void;
+}
+
+function Narrative({ text, source, sha256, animate, onDone }: NarrativeProps) {
+  const shown = useTypewriter(text, animate, onDone);
+  return (
+    <div className="narr">
+      <span>{shown}</span>
+      {animate && shown.length < text.length && <i className="caret" />}
+      <div className="narr-meta">
+        source: {source ?? "n/a"} · sha256 {sha256 ? `${sha256.slice(0, 12)}…` : "n/a"}
+      </div>
+    </div>
+  );
+}
+
+function ModelCard({ info }: { info: ModelInfo | null }) {
+  const auc = info?.metrics.test_auc_roc ?? 0;
+  const target = info?.targets.auc_roc ?? 0.87;
+  const aucAnim = useCountUp(auc * 100, 1100);
+  return (
+    <Glass className="model-card">
+      <h3>Detection model</h3>
+      {info === null && <p className="muted">Model not loaded yet. Train one (see README), then refresh.</p>}
+      {info !== null && (
+        <>
+          <div className="auc-row">
+            <span>AUC-ROC</span>
+            <b>{(aucAnim / 100).toFixed(3)}</b>
+            <span className={`pill ${info.metrics.meets_auc_target ? "ok" : "warn"}`}>
+              {info.metrics.meets_auc_target ? `meets ≥ ${target}` : `below ${target}`}
+            </span>
+          </div>
+          <div className="auc-bar">
+            <div className="auc-fill" style={{ width: `${Math.min(100, auc * 100)}%` }} />
+            <i className="auc-target" style={{ left: `${target * 100}%` }} />
+          </div>
+          <div className="mini-grid">
+            <div><span>Model</span><b>{info.model.toUpperCase()}</b></div>
+            <div><span>Precision</span><b>{pct(info.metrics.test_precision, 0)}</b></div>
+            <div><span>Recall</span><b>{pct(info.metrics.test_recall, 0)}</b></div>
+            <div><span>Threshold</span><b>{pct(info.threshold, 0)}</b></div>
+          </div>
+        </>
+      )}
+    </Glass>
+  );
+}
+
+/* ----------------------------------------------------------------------- page */
+export default function Home(): ReactElement {
+  const demoMode = isDemo();
+  // In demo mode we must install the mock backend BEFORE the first request, so wait for it.
+  const [ready, setReady] = useState<boolean>(!demoMode);
+  const [tab, setTab] = useState<TabId>("overview");
+  const [alerts, setAlerts] = useState<Alert[]>([]);
+  const [online, setOnline] = useState<boolean | null>(null);
+  const [samples, setSamples] = useState<SampleAccounts | null>(null);
+  const [modelInfo, setModelInfo] = useState<ModelInfo | null>(null);
+  const [accountId, setAccountId] = useState<string>("");
+  const [scan, setScan] = useState<ScanResult | null>(null);
+  const [authedOfficer, setAuthedOfficer] = useState<string | null>(null);
+  const [authChecked, setAuthChecked] = useState<boolean>(demoMode);   // demo mode skips auth entirely
+  const [filter, setFilter] = useState<Filter>("all");
+  const [busy, setBusy] = useState<string>("");
+  const [fresh, setFresh] = useState<Set<number>>(() => new Set<number>());
+  const [netId, setNetId] = useState<string>("");
+  const [graph, setGraph] = useState<Explanation | null>(null);
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const [anomalies, setAnomalies] = useState<AnomalyAlert[]>([]);
+  const [anomalyFilter, setAnomalyFilter] = useState<AnomalyStatus | "all">("all");
+  const [noteDraft, setNoteDraft] = useState<Record<number, string>>({});
+  const [crossCheck, setCrossCheck] = useState<Record<number, ScanResult | "pending" | "error">>({});
+  const [activity, setActivity] = useState<ActivityEntry[]>([]);
+  const [sysStatus, setSysStatus] = useState<SystemStatus | null>(null);
+  const [intakeText, setIntakeText] = useState<string>("");
+  const [intakeResults, setIntakeResults] = useState<ScanResult[]>([]);
+  const [intakeRunning, setIntakeRunning] = useState<boolean>(false);
+  const [intakeProgress, setIntakeProgress] = useState<{ done: number; total: number }>({ done: 0, total: 0 });
+
+  const notify = useCallback((kind: ToastKind, msg: string): void => {
+    const id = Date.now() + Math.random();
+    setToasts((t) => [...t, { id, kind, msg }]);
+    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 5200);
+  }, []);
+
+  const load = useCallback(async (): Promise<void> => {
+    try {
+      setAlerts(await api<Alert[]>("/alerts"));
+      setOnline(true);
+    } catch {
+      setOnline(false);
+    }
+  }, []);
+
+  const loadAnomalies = useCallback(async (): Promise<void> => {
+    try {
+      setAnomalies(await api<AnomalyAlert[]>("/anomalies"));
+    } catch {
+      // the overview badge/stat just won't update this round; the Investigate tab's own refresh button covers it
+    }
+  }, []);
+
+  const loadActivity = useCallback(async (): Promise<void> => {
+    try {
+      setActivity(await api<ActivityEntry[]>("/activity?limit=80"));
+    } catch {
+      // Activity tab shows its own "couldn't load" state; nothing else depends on this succeeding
+    }
+  }, []);
+
+  const loadStatus = useCallback(async (): Promise<void> => {
+    try {
+      setSysStatus(await api<SystemStatus>("/system/status"));
+    } catch {
+      setSysStatus(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!demoMode) return;
+    void import("../../demo/mockApi").then((m) => {
+      m.installMockApi();
+      setReady(true);
+    });
+  }, [demoMode]);
+
+  useEffect(() => {
+    if (demoMode) return;   // demo mode (sample-data mode) has no real backend to authenticate against at all
+    // Always attempt /whoami, even with no key stored at all: if the backend's own DEMO_LOGIN_BYPASS is on
+    // (a reviewer-demo convenience, off by default -- see backend/main.py), an unauthenticated call to this
+    // same endpoint succeeds and returns "Reviewer (DEMO MODE)", letting this skip the login screen
+    // automatically with no frontend-side flag needed at all. With bypass off (the normal case), an
+    // unauthenticated call here correctly fails with 401 and the login screen still shows, same as before --
+    // this only ever makes login EASIER when the backend explicitly allows it, never less secure on its own.
+    if (!hasStoredApiKey()) {
+      api<WhoamiResponse>("/whoami")
+        .then((who) => setAuthedOfficer(who.officer))
+        .catch(() => {})   // no stored key and bypass is off: expected, fall through to the login screen
+        .finally(() => setAuthChecked(true));
+      return;
+    }
+    // a key is already stored (e.g. this tab's sessionStorage survived a reload) -- verify it still works
+    // rather than trusting it blindly, since it may have been revoked since the last page load
+    api<WhoamiResponse>("/whoami")
+      .then((who) => setAuthedOfficer(who.officer))
+      .catch(() => clearApiKey())
+      .finally(() => setAuthChecked(true));
+  }, [demoMode]);
+
+  const handleLoginSuccess = useCallback((officerName: string): void => {
+    setAuthedOfficer(officerName);
+  }, []);
+
+  const handleLogout = useCallback((): void => {
+    clearApiKey();
+    setAuthedOfficer(null);
+  }, []);
+
+  useEffect(() => {
+    if (!ready) return undefined;
+    void load();
+    void loadAnomalies();
+    void loadActivity();
+    void loadStatus();
+    api<SampleAccounts>("/accounts/sample").then(setSamples).catch(() => undefined);
+    api<ModelInfo>("/model/info").then(setModelInfo).catch(() => undefined);
+    const id = setInterval(() => {
+      void load();
+      void loadAnomalies();
+      void loadActivity();
+      void loadStatus();
+    }, 15000);
+    return () => clearInterval(id);
+  }, [load, loadAnomalies, loadActivity, loadStatus, ready]);
+
+  const stats = useMemo(() => {
+    const open = alerts.filter((a) => a.status === "open").length;
+    const confirmed = alerts.filter((a) => a.status === "confirmed").length;
+    const avg = alerts.length ? alerts.reduce((s, a) => s + a.risk_score, 0) / alerts.length : 0;
+    return { total: alerts.length, open, confirmed, avg };
+  }, [alerts]);
+
+  /* ---- actions ---- */
+  const doScan = async (): Promise<void> => {
+    const id = accountId.trim();
+    if (!id) return;
+    setBusy("scan");
+    setScan(null);
+    try {
+      const [res] = await Promise.all([
+        api<ScanResponse>("/alerts/scan", { method: "POST", body: JSON.stringify({ account_id: id }) }),
+        sleep(900),
+      ]);
+      setScan({ ...res, account_id: id });
+      if (res.alert) {
+        notify("warn", `Alert #${res.alert.id} created for ${id}`);
+        void load();
+      }
+    } catch (e) {
+      notify("err", errorMessage(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  /** Parses whatever was pasted or uploaded into a flat list of account IDs. Accepts one ID per line, a
+   * comma/whitespace-separated list, or a CSV with an "account_id" (or first) column -- this is the "paste a
+   * document of accounts through the frontend" intake path. It does NOT ingest raw transaction ledgers into
+   * the graph itself (that would mean rebuilding the account graph gnn_aml_core.main was trained against --
+   * a separate, much bigger pipeline than this console can trigger); what it does do is run every account ID
+   * found through the real, already-trained Model 1 scan (the same /alerts/scan this page's Scan tab uses),
+   * in bulk, so a whole list from a bank extract can be screened in one sitting instead of one at a time. */
+  const parseIntakeIds = (raw: string): string[] => {
+    const lines = raw.split(/\r?\n/);
+    const ids: string[] = [];
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const cells = trimmed.split(/[,\t]/).map((c) => c.trim()).filter(Boolean);
+      for (const cell of cells) {
+        if (/^account[_ ]?id$/i.test(cell)) continue;   // skip an obvious CSV header cell
+        if (/^[A-Za-z0-9_-]{3,40}$/.test(cell)) ids.push(cell);
+      }
+    }
+    return Array.from(new Set(ids));   // de-duplicate -- a pasted extract often repeats an account over many rows
+  };
+
+  const doBatchScan = async (): Promise<void> => {
+    const ids = parseIntakeIds(intakeText);
+    if (ids.length === 0) {
+      notify("warn", "No account IDs found in that text (expected one per line, or a CSV column).");
+      return;
+    }
+    setIntakeRunning(true);
+    setIntakeResults([]);
+    setIntakeProgress({ done: 0, total: ids.length });
+    let created = 0;
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i];
+      try {
+        const res = await api<ScanResponse>("/alerts/scan", { method: "POST", body: JSON.stringify({ account_id: id }) });
+        setIntakeResults((r) => [...r, { ...res, account_id: id }]);
+        if (res.alert) created++;
+      } catch (e) {
+        setIntakeResults((r) => [...r, {
+          account_id: id, score: 0, flagged: false, threshold: 0, latency_ms: 0, alert: null,
+        }]);
+        notify("err", `${id}: ${errorMessage(e)}`);
+      }
+      setIntakeProgress({ done: i + 1, total: ids.length });
+    }
+    setIntakeRunning(false);
+    void load();
+    notify(created > 0 ? "warn" : "ok", `Scanned ${ids.length} account${ids.length === 1 ? "" : "s"} -- ${created} new alert${created === 1 ? "" : "s"}`);
+  };
+
+  const onIntakeFile = (file: File): void => {
+    const reader = new FileReader();
+    reader.onload = () => setIntakeText(String(reader.result ?? ""));
+    reader.readAsText(file);
+  };
+
+  const doNarrative = async (id: number): Promise<void> => {
+    setBusy(`n${id}`);
+    try {
+      const updated = await api<Alert>(`/alerts/${id}/narrative`, { method: "POST" });
+      setFresh((s) => new Set(s).add(id));
+      setAlerts((list) => list.map((x) => (x.id === id ? updated : x)));
+      notify("ok", `SAR narrative ready (${updated.narrative_source ?? "unknown"})`);
+    } catch (e) {
+      notify("err", errorMessage(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const doDecision = async (id: number, decision: "confirmed" | "dismissed"): Promise<void> => {
+    setBusy(`d${id}`);
+    try {
+      const updated = await api<Alert>(`/alerts/${id}/decision`, {
+        method: "POST",
+        body: JSON.stringify({ decision, note: "" }),
+      });
+      setAlerts((list) => list.map((x) => (x.id === id ? updated : x)));
+      notify("ok", `Alert #${id} ${decision} and written to the audit ledger`);
+    } catch (e) {
+      notify("err", errorMessage(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const doClaim = async (id: number): Promise<void> => {
+    setBusy(`claim${id}`);
+    try {
+      const updated = await api<AnomalyAlert>(`/anomalies/${id}/claim`, { method: "POST" });
+      setAnomalies((list) => list.map((x) => (x.id === id ? updated : x)));
+      notify("ok", `Claimed anomaly #${id} for investigation`);
+    } catch (e) {
+      notify("err", errorMessage(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const doAddNote = async (id: number): Promise<void> => {
+    const note = (noteDraft[id] ?? "").trim();
+    if (!note) return;
+    setBusy(`note${id}`);
+    try {
+      const updated = await api<AnomalyAlert>(`/anomalies/${id}/notes`, {
+        method: "POST",
+        body: JSON.stringify({ note }),
+      });
+      setAnomalies((list) => list.map((x) => (x.id === id ? updated : x)));
+      setNoteDraft((d) => ({ ...d, [id]: "" }));
+    } catch (e) {
+      notify("err", errorMessage(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const doResolveAnomaly = async (id: number, outcome: "confirmed_mule" | "cleared"): Promise<void> => {
+    setBusy(`resolve${id}`);
+    try {
+      const updated = await api<AnomalyAlert>(`/anomalies/${id}/resolve`, {
+        method: "POST",
+        body: JSON.stringify({ outcome, note: noteDraft[id] ?? "" }),
+      });
+      setAnomalies((list) => list.map((x) => (x.id === id ? updated : x)));
+      setNoteDraft((d) => ({ ...d, [id]: "" }));
+      notify(outcome === "confirmed_mule" ? "warn" : "ok",
+        outcome === "confirmed_mule"
+          ? `#${id} confirmed as a mule account -- this pattern will be taught to the detection model`
+          : `#${id} cleared -- logged, not used for training`);
+    } catch (e) {
+      notify("err", errorMessage(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  /** Runs the account through Model 1's own scan (the same endpoint the Scan tab uses) so an analyst
+   * investigating a Model-2-only anomaly can see, inline, whether the baseline classifier agrees there's
+   * anything unusual here at all -- a real cross-check against a second, independent signal, not a second
+   * opinion from the same model. */
+  const doCrossCheck = async (anomalyId: number, accountId: string): Promise<void> => {
+    setCrossCheck((c) => ({ ...c, [anomalyId]: "pending" }));
+    try {
+      const res = await api<ScanResponse>("/alerts/scan", { method: "POST", body: JSON.stringify({ account_id: accountId }) });
+      setCrossCheck((c) => ({ ...c, [anomalyId]: { ...res, account_id: accountId } }));
+    } catch {
+      setCrossCheck((c) => ({ ...c, [anomalyId]: "error" }));
+    }
+  };
+
+  const NOTE_TEMPLATES: string[] = [
+    "Called the account holder -- no answer, left message",
+    "Reached the account holder -- explanation given, verifying",
+    "Cross-checked related/linked accounts -- see network view",
+    "Verified KYC documents on file -- no discrepancy found",
+    "Verified KYC documents on file -- discrepancy found",
+    "Escalated to compliance / law enforcement",
+  ];
+
+  /** Not a resolution -- the actual calling-the-owner-in / involving-investigators-or-police step happens
+   * outside this system, as the Model 2 docstring and this tab's own banner both already say. This just logs
+   * that it happened, distinctly tagged, so it shows up in the case file and the Activity feed without
+   * forcing a premature confirmed/cleared verdict before that outside step is done. */
+  const doEscalate = async (id: number): Promise<void> => {
+    const extra = (noteDraft[id] ?? "").trim();
+    const note = `[ESCALATED] ${extra || "Escalated to compliance / law enforcement for further action."}`;
+    setBusy(`escalate${id}`);
+    try {
+      const updated = await api<AnomalyAlert>(`/anomalies/${id}/notes`, { method: "POST", body: JSON.stringify({ note }) });
+      setAnomalies((list) => list.map((x) => (x.id === id ? updated : x)));
+      setNoteDraft((d) => ({ ...d, [id]: "" }));
+      notify("warn", `#${id} marked escalated`);
+    } catch (e) {
+      notify("err", errorMessage(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const copyAccountId = (accountId: string): void => {
+    navigator.clipboard?.writeText(accountId)
+      .then(() => notify("ok", `Copied ${accountId}`))
+      .catch(() => notify("err", "Couldn't copy to clipboard"));
+  };
+
+  const doExplain = async (id?: string): Promise<void> => {
+    const acct = (id ?? netId).trim();
+    if (!acct) return;
+    setNetId(acct);
+    setTab("network");
+    setBusy("explain");
+    setGraph(null);
+    try {
+      const [data] = await Promise.all([api<Explanation>(`/accounts/${encodeURIComponent(acct)}/explain`), sleep(600)]);
+      setGraph(data);
+    } catch (e) {
+      notify("err", errorMessage(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const clearFresh = (id: number): void =>
+    setFresh((s) => {
+      const next = new Set(s);
+      next.delete(id);
+      return next;
+    });
+
+  const anomalyOpenCount = anomalies.filter((a) => a.status === "new" || a.status === "under_investigation").length;
+
+  const tabs: DockTab[] = [
+    { id: "overview", label: "Overview", icon: <IconHome /> },
+    { id: "pipeline", label: "Pipeline", icon: <IconFlow /> },
+    { id: "scan", label: "Scan", icon: <IconRadar /> },
+    { id: "intake", label: "Intake", icon: <IconUpload /> },
+    { id: "alerts", label: "Alerts", icon: <IconBell />, badge: stats.open },
+    { id: "investigate", label: "Investigate", icon: <IconSearch />, badge: anomalyOpenCount },
+    { id: "network", label: "Network", icon: <IconGraph /> },
+    { id: "activity", label: "Activity", icon: <IconList /> },
+    { id: "connect", label: "Connect", icon: <IconPlug />, badge: sysStatus && !sysStatus.all_ok ? 1 : undefined },
+  ];
+
+  const shown = alerts.filter((a) => filter === "all" || a.status === filter);
+  const shownAnomalies = anomalies.filter((a) => anomalyFilter === "all" || a.status === anomalyFilter);
+  const ANOMALY_FILTERS: (AnomalyStatus | "all")[] = ["all", "new", "under_investigation", "confirmed_mule", "cleared"];
+  const latencyTarget = modelInfo?.targets.latency_ms ?? 100;
+
+  /* ---- views ---- */
+  const overview = (
+    <>
+      <div className="hero-grid">
+        <section className="hero">
+          <span className="eyebrow">Explainable AML · FinCEN-ready audit trail</span>
+          <h1>
+            <span className="grad-text">Follow the money.</span>
+            <br />
+            Explain every flag.
+          </h1>
+          <p className="lead">
+            Graph neural networks spot laundering typologies across multi-hop transaction networks, and every
+            alert comes with a human-readable SAR narrative and a tamper-proof audit record.
+          </p>
+          <div className="row">
+            <button className="btn" onClick={() => setTab("scan")}>Scan an account</button>
+            <button className="btn ghost" onClick={() => setTab("alerts")}>Review alerts</button>
+          </div>
+        </section>
+
+        <div className="stats-side">
+          <Stat label="Total alerts" value={stats.total} tone="blue" hint="all time" />
+          <Stat label="Awaiting review" value={stats.open} tone="amber" hint="open cases" />
+          <Stat label="Confirmed" value={stats.confirmed} tone="red" hint="marked suspicious" />
+          <Stat label="Average risk" value={stats.avg * 100} suffix="%" tone="cyan" hint="across alerts" />
+          <Stat label="Anomalies (Model 2)" value={anomalyOpenCount} tone="amber" hint="awaiting investigation" />
+        </div>
+      </div>
+
+      <div className="two reverse">
+        <Glass>
+          <div className="row between">
+            <h3>Latest alerts</h3>
+            <button className="link" onClick={() => setTab("alerts")}>View all →</button>
+          </div>
+          {alerts.length === 0 && <p className="muted">Nothing yet. Scan a suspicious account to create the first alert.</p>}
+          {alerts.slice(0, 4).map((a, i) => (
+            <div className="mini-alert rise" key={a.id} style={{ animationDelay: `${i * 70}ms` }} onClick={() => setTab("alerts")}>
+              <span className={`dot ${a.status}`} />
+              <b>{a.account_id}</b>
+              <span className="muted">{niceType(a.typology) || "no narrative yet"}</span>
+              <span className="grow" />
+              <span className="risk">{pct(a.risk_score, 0)}</span>
+            </div>
+          ))}
+        </Glass>
+        <ModelCard info={modelInfo} />
+      </div>
+
+      <Glass>
+        <h3>Detection pipeline</h3>
+        <Pipeline />
+      </Glass>
+    </>
+  );
+
+  const scanView = (
+    <Glass className="scan-card">
+      <h2>Scan an account</h2>
+      <p className="muted">The model scores the account from its 2-hop transaction neighbourhood.</p>
+      <div className="row">
+        <input
+          className="input grow"
+          placeholder="Account ID, e.g. ACC0000123"
+          value={accountId}
+          onChange={(e) => setAccountId(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") void doScan();
+          }}
+        />
+        <button className="btn shine" disabled={!accountId.trim() || busy === "scan"} onClick={() => void doScan()}>
+          {busy === "scan" ? "Scanning…" : "Scan"}
+        </button>
+      </div>
+      {samples !== null && (
+        <div className="row chips">
+          <span className="muted">Try:</span>
+          {samples.suspicious.slice(0, 3).map((a) => (
+            <button key={a} className="chip bad" onClick={() => setAccountId(a)}>{a}</button>
+          ))}
+          {samples.benign.slice(0, 2).map((a) => (
+            <button key={a} className="chip" onClick={() => setAccountId(a)}>{a}</button>
+          ))}
+        </div>
+      )}
+
+      {busy === "scan" && (
+        <div className="scan-wait">
+          <div className="radar" />
+          <p className="muted">Running graph inference…</p>
+        </div>
+      )}
+      {scan !== null && busy !== "scan" && (
+        <div className="scan-result rise">
+          <RiskGauge key={`${scan.account_id}-${scan.score}`} score={scan.calibrated_score ?? scan.score} threshold={scan.calibrated_threshold ?? scan.threshold} />
+          <div className="scan-meta">
+            <div className={`verdict ${scan.flagged ? "bad" : "good"}`}>
+              {scan.flagged ? "Flagged: suspicious pattern" : "Below alert threshold"}
+            </div>
+            <p className="muted">
+              {scan.account_id} · threshold {pct(scan.calibrated_threshold ?? scan.threshold)} · inference {scan.latency_ms} ms
+              {scan.latency_ms <= latencyTarget && <span className="ok-text"> ✓ within {latencyTarget} ms target</span>}
+            </p>
+            <div className="row">
+              <button className="btn ghost" onClick={() => void doExplain(scan.account_id)}>Explain network</button>
+              {scan.alert !== null && (
+                <button className="btn" onClick={() => setTab("alerts")}>Open alert #{scan.alert.id}</button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </Glass>
+  );
+
+  const alertsView = (
+    <>
+      <Glass>
+        <div className="row between">
+          <div className="seg">
+            {FILTERS.map((f) => (
+              <button key={f} className={filter === f ? "on" : ""} onClick={() => setFilter(f)}>{f}</button>
+            ))}
+          </div>
+          <div className="row">
+            <button className="btn ghost" onClick={() => void load()}>Refresh</button>
+          </div>
+        </div>
+      </Glass>
+
+      {shown.length === 0 && (
+        <Glass>
+          <p className="muted">No alerts in this view.</p>
+        </Glass>
+      )}
+      {shown.map((a, i) => (
+        <Glass className="alert-card rise" key={a.id} style={{ animationDelay: `${Math.min(i, 8) * 60}ms` }}>
+          <div className="row between">
+            <div className="row">
+              <span className="alert-id">#{a.id}</span>
+              <b>{a.account_id}</b>
+              <span className={`pill s-${a.status}`}>{a.status}</span>
+              {a.typology && <span className="pill neutral">{niceType(a.typology)}</span>}
+            </div>
+            <div className="row">
+              <div className="bar"><div style={{ width: `${Math.round(a.risk_score * 100)}%` }} /></div>
+              <b className="risk">{pct(a.risk_score, 0)}</b>
+            </div>
+          </div>
+
+          {a.narrative && (
+            <Narrative
+              text={a.narrative}
+              source={a.narrative_source}
+              sha256={a.narrative_sha256}
+              animate={fresh.has(a.id)}
+              onDone={() => clearFresh(a.id)}
+            />
+          )}
+
+          <div className="row actions">
+            <button className="btn ghost" disabled={busy === `n${a.id}`} onClick={() => void doNarrative(a.id)}>
+              {busy === `n${a.id}` ? "Generating…" : a.narrative ? "Regenerate narrative" : "Generate SAR narrative"}
+            </button>
+            <button className="btn ghost" onClick={() => void doExplain(a.account_id)}>View network</button>
+            {a.status === "open" && a.narrative && (
+              <>
+                <button className="btn red" disabled={busy === `d${a.id}`} onClick={() => void doDecision(a.id, "confirmed")}>
+                  Confirm suspicious
+                </button>
+                <button className="btn green" disabled={busy === `d${a.id}`} onClick={() => void doDecision(a.id, "dismissed")}>
+                  Dismiss
+                </button>
+              </>
+            )}
+            {a.reviewed_by && <span className="muted">reviewed by {a.reviewed_by}</span>}
+          </div>
+        </Glass>
+      ))}
+    </>
+  );
+
+  const investigateView = (
+    <>
+      <Glass>
+        <p className="muted">
+          Model 2&apos;s alerts -- accounts Model 1 currently calls normal, but that look statistically unlike
+          the rest of that same population. Nothing here is auto-decided: claim one to start investigating,
+          document what you find, then resolve it. Only a &quot;confirmed mule&quot; resolution teaches the
+          detection model this pattern; a cleared one is kept only as evidence.
+        </p>
+      </Glass>
+      <Glass>
+        <div className="row between">
+          <div className="seg">
+            {ANOMALY_FILTERS.map((f) => (
+              <button key={f} className={anomalyFilter === f ? "on" : ""} onClick={() => setAnomalyFilter(f)}>
+                {f.replaceAll("_", " ")}
+              </button>
+            ))}
+          </div>
+          <button className="btn ghost" onClick={() => void loadAnomalies()}>Refresh</button>
+        </div>
+      </Glass>
+
+      {shownAnomalies.length === 0 && (
+        <Glass>
+          <p className="muted">No anomaly alerts in this view.</p>
+        </Glass>
+      )}
+      {shownAnomalies.map((a, i) => (
+        <Glass className="alert-card rise" key={a.id} style={{ animationDelay: `${Math.min(i, 8) * 60}ms` }}>
+          <div className="row between">
+            <div className="row">
+              <span className="alert-id">#{a.id}</span>
+              <b>{a.account_id}</b>
+              <span className={`pill s-${a.status === "confirmed_mule" ? "confirmed" : a.status === "cleared" ? "dismissed" : a.status === "under_investigation" ? "open" : "neutral"}`}>
+                {a.status.replaceAll("_", " ")}
+              </span>
+              {a.assigned_to && <span className="pill neutral">assigned: {a.assigned_to}</span>}
+            </div>
+            <div className="muted small">
+              anomaly score {a.anomaly_score.toFixed(4)} · threshold {a.threshold.toFixed(4)}
+            </div>
+          </div>
+
+          <div className="row actions investigator-tools">
+            <button className="chip" onClick={() => void doExplain(a.account_id)}>View network →</button>
+            <button className="chip" disabled={crossCheck[a.id] === "pending"} onClick={() => void doCrossCheck(a.id, a.account_id)}>
+              {crossCheck[a.id] === "pending" ? "Checking Model 1…" : "Cross-check with Model 1"}
+            </button>
+            <button className="chip" onClick={() => copyAccountId(a.account_id)}>Copy account ID</button>
+          </div>
+          {crossCheck[a.id] && crossCheck[a.id] !== "pending" && (
+            crossCheck[a.id] === "error" ? (
+              <p className="muted small">Model 1 cross-check failed -- try again.</p>
+            ) : (
+              <p className="muted small">
+                Model 1 says: {(crossCheck[a.id] as ScanResult).flagged ? "also unusual" : "looks normal to it"} ·
+                {" "}risk score {pct((crossCheck[a.id] as ScanResult).score, 1)}
+                {(crossCheck[a.id] as ScanResult).alert ? ` · alert #${(crossCheck[a.id] as ScanResult).alert!.id} already exists there` : " · no Model 1 alert exists"}
+              </p>
+            )
+          )}
+
+          {a.investigation_log.length > 0 && (
+            <div className="narr" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {a.investigation_log.map((entry, idx) => (
+                <div key={idx} className="small">
+                  <b>{entry.by}</b> <span className="muted">· {new Date(entry.ts * 1000).toLocaleString()} · {entry.status.replaceAll("_", " ")}</span>
+                  <div>{entry.note}</div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className="row actions">
+            {a.status === "new" && (
+              <button className="btn" disabled={busy === `claim${a.id}`} onClick={() => void doClaim(a.id)}>
+                {busy === `claim${a.id}` ? "Claiming…" : "Claim for investigation"}
+              </button>
+            )}
+            {a.status === "under_investigation" && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 10, width: "100%" }}>
+                <div className="row chips">
+                  <span className="muted small">Quick notes:</span>
+                  {NOTE_TEMPLATES.map((t) => (
+                    <button key={t} className="chip" onClick={() => setNoteDraft((d) => ({ ...d, [a.id]: t }))}>
+                      {t.length > 34 ? `${t.slice(0, 34)}…` : t}
+                    </button>
+                  ))}
+                </div>
+                <div className="row">
+                  <input
+                    className="input grow"
+                    placeholder="Investigation note (e.g. called the account holder, cross-checked related accounts...)"
+                    value={noteDraft[a.id] ?? ""}
+                    onChange={(e) => setNoteDraft((d) => ({ ...d, [a.id]: e.target.value }))}
+                  />
+                  <button className="btn ghost" disabled={busy === `note${a.id}` || !(noteDraft[a.id] ?? "").trim()} onClick={() => void doAddNote(a.id)}>
+                    Add note
+                  </button>
+                </div>
+                <div className="row">
+                  <button className="btn red" disabled={busy === `resolve${a.id}`} onClick={() => void doResolveAnomaly(a.id, "confirmed_mule")}>
+                    Confirm mule
+                  </button>
+                  <button className="btn green" disabled={busy === `resolve${a.id}`} onClick={() => void doResolveAnomaly(a.id, "cleared")}>
+                    Clear
+                  </button>
+                  <span className="grow" />
+                  <button className="btn ghost" disabled={busy === `escalate${a.id}`} onClick={() => void doEscalate(a.id)}>
+                    {busy === `escalate${a.id}` ? "Escalating…" : "Escalate to compliance / police"}
+                  </button>
+                </div>
+              </div>
+            )}
+            {a.status === "confirmed_mule" && (
+              <span className="muted small">
+                {a.trained_at ? "Taught to the detection model." : "Queued to teach the detection model (next sync cycle)."}
+              </span>
+            )}
+          </div>
+        </Glass>
+      ))}
+    </>
+  );
+
+  const networkView = (
+    <>
+      <Glass>
+        <div className="row">
+          <input
+            className="input grow"
+            placeholder="Account ID to explain, e.g. ACC0000123"
+            value={netId}
+            onChange={(e) => setNetId(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void doExplain();
+            }}
+          />
+          <button className="btn shine" disabled={!netId.trim() || busy === "explain"} onClick={() => void doExplain()}>
+            {busy === "explain" ? "Explaining…" : "Explain"}
+          </button>
+        </div>
+        {samples !== null && (
+          <div className="row chips">
+            <span className="muted">Try:</span>
+            {samples.suspicious.slice(0, 3).map((a) => (
+              <button key={a} className="chip bad" onClick={() => setNetId(a)}>{a}</button>
+            ))}
+          </div>
+        )}
+      </Glass>
+      {busy === "explain" && (
+        <Glass>
+          <div className="scan-wait">
+            <div className="radar" />
+            <p className="muted">Running GNNExplainer…</p>
+          </div>
+        </Glass>
+      )}
+      {graph !== null && busy !== "explain" && (
+        <div className="rise">
+          <NetworkGraph key={graph.account_id} data={graph} />
+        </div>
+      )}
+      {graph === null && busy !== "explain" && (
+        <Glass>
+          <p className="muted">Explain an account to see the transaction network the model reasoned over.</p>
+        </Glass>
+      )}
+    </>
+  );
+
+  const pipelineView = (
+    <>
+      <Glass>
+        <h3>Model 1 · known-typology classifier (baseline)</h3>
+        <p className="muted">
+          Every scan runs through here first. Trained on labelled laundering typologies, it flags the patterns
+          it already knows -- the obvious cases. Its own alerts never retrain it; only a confirmed Model 2
+          discovery does (see below), which is a deliberate choice: everyday confirm/dismiss clicks on already-
+          obvious cases would make the model drift with reviewer habits, not with genuinely new information.
+        </p>
+        <Pipeline />
+      </Glass>
+
+      <div className="two">
+        <Glass>
+          <h3>Model 2 · deep anomaly detector (blind-spot watcher)</h3>
+          <p className="muted">
+            A separate graph autoencoder, trained only on accounts Model 1 currently calls normal -- it learns
+            what "normal" looks like in depth, then flags anything that stops fitting that pattern, however
+            small. It scores only Model 1's blind spot, so a pattern Model 1 already catches never reaches it.
+          </p>
+          <div className="mini-grid">
+            <div><span>Open anomalies</span><b>{anomalyOpenCount}</b></div>
+            <div><span>Confirmed mules found</span><b>{anomalies.filter((a) => a.status === "confirmed_mule").length}</b></div>
+            <div><span>Cleared (false alarms)</span><b>{anomalies.filter((a) => a.status === "cleared").length}</b></div>
+            <div><span>Taught back to Model 1</span><b>{anomalies.filter((a) => a.trained_at !== null).length}</b></div>
+          </div>
+        </Glass>
+        <Glass>
+          <h3>The feedback loop</h3>
+          <ol className="loop-steps">
+            <li>Model 2 flags an account Model 1 called normal.</li>
+            <li>An analyst claims it on the Investigate tab and actually investigates (account history, related
+              accounts, contacting the owner, escalation -- outside this system's reach).</li>
+            <li>Resolved <b>confirmed mule</b> -- the pattern is fed into a short, warm-started fine-tune of
+              Model 1 (never a retrain from scratch), gated so it only ever goes live if it measurably beats
+              the model currently in production.</li>
+            <li>Resolved <b>cleared</b> -- logged as evidence only, never used for training.</li>
+          </ol>
+          <p className="muted" style={{ marginTop: 10 }}>
+            This is the only path that changes Model 1. Routine officer decisions on Model 1&apos;s own alerts
+            (the Alerts tab) are audit evidence only and never retrain anything.
+          </p>
+        </Glass>
+      </div>
+    </>
+  );
+
+  const intakeView = (
+    <>
+      <Glass>
+        <h3>Screen a batch of accounts</h3>
+        <p className="muted">
+          Paste a list of account IDs (one per line, or a CSV with an <code>account_id</code> column) from a
+          bank extract, or upload a .csv/.txt file below. Each one runs through the real Model 1 scan -- the
+          same check the Scan tab does one at a time -- so a whole extract can be screened in one sitting
+          instead of typed in by hand. This does not ingest raw transaction ledgers into the account graph
+          itself; it screens account IDs the graph already knows about.
+        </p>
+        <textarea
+          className="input intake-textarea"
+          placeholder={"ACC0000123\nACC0000456\nACC0000789\n…or paste a CSV with an account_id column"}
+          value={intakeText}
+          onChange={(e) => setIntakeText(e.target.value)}
+          disabled={intakeRunning}
+          rows={8}
+        />
+        <div className="row" style={{ marginTop: 10 }}>
+          <label className="btn ghost" style={{ cursor: "pointer" }}>
+            Upload file
+            <input
+              type="file"
+              accept=".csv,.txt"
+              style={{ display: "none" }}
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) onIntakeFile(f);
+                e.target.value = "";
+              }}
+            />
+          </label>
+          <button className="btn shine" disabled={!intakeText.trim() || intakeRunning} onClick={() => void doBatchScan()}>
+            {intakeRunning ? `Scanning ${intakeProgress.done}/${intakeProgress.total}…` : "Scan all"}
+          </button>
+          {intakeText.trim() && !intakeRunning && (
+            <span className="muted">{parseIntakeIds(intakeText).length} account ID(s) detected</span>
+          )}
+        </div>
+      </Glass>
+
+      {intakeResults.length > 0 && (
+        <Glass>
+          <div className="row between">
+            <h3>Results ({intakeResults.length})</h3>
+            <span className="muted">{intakeResults.filter((r) => r.alert).length} flagged</span>
+          </div>
+          <div className="intake-results">
+            {intakeResults.map((r, i) => (
+              <div className={`mini-alert rise${r.alert ? " bad" : ""}`} key={`${r.account_id}-${i}`}>
+                <span className={`dot ${r.alert ? "open" : "dismissed"}`} />
+                <b>{r.account_id}</b>
+                <span className="muted">{r.alert ? `alert #${r.alert.id} created` : "below threshold"}</span>
+                <span className="grow" />
+                <span className="risk">{pct(r.score, 0)}</span>
+              </div>
+            ))}
+          </div>
+        </Glass>
+      )}
+    </>
+  );
+
+  const activityView = (
+    <Glass>
+      <div className="row between">
+        <h3>Activity feed</h3>
+        <button className="link" onClick={() => void loadActivity()}>Refresh</button>
+      </div>
+      <p className="muted" style={{ marginBottom: 12 }}>
+        Every scan, decision, claim, note and resolution across both pipelines, newest first -- so an analyst
+        can see what happened without opening a terminal or a database client.
+      </p>
+      {activity.length === 0 && <p className="muted">Nothing yet.</p>}
+      <div className="activity-feed">
+        {activity.map((e, i) => (
+          <div className="activity-item rise" key={`${e.ref_id}-${e.ts}-${i}`} style={{ animationDelay: `${Math.min(i, 12) * 30}ms` }}>
+            <span className={`pipeline-tag ${e.pipeline}`}>{e.pipeline === "model1" ? "M1" : "M2"}</span>
+            <div className="activity-body">
+              <div className="row">
+                <b>{e.account_id}</b>
+                <span className="muted">{e.kind.replaceAll("_", " ")}</span>
+                {e.by && <span className="muted">· {e.by}</span>}
+              </div>
+              <div className="muted activity-detail">{e.detail}</div>
+            </div>
+            <span className="activity-ts">{new Date(e.ts * 1000).toLocaleString()}</span>
+          </div>
+        ))}
+      </div>
+    </Glass>
+  );
+
+  const connectView = (
+    <>
+      <Glass>
+        <div className="row between">
+          <h3>Live system status</h3>
+          <button className="link" onClick={() => void loadStatus()}>Refresh</button>
+        </div>
+        {sysStatus === null && <p className="muted">Couldn&apos;t reach the backend to check status.</p>}
+        {sysStatus !== null && (
+          <div className="status-grid">
+            {sysStatus.services.map((s) => (
+              <div key={s.name} className={`status-pill ${s.ok ? "ok" : "bad"}`}>
+                <i />
+                <div>
+                  <b>{s.name}</b>
+                  <span className="muted">
+                    {s.ok ? (s.latency_ms !== null ? `reachable · ${s.latency_ms}ms` : "reachable") : `unreachable${s.error ? ` (${s.error})` : ""}`}
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </Glass>
+
+      <div className="two">
+        <Glass>
+          <h3>Option 1 · paste data through the frontend</h3>
+          <p className="muted">
+            The Intake tab lets an analyst paste or upload a list of account IDs (a CSV extract from a bank,
+            say) and screen all of them through Model 1 in one go -- no terminal, no direct database access.
+            See the Intake tab to use it.
+          </p>
+          <button className="btn ghost" onClick={() => setTab("intake")}>Open Intake →</button>
+        </Glass>
+        <Glass>
+          <h3>Option 2 · connect a live transaction feed</h3>
+          {sysStatus !== null && (
+            <>
+              <p className="muted">A bank&apos;s own system publishes transactions onto this Kafka topic:</p>
+              <div className="mini-grid">
+                <div><span>Transactions topic</span><b>{sysStatus.kafka.transactions_topic}</b></div>
+                <div><span>Alerts topic</span><b>{sysStatus.kafka.alerts_topic}</b></div>
+                <div><span>External listener</span><b>{sysStatus.kafka.external_listener}</b></div>
+              </div>
+              <p className="muted" style={{ marginTop: 10 }}>{sysStatus.kafka.note}</p>
+            </>
+          )}
+        </Glass>
+      </div>
+    </>
+  );
+
+  if (!authChecked) {
+    return <Background />;   // brief, near-instant check of an already-stored key; nothing worth a spinner for
+  }
+  if (!demoMode && !authedOfficer) {
+    return (
+      <>
+        <Background />
+        <LoginScreen onSuccess={handleLoginSuccess} />
+      </>
+    );
+  }
+
+  return (
+    <>
+      <Background />
+      {demoMode && <div className="demo-badge">Demo mode &middot; sample data &middot; no live backend</div>}
+      <div className="toasts">
+        {toasts.map((t) => (
+          <div key={t.id} className={`toast ${t.kind}`}>{t.msg}</div>
+        ))}
+      </div>
+
+      <div className={`app${demoMode ? " demo" : ""}`}>
+        <header className="topbar">
+          <div className="brand">
+            <div className="logo">
+              <span className="logo-ring" />
+              <IconShield />
+            </div>
+            <div>
+              <div className="brand-name">XAI<span>·</span>AMLBench</div>
+              <div className="brand-sub">Compliance Console</div>
+            </div>
+          </div>
+          <div className={`status ${online === false ? "off" : online ? "on" : ""}`}>
+            <i />
+            {online === null ? "Connecting…" : online ? "Backend online" : "Backend offline"}
+          </div>
+          {authedOfficer && (
+            <div className="row officer-badge">
+              <span className="muted">Signed in as {authedOfficer}</span>
+              <button className="btn ghost" onClick={handleLogout}>Sign out</button>
+            </div>
+          )}
+        </header>
+
+        <main key={tab} className="view">
+          {tab === "overview" && overview}
+          {tab === "pipeline" && pipelineView}
+          {tab === "scan" && scanView}
+          {tab === "intake" && intakeView}
+          {tab === "alerts" && alertsView}
+          {tab === "investigate" && investigateView}
+          {tab === "network" && networkView}
+          {tab === "activity" && activityView}
+          {tab === "connect" && connectView}
+        </main>
+      </div>
+
+      <FloatingDock tabs={tabs} active={tab} onChange={setTab} />
+    </>
+  );
+}

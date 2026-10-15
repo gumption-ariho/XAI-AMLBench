@@ -1,0 +1,90 @@
+"use client";
+
+import { useEffect, useRef } from "react";
+
+interface Particle {
+  x: number;
+  y: number;
+  r: number;
+}
+
+/** Static backdrop: a single still frame of a glowing dot-and-line network, drawn once per size change.
+ * This used to run a requestAnimationFrame loop that moved every point and redrew the whole canvas 60
+ * times a second, plus a cursor-chasing line -- constant, page-wide motion that read as "too much
+ * animation" (reported directly). Nothing here moves on its own now: it draws once on mount/resize and
+ * sits still, same as the orbs and grid-floor it sits alongside. */
+export default function Background() {
+  const ref = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    const canvas = ref.current;
+    if (!canvas) return undefined;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return undefined;
+
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    let resizeTimer = 0;
+
+    const draw = (): void => {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      canvas.width = w * dpr;
+      canvas.height = h * dpr;
+      canvas.style.width = `${w}px`;
+      canvas.style.height = `${h}px`;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, w, h);
+
+      const n = Math.round(Math.min(70, (w * h) / 20000));
+      const pts: Particle[] = Array.from({ length: n }, (): Particle => ({
+        x: Math.random() * w,
+        y: Math.random() * h,
+        r: Math.random() * 1.4 + 0.6,
+      }));
+
+      for (let i = 0; i < pts.length; i++) {
+        const a = pts[i];
+        for (let j = i + 1; j < pts.length; j++) {
+          const b = pts[j];
+          const d = Math.hypot(a.x - b.x, a.y - b.y);
+          if (d < 130) {
+            ctx.strokeStyle = `rgba(47,184,143,${(1 - d / 130) * 0.22})`;
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(a.x, a.y);
+            ctx.lineTo(b.x, b.y);
+            ctx.stroke();
+          }
+        }
+        ctx.fillStyle = "rgba(212,175,55,0.55)";
+        ctx.beginPath();
+        ctx.arc(a.x, a.y, a.r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    };
+
+    const onResize = (): void => {
+      window.clearTimeout(resizeTimer);
+      resizeTimer = window.setTimeout(draw, 150);   // redraw once the window settles, not on every pixel
+    };
+
+    draw();
+    window.addEventListener("resize", onResize);
+    return () => {
+      window.clearTimeout(resizeTimer);
+      window.removeEventListener("resize", onResize);
+    };
+  }, []);
+
+  return (
+    <div className="bg" aria-hidden="true">
+      <div className="orbs">
+        <i />
+        <i />
+        <i />
+      </div>
+      <div className="grid-floor" />
+      <canvas ref={ref} className="bg-canvas" />
+    </div>
+  );
+}

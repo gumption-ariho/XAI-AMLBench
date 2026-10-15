@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use this software or the accompanying synthetic dataset, please cite it as below."
+title: "XAI-AMLBench: An Explainable, Open-Source Benchmark for Multi-Hop Money-Laundering Detection"
+type: software
+version: 0.1.0
+date-released: "2026-09-21"
+license: MIT
+repository-code: "https://github.com/OWNER/xai-amlbench"
+keywords:
+  - anti-money-laundering
+  - explainable-ai
+  - graph-neural-networks
+  - fincen
+  - regtech
+authors:
+  - name: "XAI-AMLBench contributors"
+preferred-citation:
+  type: software
+  title: "XAI-AMLBench: An Explainable, Open-Source Benchmark for Multi-Hop Money-Laundering Detection"
+  version: 0.1.0
+  year: 2026
+  authors:
+    - name: "XAI-AMLBench contributors"
+  url: "https://github.com/OWNER/xai-amlbench"

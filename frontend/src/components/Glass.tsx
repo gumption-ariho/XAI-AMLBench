@@ -1,6 +1,6 @@
 "use client";
 
-import type { ElementType, HTMLAttributes, MouseEvent, ReactNode } from "react";
+import type { ElementType, HTMLAttributes, ReactNode } from "react";
 
 interface GlassProps extends HTMLAttributes<HTMLElement> {
   /** Element to render, e.g. "section" (default) or "div". */
@@ -8,16 +8,11 @@ interface GlassProps extends HTMLAttributes<HTMLElement> {
   children?: ReactNode;
 }
 
-/** Glass panel with a soft spotlight that follows the cursor. */
+/** Plain bordered card -- flat, no blur, no cursor-follow glow. Keeps the name "Glass" and the same props so
+ * every existing <Glass> usage across the app keeps working unchanged; only the look underneath it changed. */
 export default function Glass({ as: Tag = "section", className = "", children, ...rest }: GlassProps) {
-  const onMove = (e: MouseEvent<HTMLElement>): void => {
-    const el = e.currentTarget;
-    const r = el.getBoundingClientRect();
-    el.style.setProperty("--mx", `${e.clientX - r.left}px`);
-    el.style.setProperty("--my", `${e.clientY - r.top}px`);
-  };
   return (
-    <Tag className={`glass ${className}`} onMouseMove={onMove} {...rest}>
+    <Tag className={`glass ${className}`} {...rest}>
       {children}
     </Tag>
   );

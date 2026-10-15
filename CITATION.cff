@@ -5,7 +5,7 @@ type: software
 version: 0.1.0
 date-released: "2026-09-21"
 license: MIT
-repository-code: "https://github.com/OWNER/xai-amlbench"
+repository-code: "https://github.com/gumption-ariho/xai-amlbench"
 keywords:
   - anti-money-laundering
   - explainable-ai
@@ -21,4 +21,4 @@ preferred-citation:
   year: 2026
   authors:
     - name: "XAI-AMLBench contributors"
-  url: "https://github.com/OWNER/xai-amlbench"
+  url: "https://github.com/gumption-ariho/xai-amlbench"

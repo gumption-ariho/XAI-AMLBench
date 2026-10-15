@@ -69,6 +69,33 @@ def arrays_from_frames(accounts: pd.DataFrame, tx: pd.DataFrame, reporting_thres
     }
 
 
+def save_serving_artifacts(arrays: dict, res: dict, metrics: dict, *, model_name: str, hp: dict,
+                           out_dir: str | Path, extra_metrics: dict | None = None) -> None:
+    """Writes gnn_model.pt, graph.pt and metrics.json in the exact shape gnn_aml_core.main's serving API, the
+    frontend (via /accounts/sample, /alerts/scan, /accounts/{id}/explain) and gnn_aml_core.anomaly's Model 2 all
+    expect. This is the SAME save main() below already did inline for the SynthAML pipeline -- factored out here
+    so gnn_aml_core.amlworld can write a live, servable checkpoint from the real IBM AMLworld dataset too,
+    instead of only ever evaluating it offline and printing a score table. Whichever dataset last wrote these
+    three files is what the running stack serves -- there is no separate "which dataset is live" flag, the
+    files on disk ARE the live dataset."""
+    import torch
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    calibrated_threshold = float(res["calibrator"](metrics["threshold"]))
+    torch.save({
+        "model_name": model_name, "hparams": hp, "in_dim": arrays["x"].shape[1], "state_dict": res["state_dict"],
+        "feature_names": arrays["feature_names"], "mean": torch.from_numpy(arrays["mean"]), "std": torch.from_numpy(arrays["std"]),
+        "threshold": metrics["threshold"], "metrics": metrics,
+        "calibration": res["calibrator"].to_dict(), "calibrated_threshold": calibrated_threshold,
+    }, out / "gnn_model.pt")
+    graph = {k: torch.from_numpy(np.array(arrays[k])) for k in
+             ("x", "edge_index", "edge_attr", "edge_type", "y", "tx_amount", "tx_timestamp", "tx_cross_border", "opened_ts")}
+    graph.update({k: arrays[k] for k in ("account_ids", "account_type", "country", "tx_ids", "feature_names", "n_tx")})
+    torch.save(graph, out / "graph.pt")
+    (out / "metrics.json").write_text(json.dumps({**metrics, **(extra_metrics or {})}, indent=2))
+    log.info("saved %s, %s and %s", out / "gnn_model.pt", out / "graph.pt", out / "metrics.json")
+
+
 def make_splits(y: np.ndarray, seed: int):
     """Stratified 60 / 20 / 20 train / validation / test split of the accounts."""
     n = len(y)
@@ -88,10 +115,16 @@ def format_table(rows: dict) -> str:
 # ------------------------------------------------------------------------------------------------------ training
 def fit_gnn(arrays: dict, tr, va, te, *, model_name: str = "gatv2", hidden: int = 64, layers: int = 2, lr: float = 0.005,
             epochs: int = 150, pos_weight: float | None = None, seed: int = 42, patience: int = 0,
-            eval_every: int = 5, verbose: bool = True, **model_kwargs) -> dict:
+            eval_every: int = 5, verbose: bool = True, init_state_dict: dict | None = None, **model_kwargs) -> dict:
     """Train one GNN and evaluate it. Model selection uses the validation AUC only; the test split is touched once, at the end.
 
     patience: stop after this many evaluations (each `eval_every` epochs) without a validation improvement; 0 = train all epochs.
+    init_state_dict: load these weights into the freshly-built model BEFORE training starts, instead of the
+    usual random init -- this is what turns a call into a fine-tune/warm-start of an existing model rather than
+    training a new one from scratch. The architecture (model_name/hidden/layers/**model_kwargs) must match
+    whatever produced these weights, or load_state_dict raises. gnn_aml_core.feedback.retrain_and_maybe_promote
+    is the caller that uses this -- see that module's docstring for why fine-tuning, not fresh training, is
+    what an automatic feedback-driven retrain should do.
     **model_kwargs: extra keyword arguments forwarded to `build_model` beyond hidden/num_layers -- e.g. `edge_dim`
     for a dataset whose edge features are not aml_synth's own EDGE_DIM (see gnn_aml_core.elliptic, which trains
     on the real Elliptic Bitcoin dataset's 1-dimensional time-gap edge feature rather than aml_synth's 5).
@@ -113,6 +146,8 @@ def fit_gnn(arrays: dict, tr, va, te, *, model_name: str = "gatv2", hidden: int 
 
     hp = {"hidden": hidden, "num_layers": layers, **model_kwargs}
     model = build_model(model_name, arrays["x"].shape[1], **hp).to(dev)
+    if init_state_dict is not None:
+        model.load_state_dict(init_state_dict)   # warm start -- fine-tune from here, not from random weights
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
     def forward():
@@ -129,10 +164,20 @@ def fit_gnn(arrays: dict, tr, va, te, *, model_name: str = "gatv2", hidden: int 
             model.eval()
             with torch.no_grad():
                 probs = torch.sigmoid(forward()).cpu().numpy()
-            auc = float(roc_auc_score(y_np[va], probs[va]))      # same index array for scores and labels (a boolean mask would reorder)
+            # roc_auc_score returns NaN (with an UndefinedMetricWarning, not a raise) when y_np[va] happens to
+            # be single-class for this split -- a real, observed failure mode with a small or unlucky
+            # validation split, not just a theoretical edge case. `NaN > anything` is always False in Python,
+            # so every one of these evaluations would silently fail the "did it improve" check below and
+            # best_state would stay None for the WHOLE run, crashing model.load_state_dict(None) after the
+            # loop. Guard explicitly so a single undefined evaluation just counts as "no improvement this
+            # round" (the existing `stale`/patience path already handles that correctly) instead of poisoning
+            # every later comparison.
+            raw_auc = roc_auc_score(y_np[va], probs[va])
+            auc = float(raw_auc) if raw_auc == raw_auc else float("nan")   # raw_auc == raw_auc is False only for NaN
             if verbose:
-                log.info("epoch %3d  loss %.4f  val AUC %.4f", epoch, loss.item(), auc)
-            if auc > best_auc + 1e-4:
+                log.info("epoch %3d  loss %.4f  val AUC %s", epoch, loss.item(),
+                         "undefined (single-class validation split)" if auc != auc else f"{auc:.4f}")
+            if auc == auc and auc > best_auc + 1e-4:
                 best_auc, best_state, best_epoch, stale = auc, copy.deepcopy(model.state_dict()), epoch, 0
             else:
                 stale += 1
@@ -140,6 +185,19 @@ def fit_gnn(arrays: dict, tr, va, te, *, model_name: str = "gatv2", hidden: int 
                     if verbose:
                         log.info("early stop at epoch %d (no validation improvement for %d evaluations)", epoch, patience)
                     break
+
+    if best_state is None:
+        # Every evaluation this run came back NaN (validation AUC never defined, e.g. a persistently
+        # single-class validation split) -- rather than crash, fall back to whatever the model looks like
+        # after the LAST training epoch, clearly logged so this degraded case is visible, not silent. This is
+        # strictly better than the prior behaviour (model.load_state_dict(None) -> TypeError, with no model
+        # produced at all) and still returns a real, trained model; best_val_auc stays -1.0 so a caller
+        # comparing "did this beat the last checkpoint" never mistakes this for a real, measured improvement.
+        log.warning("fit_gnn: validation AUC was never defined in any evaluation this run (checked every %d "
+                   "epochs) -- falling back to the final epoch's weights instead of a 'best' checkpoint. This "
+                   "usually means the validation split ended up single-class; check the train/val/test split "
+                   "and class balance before trusting this model.", eval_every)
+        best_state, best_epoch = copy.deepcopy(model.state_dict()), epoch
 
     model.load_state_dict(best_state)
     model.eval()
@@ -210,24 +268,10 @@ def main() -> None:
     log.info("calibration: ECE %.4f -> %.4f, Brier %.4f -> %.4f (raw score is uncalibrated; use 'calibrated_score' at serving time)",
              cr["ece_before"], cr["ece_after"], cr["brier_before"], cr["brier_after"])
 
-    out = Path(a.out)
-    out.mkdir(parents=True, exist_ok=True)
-    calibrated_threshold = float(res["calibrator"](metrics["threshold"]))
-    torch.save({
-        "model_name": a.model, "hparams": hp, "in_dim": arrays["x"].shape[1], "state_dict": res["state_dict"],
-        "feature_names": arrays["feature_names"], "mean": torch.from_numpy(arrays["mean"]), "std": torch.from_numpy(arrays["std"]),
-        "threshold": metrics["threshold"], "metrics": metrics,
-        "calibration": res["calibrator"].to_dict(), "calibrated_threshold": calibrated_threshold,
-    }, out / "gnn_model.pt")
-    graph = {k: torch.from_numpy(np.array(arrays[k])) for k in
-             ("x", "edge_index", "edge_attr", "edge_type", "y", "tx_amount", "tx_timestamp", "tx_cross_border", "opened_ts")}
-    graph.update({k: arrays[k] for k in ("account_ids", "account_type", "country", "tx_ids", "feature_names", "n_tx")})
-    torch.save(graph, out / "graph.pt")
-    (out / "metrics.json").write_text(json.dumps({
-        **metrics, "model": a.model, "hparams": hp, "epochs": a.epochs, "seed": a.seed, "n_nodes": n, "n_transactions": arrays["n_tx"],
-        "positive_rate": float(y_np.mean()), "baselines": baselines,
-    }, indent=2))
-    log.info("saved %s, %s and %s", out / "gnn_model.pt", out / "graph.pt", out / "metrics.json")
+    save_serving_artifacts(arrays, res, metrics, model_name=a.model, hp=hp, out_dir=a.out, extra_metrics={
+        "model": a.model, "hparams": hp, "epochs": a.epochs, "seed": a.seed, "n_nodes": n, "n_transactions": arrays["n_tx"],
+        "positive_rate": float(y_np.mean()), "baselines": baselines, "source_dataset": "synthaml",
+    })
 
 
 if __name__ == "__main__":

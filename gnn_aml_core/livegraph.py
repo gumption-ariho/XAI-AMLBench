@@ -171,10 +171,16 @@ def rebuild_live_graph(ckpt: dict, out_dir: str | Path, reporting_threshold: flo
         "y": torch.zeros(len(accounts), dtype=torch.float32),   # unknown ground truth for a live account --
                                                                  # never read at serving time, kept only for
                                                                  # shape-compatibility with graph.pt's own schema
-        "tx_amount": torch.from_numpy(tx["amount"].to_numpy(dtype=np.float32)),
-        "tx_timestamp": torch.from_numpy(tx["timestamp"].to_numpy(dtype=np.int64)),
-        "tx_cross_border": torch.from_numpy(tx["cross_border"].to_numpy(dtype=np.int64)),
-        "opened_ts": torch.from_numpy(accounts["opened_ts"].to_numpy(dtype=np.int64)),
+        # copy=True: when a column's on-disk dtype already matches the requested dtype (e.g. "timestamp" is
+        # already int64 straight out of read_csv), pandas' to_numpy() hands back the block manager's own
+        # array with NO copy -- which can be a non-writable view (pandas may share/consolidate that buffer
+        # across columns). torch.from_numpy() on a non-writable array is undefined behavior if anything ever
+        # writes into the tensor later (PyTorch warns about exactly this: "UserWarning: The given NumPy array
+        # is not writable..."), so every array handed to torch here is forced to be its own writable copy.
+        "tx_amount": torch.from_numpy(tx["amount"].to_numpy(dtype=np.float32, copy=True)),
+        "tx_timestamp": torch.from_numpy(tx["timestamp"].to_numpy(dtype=np.int64, copy=True)),
+        "tx_cross_border": torch.from_numpy(tx["cross_border"].to_numpy(dtype=np.int64, copy=True)),
+        "opened_ts": torch.from_numpy(accounts["opened_ts"].to_numpy(dtype=np.int64, copy=True)),
         "account_ids": accounts["account_id"].tolist(), "account_type": accounts["account_type"].tolist(),
         "country": accounts["country"].tolist(), "tx_ids": tx["tx_id"].tolist(),
         "feature_names": names, "n_tx": int(len(tx)),

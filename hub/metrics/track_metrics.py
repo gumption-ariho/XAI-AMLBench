@@ -6,8 +6,8 @@ Reads ONLY public counts (GitHub API, PyPI's public JSON API, Hugging Face's pub
 inflate a number -- it just fetches what is already public and appends one dated row per run to a CSV, so a
 history builds up automatically as you run this weekly. It never modifies GitHub, PyPI, Zenodo or Hugging Face.
 
-    python3 track_metrics.py --repo OWNER/xai-amlbench --pypi xai-amlbench --hf-dataset OWNER/xai-amlbench
-    python3 track_metrics.py --repo OWNER/xai-amlbench --pypi xai-amlbench --zenodo-doi 10.5281/zenodo.XXXXXXX
+    python3 track_metrics.py --repo gumption-ariho/xai-amlbench --pypi xai-amlbench --hf-dataset gumption-ariho/xai-amlbench
+    python3 track_metrics.py --repo gumption-ariho/xai-amlbench --pypi xai-amlbench --zenodo-doi 10.5281/zenodo.XXXXXXX
 
 Zenodo has no simple public "download count" API endpoint the way GitHub/PyPI/HF do; --zenodo-doi just records
 the DOI as a reminder to note its download/citation count by hand from the record's own page. Run this weekly
@@ -73,9 +73,9 @@ def huggingface_metrics(dataset: str) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--repo", help="GitHub repo, e.g. OWNER/xai-amlbench")
+    ap.add_argument("--repo", help="GitHub repo, e.g. gumption-ariho/xai-amlbench")
     ap.add_argument("--pypi", help="PyPI package name, e.g. xai-amlbench")
-    ap.add_argument("--hf-dataset", help="Hugging Face dataset id, e.g. OWNER/xai-amlbench")
+    ap.add_argument("--hf-dataset", help="Hugging Face dataset id, e.g. gumption-ariho/xai-amlbench")
     ap.add_argument("--zenodo-doi", default="", help="Zenodo DOI, once minted (recorded as-is; check its download/citation count by hand)")
     ap.add_argument("--notes", default="", help="free-text note for this week's row, e.g. a beta-tester milestone")
     ap.add_argument("--out", default=str(Path(__file__).with_name("metrics.csv")))

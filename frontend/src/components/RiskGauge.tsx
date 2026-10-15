@@ -1,6 +1,5 @@
 "use client";
 
-import { useEffect, useState } from "react";
 import { useCountUp } from "./hooks";
 
 interface RiskGaugeProps {
@@ -10,15 +9,9 @@ interface RiskGaugeProps {
   threshold: number;
 }
 
-/** 270-degree animated risk gauge. Give it a `key` that changes per scan to replay the sweep. */
+/** 270-degree risk gauge, drawn at its final value immediately -- no sweep-in. */
 export default function RiskGauge({ score, threshold }: RiskGaugeProps) {
-  const [on, setOn] = useState<boolean>(false);
   const shown = useCountUp(score * 100, 1200);
-
-  useEffect(() => {
-    const id = requestAnimationFrame(() => setOn(true));
-    return () => cancelAnimationFrame(id);
-  }, []);
 
   const r = 70;
   const c = 2 * Math.PI * r;
@@ -35,25 +28,25 @@ export default function RiskGauge({ score, threshold }: RiskGaugeProps) {
       <svg viewBox="0 0 180 180">
         <defs>
           <linearGradient id="gaugeBad" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0%" stopColor="#fbbf24" />
-            <stop offset="100%" stopColor="#fb7185" />
+            <stop offset="0%" stopColor="#ef4444" />
+            <stop offset="100%" stopColor="#dc2626" />
           </linearGradient>
           <linearGradient id="gaugeGood" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0%" stopColor="#22d3ee" />
-            <stop offset="100%" stopColor="#3b82f6" />
+            <stop offset="0%" stopColor="#3b82f6" />
+            <stop offset="100%" stopColor="#2563eb" />
           </linearGradient>
         </defs>
         <circle
-          cx="90" cy="90" r={r} fill="none" stroke="rgba(148,163,184,.14)" strokeWidth="12"
+          cx="90" cy="90" r={r} fill="none" stroke="rgba(100,116,139,.15)" strokeWidth="12"
           strokeLinecap="round" strokeDasharray={`${arc} ${c}`} transform="rotate(135 90 90)"
         />
         <circle
           className="gauge-arc" cx="90" cy="90" r={r} fill="none" strokeWidth="12" strokeLinecap="round"
           stroke={flagged ? "url(#gaugeBad)" : "url(#gaugeGood)"}
-          strokeDasharray={`${arc} ${c}`} strokeDashoffset={on ? arc * (1 - score) : arc}
+          strokeDasharray={`${arc} ${c}`} strokeDashoffset={arc * (1 - score)}
           transform="rotate(135 90 90)"
         />
-        <line x1={tx1} y1={ty1} x2={tx2} y2={ty2} stroke="#e8f0ff" strokeWidth="2" strokeLinecap="round" opacity=".8" />
+        <line x1={tx1} y1={ty1} x2={tx2} y2={ty2} stroke="#0f172a" strokeWidth="2" strokeLinecap="round" opacity=".6" />
       </svg>
       <div className="gauge-text">
         <b>

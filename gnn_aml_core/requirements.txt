@@ -15,3 +15,8 @@ networkx   # xai_explainer/__init__.py (triggered just by importing xai_explaine
 prometheus-client
 prometheus-fastapi-instrumentator
 psycopg[binary]   # gnn_aml_core.feedback reads officer decisions from the same Postgres alerts table the backend writes to
+httpx   # gnn_aml_core.anomaly's anomaly_pass() calls gnn-detection-api's own POST /predict to ask Model 1
+       # what it currently considers normal vs flagged -- a real bug, found on a real run (this file never
+       # had httpx even though gnn_aml_core/feedback.py's urllib-based calls elsewhere happened to not need
+       # it): anomaly-detector (Model 2) was crash-looping on every single cycle with ModuleNotFoundError,
+       # meaning Model 2 had never successfully run even once in this deployment until this was added.

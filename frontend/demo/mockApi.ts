@@ -35,6 +35,9 @@ function makeAlert(
     narrative: narrative?.text ?? null,
     narrative_source: narrative ? "template" : null,
     narrative_sha256: narrative?.sha256 ?? null,
+    source_bank: "Demo Bank",   // demo mode has no real Intake/Connect ingestion behind it, so there's no
+                               // real bank to attribute this to -- a fixed, obviously-fake name, same
+                               // honesty rule as everywhere else in this mock (never a real-looking value)
     reviewed_by: reviewer,
     review_note: reviewer ? "" : null,
     created_at: iso(minutesAgo),
@@ -83,6 +86,7 @@ function route(method: string, path: string, data: Record<string, unknown>): Rep
     return ok(body, 120);
   }
   if (method === "GET" && path === "/model/info") return ok(MODEL_INFO, 150);
+  if (method === "GET" && path === "/banks") return ok(["Demo Bank"], 100);
 
   if (method === "POST" && path === "/alerts/scan") {
     const id = String(data.account_id ?? "").trim();

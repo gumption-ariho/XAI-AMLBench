@@ -110,5 +110,12 @@ class TestScheduler:
 
         t = __import__("threading").Thread(target=agent.Scheduler._loop, args=(0.05, flaky), daemon=True)
         t.start()
-        time.sleep(0.3)   # several intervals' worth of time
+        # Poll with a generous overall timeout instead of trusting one fixed sleep: a single sleep(0.3) assumes
+        # the OS schedules this daemon thread with near-zero latency, which is not a safe assumption under
+        # system load (e.g. right after a long-running test suite) -- a real, observed flake, not a sign that
+        # the retry behaviour itself is broken. Polling still fails fast on the common case (usually well under
+        # 0.3s) and only needs the full budget when the machine is genuinely under load.
+        deadline = time.monotonic() + 5.0
+        while len(calls) < 2 and time.monotonic() < deadline:
+            time.sleep(0.02)
         assert len(calls) >= 2, "the loop should have retried after the first call raised"

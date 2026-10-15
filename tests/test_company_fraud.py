@@ -140,3 +140,139 @@ class TestAnalyzeStatisticImportance:
         groups = analyze_statistic_importance(x, y, names)
         total = sum(groups.values())
         assert abs(sum(100 * v / total for v in groups.values()) - 100.0) < 1e-6
+
+
+def _write_rich_split(tmp_path: Path, split: str, n_companies: int, seed: int) -> None:
+    """A larger, randomly-generated but internally-consistent split -- enough labelled windows per class for
+    run()'s LogisticRegression/RandomForest/etc. fits and the recall/precision sweep tables to produce real,
+    non-degenerate numbers, while keeping the exact same schema load_split()/build_window_features() expect.
+    """
+    rng = np.random.default_rng(seed)
+    company_rows, tx_rows, order_rows, tsid_rows, label_rows = [], [], [], [], []
+    tx_counter = 0
+    for ci in range(n_companies):
+        cid = f"company_{ci}"
+        company_rows.append([cid] + list(rng.normal(0, 1, 6)))
+        is_fraud = ci % 2 == 0   # exactly half fraudulent, half not -- both classes always present
+        wid = f"{cid}_window_0"
+        n_tx = rng.integers(2, 5)
+        shift = 3.0 if is_fraud else 0.0   # a real, learnable signal so the classifiers aren't fitting noise
+        for _ in range(n_tx):
+            tx_id = f"tx_{tx_counter}"
+            tx_counter += 1
+            tx_rows.append([tx_id] + list(rng.normal(shift, 1, 3)))
+            order_rows.append([tx_id, len(order_rows) + 1])
+            tsid_rows.append([tx_id, wid])
+        label_rows.append([wid, is_fraud])
+
+    pd.DataFrame(company_rows, columns=["", "0", "1", "2", "3", "4", "5"]).to_csv(
+        tmp_path / f"companies_{split}.csv", index=False)
+    pd.DataFrame(tx_rows, columns=["transactionId", "0", "1", "2"]).to_csv(
+        tmp_path / f"transactions_{split}.csv", index=False)
+    pd.DataFrame(order_rows, columns=["transactionId", "eventAt"]).to_csv(
+        tmp_path / f"event_order_{split}.csv", index=False)
+    pd.DataFrame(tsid_rows, columns=["transactionId", "time_series_ids"]).to_csv(
+        tmp_path / f"time_series_ids_{split}.csv", index=False)
+    pd.DataFrame(label_rows, columns=["", "isFraudUser"]).to_csv(
+        tmp_path / f"fraud_labels_{split}.csv", index=False)
+
+
+class TestRun:
+    """run() end-to-end: load both splits, build features, evaluate baselines, and (with the flags on) report
+    statistic importance and the recall/precision sweep tables -- all through logging, so these capture via
+    caplog rather than stdout."""
+
+    def test_default_run_logs_split_sizes_and_a_results_table(self, tmp_path, caplog):
+        import logging
+
+        from gnn_aml_core.company_fraud import run
+
+        _write_rich_split(tmp_path, "train", n_companies=20, seed=1)
+        _write_rich_split(tmp_path, "test", n_companies=10, seed=2)
+
+        with caplog.at_level(logging.INFO, logger="gnn_aml_core.company_fraud"):
+            run(tmp_path, seed=42, analyze=False, sweep=False)
+
+        text = caplog.text
+        assert "labelled windows" in text
+        assert "REAL-DATA RESULTS" in text
+        assert "Logistic Regression" in text
+
+    def test_analyze_flag_additionally_logs_statistic_importance(self, tmp_path, caplog):
+        import logging
+
+        from gnn_aml_core.company_fraud import run
+
+        _write_rich_split(tmp_path, "train", n_companies=20, seed=3)
+        _write_rich_split(tmp_path, "test", n_companies=10, seed=4)
+
+        with caplog.at_level(logging.INFO, logger="gnn_aml_core.company_fraud"):
+            run(tmp_path, seed=42, analyze=True, sweep=False)
+
+        assert "Which KIND of statistic carries the signal" in caplog.text
+
+    def test_sweep_flag_additionally_logs_recall_and_precision_tables(self, tmp_path, caplog):
+        import logging
+
+        from gnn_aml_core.company_fraud import run
+
+        _write_rich_split(tmp_path, "train", n_companies=20, seed=5)
+        _write_rich_split(tmp_path, "test", n_companies=10, seed=6)
+
+        with caplog.at_level(logging.INFO, logger="gnn_aml_core.company_fraud"):
+            run(tmp_path, seed=42, analyze=False, sweep=True)
+
+        text = caplog.text
+        assert "How far can RECALL be pushed" in text
+        assert "How far can PRECISION be pushed" in text
+
+    def test_both_analyze_and_sweep_can_run_together(self, tmp_path, caplog):
+        import logging
+
+        from gnn_aml_core.company_fraud import run
+
+        _write_rich_split(tmp_path, "train", n_companies=20, seed=7)
+        _write_rich_split(tmp_path, "test", n_companies=10, seed=8)
+
+        with caplog.at_level(logging.INFO, logger="gnn_aml_core.company_fraud"):
+            run(tmp_path, seed=42, analyze=True, sweep=True)
+
+        text = caplog.text
+        assert "Which KIND of statistic carries the signal" in text
+        assert "How far can RECALL be pushed" in text
+
+
+class TestMain:
+    def test_parses_args_and_calls_run_with_them(self, monkeypatch, tmp_path):
+        import sys
+
+        import gnn_aml_core.company_fraud as cfmod
+
+        captured = {}
+        monkeypatch.setattr(cfmod, "run", lambda data_dir, seed, analyze, sweep: captured.update(
+            data_dir=data_dir, seed=seed, analyze=analyze, sweep=sweep))
+        monkeypatch.setattr(sys, "argv", ["company_fraud.py", "--data", str(tmp_path), "--seed", "7",
+                                         "--analyze", "--sweep"])
+        cfmod.main()
+        assert captured == {"data_dir": tmp_path, "seed": 7, "analyze": True, "sweep": True}
+
+    def test_data_flag_is_required(self, monkeypatch):
+        import sys
+
+        import gnn_aml_core.company_fraud as cfmod
+
+        monkeypatch.setattr(sys, "argv", ["company_fraud.py"])  # no --data
+        with pytest.raises(SystemExit):
+            cfmod.main()
+
+    def test_analyze_and_sweep_default_to_false(self, monkeypatch, tmp_path):
+        import sys
+
+        import gnn_aml_core.company_fraud as cfmod
+
+        captured = {}
+        monkeypatch.setattr(cfmod, "run", lambda data_dir, seed, analyze, sweep: captured.update(
+            analyze=analyze, sweep=sweep))
+        monkeypatch.setattr(sys, "argv", ["company_fraud.py", "--data", str(tmp_path)])
+        cfmod.main()
+        assert captured == {"analyze": False, "sweep": False}

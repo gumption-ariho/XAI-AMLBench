@@ -1,54 +1,83 @@
 name: CI
 
+# Referenced by the badge in README.md -- keep this file at exactly this path.
 on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  test:
+  # Fast lane: aml_synth's own tests (graph generation, the typologies, adversarial/label-noise helpers) need
+  # only numpy/pandas/networkx/pyarrow -- no PyTorch. Runs on every supported Python version from pyproject.toml's
+  # classifiers so a generator change can't silently depend on one interpreter's dict-ordering or float quirks.
+  test-lite:
+    name: test (lite, py${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.10", "3.11"]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      - name: Install CPU-only PyTorch
-        run: pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cpu
+      - name: Install (no GNN/XAI extras -- this is the point of this job)
+        run: pip install -e ".[test]"
 
-      - name: Install the package (all extras, editable)
-        run: pip install -e ".[dev]"
+      - name: Compile check
+        run: python -m py_compile $(git ls-files '*.py')
 
-      - name: Run tests with coverage
-        run: pytest --cov --cov-report=term --cov-report=xml --cov-fail-under=80
+      # Tests that need torch/scipy use pytest.importorskip or the "torch" marker (see tests/conftest.py) and
+      # skip cleanly here rather than failing -- that's by design, not something this job should paper over
+      # with -k filters, since a skip is visible in the summary and a silently-excluded test is not.
+      - name: pytest
+        run: pytest -v
 
-      - name: Upload coverage report
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: coverage-py${{ matrix.python-version }}
-          path: coverage.xml
-
-  no-torch-smoke-test:
-    # Confirms that installing WITHOUT the [gnn] extra still works: aml_synth and xai_explainer, and the tests
-    # that don't need torch, run fine on a plain CPU-only install with no ML framework at all.
+  # Full lane: everything test-lite covers, plus the GNN model (gnn_aml_core), its API (torch_geometric,
+  # fastapi), and xai_explainer's GNNExplainer-dependent extraction path. One Python version only -- torch CPU
+  # wheels are the slow part of this job, and pyproject.toml's classifiers don't promise torch itself works
+  # identically across 3.10 vs 3.11, only that the pure-Python package does.
+  test-full:
+    name: test (full, py3.11 + torch CPU)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install the core package only (no gnn/xai extras)
-        run: pip install -e ".[test]"
-      - name: Generate a small synthetic graph
-        run: python -m aml_synth.graph_generator --accounts 500 --to csv --out /tmp/smoke
-      - name: Run the torch-independent tests
-        run: pytest tests/test_graph_generator.py tests/test_features.py tests/test_baselines.py tests/test_sar_generator.py -q
+          cache: pip
+
+      # CPU wheel from its own index first, same as gnn_aml_core/Dockerfile and install_all_requirements_v2.sh:
+      # the plain PyPI resolution for "torch" defaults to a multi-GB CUDA build neither this runner nor most
+      # contributors' laptops have a use for. numpy<2 alongside it for the same reason the Dockerfile pins it --
+      # torch 2.4.1 was built against NumPy 1.x.
+      - name: Install PyTorch (CPU)
+        run: pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cpu
+
+      - name: "Install (dev extras: gnn, xgboost, xai, kafka, neo4j, test)"
+        run: pip install "numpy<2" -e ".[dev]"
+
+      - name: pytest (with coverage)
+        run: pytest -v --cov --cov-report=term-missing --cov-report=xml
+        # No --cov-fail-under here: CONTRIBUTING.md's 80% bar applies to the module a given PR touches, not to
+        # the whole tree at once (several modules, e.g. backend/, are intentionally excluded from coverage --
+        # see pyproject.toml's [tool.coverage.run], "exercised by the stack checker rather than unit tests").
+        # A blanket repo-wide gate here would fail CI for reasons a contributor can't fix in their own PR.
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: ignore

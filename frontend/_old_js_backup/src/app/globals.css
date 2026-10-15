@@ -1,0 +1,28 @@
+:root {
+  --bg: #0f172a; --card: #1e293b; --line: #334155; --text: #e2e8f0; --muted: #94a3b8;
+  --accent: #38bdf8; --red: #f87171; --green: #4ade80; --amber: #fbbf24;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, Segoe UI, sans-serif; }
+main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 64px; }
+h1 { margin: 0 0 4px; font-size: 24px; }
+h2 { font-size: 16px; margin: 0 0 12px; }
+.sub { color: var(--muted); margin-bottom: 24px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+input { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; min-width: 220px; }
+button { background: var(--accent); color: #0b1220; border: 0; border-radius: 6px; padding: 8px 12px; font-weight: 600; cursor: pointer; }
+button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); }
+button.red { background: var(--red); } button.green { background: var(--green); }
+button:disabled { opacity: .5; cursor: wait; }
+.chip { font-size: 12px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); cursor: pointer; }
+.chip:hover { color: var(--text); }
+.pill { font-size: 12px; padding: 2px 8px; border-radius: 999px; font-weight: 600; }
+.open { background: #422006; color: var(--amber); } .confirmed { background: #450a0a; color: var(--red); } .dismissed { background: #052e16; color: var(--green); }
+.bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; width: 120px; }
+.bar > div { height: 100%; background: linear-gradient(90deg, var(--amber), var(--red)); }
+.narr { background: var(--bg); border-left: 3px solid var(--accent); padding: 10px 12px; margin: 10px 0; border-radius: 4px; white-space: pre-wrap; }
+.muted { color: var(--muted); font-size: 13px; }
+.err { color: var(--red); margin-top: 8px; }
+.alert { border-top: 1px solid var(--line); padding: 14px 0; }
+.alert:first-child { border-top: 0; }

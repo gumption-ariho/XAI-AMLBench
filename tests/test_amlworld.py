@@ -73,3 +73,131 @@ class TestLoadAmlworld:
         p.write_text("Timestamp,From Bank,Account\n2022-01-01,10,ACC001\n")
         with pytest.raises(ValueError, match="missing"):
             load_amlworld(p)
+
+
+class TestMain:
+    """main()'s own control flow: argument wiring, the --save/--no-baselines branches, and the
+    meets_auc_target/metrics computation -- with load_amlworld's real output but fit_gnn/evaluate_baselines/
+    save_serving_artifacts all mocked out, since actually training a real GATv2/RGCN model needs torch and
+    torch_geometric and belongs to gnn_aml_core.train's own test suite, not this module's argument-wiring
+    logic."""
+
+    def _install_mocks(self, monkeypatch, *, fit_gnn_result=None):
+        import gnn_aml_core.amlworld as aw
+
+        fake_arrays = {"x": np.zeros((3, 2)), "y": np.array([0.0, 1.0, 0.0]), "src_tx": np.array([0, 1]),
+                      "dst_tx": np.array([1, 2]), "edge_attr": np.zeros((2, 4)), "n_tx": 2}
+
+        import gnn_aml_core.train as train_mod
+        monkeypatch.setattr(train_mod, "arrays_from_frames", lambda accounts, tx: fake_arrays)
+        monkeypatch.setattr(train_mod, "make_splits", lambda y, seed=42: ([0], [1], [2]))
+
+        default_report = {"auc_roc": 0.91, "pr_auc": 0.5, "precision": 0.6, "recall": 0.7, "f1": 0.65,
+                          "fpr": 0.02, "threshold": 0.5}
+        fit_gnn_result = fit_gnn_result or {"report": default_report, "best_epoch": 42, "best_val_auc": 0.9,
+                                            "hparams": {"hidden": 64}, "calibration_report": {"ece": 0.01}}
+        monkeypatch.setattr(train_mod, "fit_gnn", lambda *a, **kw: fit_gnn_result)
+        monkeypatch.setattr(train_mod, "format_table", lambda table: "FORMATTED_TABLE")
+
+        save_calls = []
+        monkeypatch.setattr(train_mod, "save_serving_artifacts",
+                           lambda *a, **kw: save_calls.append((a, kw)))
+
+        baseline_calls = []
+        import gnn_aml_core.baselines as baselines_mod
+        monkeypatch.setattr(baselines_mod, "evaluate_baselines",
+                           lambda *a, **kw: baseline_calls.append((a, kw)) or {"Logistic Regression": default_report})
+
+        return save_calls, baseline_calls
+
+    def test_evaluation_only_run_does_not_save_and_logs_the_evaluation_only_notice(self, monkeypatch, tmp_path, caplog):
+        import logging
+        import sys
+
+        import gnn_aml_core.amlworld as aw
+
+        save_calls, _ = self._install_mocks(monkeypatch)
+        _write_fixture(tmp_path)
+        monkeypatch.setattr(sys, "argv", ["amlworld.py", "--data", str(tmp_path)])
+
+        with caplog.at_level(logging.INFO, logger="gnn_aml_core.amlworld"):
+            aw.main()
+
+        assert save_calls == []  # --save was not given -- nothing should be written
+        assert "evaluation only (no --save given)" in caplog.text
+
+    def test_no_baselines_flag_skips_the_baseline_evaluation(self, monkeypatch, tmp_path):
+        import sys
+
+        import gnn_aml_core.amlworld as aw
+
+        _, baseline_calls = self._install_mocks(monkeypatch)
+        _write_fixture(tmp_path)
+        monkeypatch.setattr(sys, "argv", ["amlworld.py", "--data", str(tmp_path), "--no-baselines"])
+
+        aw.main()
+        assert baseline_calls == []
+
+    def test_save_flag_writes_serving_artifacts_with_computed_metrics(self, monkeypatch, tmp_path):
+        import sys
+
+        import gnn_aml_core.amlworld as aw
+
+        save_calls, _ = self._install_mocks(monkeypatch)
+        _write_fixture(tmp_path)
+        out_dir = tmp_path / "out"
+        monkeypatch.setattr(sys, "argv", ["amlworld.py", "--data", str(tmp_path), "--save", "--out", str(out_dir),
+                                         "--auc-target", "0.85"])
+
+        aw.main()
+
+        assert len(save_calls) == 1
+        _, kwargs = save_calls[0]
+        metrics = kwargs["extra_metrics"] if "extra_metrics" in kwargs else None
+        # metrics passed as the positional `metrics` dict (3rd positional arg) carries meets_auc_target
+        args = save_calls[0][0]
+        passed_metrics = args[2]
+        assert passed_metrics["meets_auc_target"] is True  # 0.91 (mocked report) >= 0.85
+        assert passed_metrics["auc_target"] == 0.85
+        assert passed_metrics["test_auc_roc"] == 0.91
+
+    def test_meets_auc_target_is_false_when_the_real_auc_falls_short(self, monkeypatch, tmp_path):
+        import sys
+
+        import gnn_aml_core.amlworld as aw
+
+        low_report = {"auc_roc": 0.80, "pr_auc": 0.5, "precision": 0.6, "recall": 0.7, "f1": 0.65,
+                     "fpr": 0.02, "threshold": 0.5}
+        save_calls, _ = self._install_mocks(monkeypatch, fit_gnn_result={
+            "report": low_report, "best_epoch": 10, "best_val_auc": 0.8,
+            "hparams": {"hidden": 32}, "calibration_report": {"ece": 0.02}})
+        _write_fixture(tmp_path)
+        monkeypatch.setattr(sys, "argv", ["amlworld.py", "--data", str(tmp_path), "--save",
+                                         "--out", str(tmp_path / "out"), "--auc-target", "0.87"])
+
+        aw.main()
+        passed_metrics = save_calls[0][0][2]
+        assert passed_metrics["meets_auc_target"] is False
+
+    def test_model_choice_is_threaded_through_to_fit_gnn_kwargs(self, monkeypatch, tmp_path):
+        import sys
+
+        import gnn_aml_core.amlworld as aw
+        import gnn_aml_core.train as train_mod
+
+        self._install_mocks(monkeypatch)
+        captured = {}
+
+        def fake_fit_gnn(arrays, tr, va, te, **kw):
+            captured.update(kw)
+            return {"report": {"auc_roc": 0.9, "pr_auc": 0.5, "precision": 0.6, "recall": 0.7, "f1": 0.6,
+                              "fpr": 0.02, "threshold": 0.5}, "best_epoch": 1, "best_val_auc": 0.9,
+                   "hparams": {}, "calibration_report": {}}
+
+        monkeypatch.setattr(train_mod, "fit_gnn", fake_fit_gnn)
+        _write_fixture(tmp_path)
+        monkeypatch.setattr(sys, "argv", ["amlworld.py", "--data", str(tmp_path), "--model", "rgcn"])
+
+        aw.main()
+        assert captured["model_name"] == "rgcn"
+        assert "edge_dim" not in captured  # edge_dim is only passed for gatv2, never for rgcn

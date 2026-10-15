@@ -93,3 +93,107 @@ class TestEmbeddingsPlusBoosting:
         key = next(iter(result))
         assert "GATV2" in key
         assert "auc_roc" in result[key]
+
+
+class TestMain:
+    """main()'s own CLI/control-flow logic -- with load_elliptic/search_gnn/embeddings_plus_boosting/
+    evaluate_baselines all mocked out (no real Elliptic data or PyTorch needed), since the actual training
+    behaviour each of those calls into is already covered by their own modules' test suites. What's checked
+    here is main()'s own wiring: --skip-rgcn, which results end up in the final table, and which one gets
+    reported as "best"."""
+
+    def _report(self, auc, f1=0.5):
+        return {"auc_roc": auc, "f1": f1, "pr_auc": 0.5, "precision": 0.5, "recall": 0.5, "fpr": 0.02,
+               "threshold": 0.5}
+
+    def _install_mocks(self, monkeypatch):
+        import gnn_aml_core.elliptic_search as es
+
+        fake_arrays = {"x": None, "y": None, "edge_attr": None, "src_tx": None, "dst_tx": None}
+        monkeypatch.setattr(es, "load_elliptic", lambda data: fake_arrays)
+        monkeypatch.setattr(es, "elliptic_splits", lambda arrays, split, cutoff, seed: ([0], [1], [2]))
+
+        search_calls = []
+
+        def fake_search_gnn(arrays, tr, va, te, model_name, grid, epochs, patience, seed):
+            search_calls.append(model_name)
+            auc = 0.80 if model_name == "gatv2" else 0.60
+            return {"hp": {"hidden": 64, "layers": 2, "lr": 0.005}, "best_val_auc": auc,
+                   "report": self._report(auc), "state_dict": {}}
+
+        monkeypatch.setattr(es, "search_gnn", fake_search_gnn)
+
+        embed_calls = []
+
+        def fake_embeddings_plus_boosting(arrays, best_gnn, model_name, tr, va, te, seed):
+            embed_calls.append(model_name)
+            auc = 0.70 if model_name == "gatv2" else 0.55
+            return {f"boosting on {model_name.upper()}'s embeddings": self._report(auc)}
+
+        monkeypatch.setattr(es, "embeddings_plus_boosting", fake_embeddings_plus_boosting)
+
+        import gnn_aml_core.baselines as baselines_mod
+        monkeypatch.setattr(baselines_mod, "evaluate_baselines",
+                           lambda *a, **kw: {"Logistic Regression": self._report(0.65)})
+
+        import gnn_aml_core.train as train_mod
+        monkeypatch.setattr(train_mod, "format_table", lambda table: "FORMATTED")
+
+        return search_calls, embed_calls
+
+    def test_default_run_searches_and_embeds_both_architectures(self, monkeypatch):
+        import sys
+
+        import gnn_aml_core.elliptic_search as es
+
+        search_calls, embed_calls = self._install_mocks(monkeypatch)
+        monkeypatch.setattr(sys, "argv", ["elliptic_search.py", "--data", "fake_dir"])
+
+        es.main()
+
+        assert search_calls == ["gatv2", "rgcn"]
+        assert embed_calls == ["gatv2", "rgcn"]
+
+    def test_skip_rgcn_flag_skips_rgcn_entirely(self, monkeypatch):
+        import sys
+
+        import gnn_aml_core.elliptic_search as es
+
+        search_calls, embed_calls = self._install_mocks(monkeypatch)
+        monkeypatch.setattr(sys, "argv", ["elliptic_search.py", "--data", "fake_dir", "--skip-rgcn"])
+
+        es.main()
+
+        assert search_calls == ["gatv2"]
+        assert embed_calls == ["gatv2"]
+
+    def test_the_actual_best_result_across_gnn_boosting_and_baselines_is_reported(self, monkeypatch, caplog):
+        import logging
+        import sys
+
+        import gnn_aml_core.elliptic_search as es
+
+        self._install_mocks(monkeypatch)
+        # mocked AUCs: GATv2 tuned 0.80, RGCN tuned 0.60, boosting-on-GATv2-embeddings 0.70,
+        # boosting-on-RGCN-embeddings 0.55, Logistic Regression 0.65 -- GATv2 (tuned) is the real max of all
+        monkeypatch.setattr(sys, "argv", ["elliptic_search.py", "--data", "fake_dir"])
+
+        with caplog.at_level(logging.INFO, logger="gnn_aml_core.elliptic_search"):
+            es.main()
+
+        assert "Best result found: 'GATv2 (tuned:" in caplog.text
+        assert "AUC 0.800" in caplog.text
+
+    def test_default_split_is_temporal(self, monkeypatch):
+        import sys
+
+        import gnn_aml_core.elliptic_search as es
+
+        captured = {}
+        self._install_mocks(monkeypatch)
+        monkeypatch.setattr(es, "elliptic_splits",
+                           lambda arrays, split, cutoff, seed: (captured.update(split=split) or ([0], [1], [2])))
+        monkeypatch.setattr(sys, "argv", ["elliptic_search.py", "--data", "fake_dir"])
+
+        es.main()
+        assert captured["split"] == "temporal"

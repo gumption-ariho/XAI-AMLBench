@@ -37,7 +37,25 @@ A real, confirmed gotcha this loader handles: "Account" alone is not a globally 
 same account number can recur under different banks across its ~30,000 banks) -- account ids here are always
 Bank+Account combined.
 
-    python -m gnn_aml_core.amlworld --data data/amlworld --file LI-Small_Trans.csv
+    python -m gnn_aml_core.amlworld --data data/amlworld --file LI-Small_Trans.csv              # evaluate only
+    python -m gnn_aml_core.amlworld --data data/amlworld --file LI-Small_Trans.csv --save        # evaluate AND
+                                                                                                   # write a live,
+                                                                                                   # servable checkpoint
+
+By default this only evaluates and prints a score table (the comparison-to-literature use case above). Pass
+--save to ALSO write gnn_model.pt / graph.pt / metrics.json to --out (default "models") -- the exact files
+gnn_aml_core.main's serving API, the frontend, and gnn_aml_core.anomaly (Model 2) all read. There is no separate
+"which dataset is live" switch anywhere in this project: whichever dataset's files were written there LAST is
+what the running stack serves. After running with --save, restart (or --build, since the frontend doesn't need
+a rebuild for this but the gnn-detection-api / anomaly-detector containers need the new models/ picked up):
+
+    docker compose --profile ml up -d --force-recreate gnn-detection-api anomaly-detector feedback-drift-monitor
+
+Model 2's own anomaly_autoencoder.pt checkpoint is NOT touched by this and will try to warm-start from whatever
+it last learned -- almost certainly tuned to a completely different dataset's notion of "normal" after a swap.
+Delete it first so Model 2 starts learning this dataset's own normal population fresh:
+
+    rm -f models/anomaly_autoencoder.pt
 """
 from __future__ import annotations
 
@@ -117,7 +135,7 @@ def load_amlworld(trans_csv: str | Path) -> tuple[pd.DataFrame, pd.DataFrame]:
 def main() -> None:
     from gnn_aml_core.baselines import evaluate_baselines
     from gnn_aml_core.train import arrays_from_frames, format_table, make_splits
-    from gnn_aml_core.train import fit_gnn
+    from gnn_aml_core.train import fit_gnn, save_serving_artifacts
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -130,6 +148,12 @@ def main() -> None:
     ap.add_argument("--patience", type=int, default=6)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--no-baselines", action="store_true")
+    ap.add_argument("--save", action="store_true",
+                    help="ALSO write a live, servable checkpoint (gnn_model.pt/graph.pt/metrics.json) to --out, "
+                         "so the running backend/frontend/Model 2 serve this real AMLworld-trained model instead "
+                         "of just printing an evaluation table")
+    ap.add_argument("--out", type=Path, default=Path("models"), help="where to write the checkpoint when --save is given")
+    ap.add_argument("--auc-target", type=float, default=0.87, help="only used for the meets_auc_target field when --save is given")
     a = ap.parse_args()
 
     accounts, tx = load_amlworld(a.data / a.file)
@@ -147,11 +171,39 @@ def main() -> None:
     model_kwargs = {"edge_dim": arrays["edge_attr"].shape[1]} if a.model == "gatv2" else {}
     res = fit_gnn(arrays, tr, va, te, model_name=a.model, epochs=a.epochs, patience=a.patience, seed=a.seed, **model_kwargs)
     table = {f"GNN ({a.model.upper()}, best epoch {res['best_epoch']})": res["report"]}
+    baselines = {}
     if not a.no_baselines:
-        table.update(evaluate_baselines(arrays["x"], arrays["y"], tr, va, te,
-                                        edges=(arrays["src_tx"], arrays["dst_tx"]), seed=a.seed))
+        baselines = evaluate_baselines(arrays["x"], arrays["y"], tr, va, te,
+                                       edges=(arrays["src_tx"], arrays["dst_tx"]), seed=a.seed)
+        table.update(baselines)
     log.info("REAL-WORLD RESULTS on IBM AMLworld (%s, account-level aggregation of the real per-transaction "
              "label)\n%s", a.file, format_table(table))
+
+    if not a.save:
+        log.info("evaluation only (no --save given) -- the running stack still serves whatever dataset last "
+                 "wrote models/graph.pt. Re-run with --save to make THIS run the live one.")
+        return
+
+    rep = res["report"]
+    metrics = {
+        "val_auc_roc": res["best_val_auc"], "best_epoch": res["best_epoch"], "test_auc_roc": rep["auc_roc"],
+        "test_pr_auc": rep["pr_auc"], "test_precision": rep["precision"], "test_recall": rep["recall"],
+        "test_f1": rep["f1"], "test_fpr": rep["fpr"], "threshold": rep["threshold"],
+        "auc_target": a.auc_target, "meets_auc_target": bool(rep["auc_roc"] >= a.auc_target),
+        **{f"calibration_{k}": v for k, v in res["calibration_report"].items()},
+    }
+    save_serving_artifacts(arrays, res, metrics, model_name=a.model, hp=res["hparams"], out_dir=a.out, extra_metrics={
+        "model": a.model, "hparams": res["hparams"], "epochs": a.epochs, "seed": a.seed,
+        "n_nodes": len(accounts), "n_transactions": arrays["n_tx"], "positive_rate": float(accounts["is_suspicious"].mean()),
+        "baselines": baselines, "source_dataset": "amlworld", "source_file": str(a.file),
+    })
+    log.warning("Live checkpoint written to %s from REAL AMLworld data (%s). Restart the serving containers to "
+                "pick it up:\n"
+                "    docker compose --profile ml up -d --force-recreate gnn-detection-api anomaly-detector feedback-drift-monitor\n"
+                "Model 2's own anomaly_autoencoder.pt was NOT touched and will otherwise warm-start its notion of "
+                "'normal' from weights tuned to a different dataset -- delete it first so Model 2 learns this "
+                "dataset's own normal population from scratch:\n"
+                "    rm -f %s/anomaly_autoencoder.pt", a.out, a.file, a.out)
 
 
 if __name__ == "__main__":

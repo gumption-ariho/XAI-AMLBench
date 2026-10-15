@@ -1,0 +1,24 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs: [{ targets: ["localhost:9090"] }]
+
+  - job_name: traefik
+    static_configs: [{ targets: ["traefik-edge-router:8082"] }]
+
+  # Requires /metrics in the FastAPI apps (prometheus-fastapi-instrumentator)
+  - job_name: gnn-detection-api
+    metrics_path: /metrics
+    static_configs: [{ targets: ["gnn-detection-api:8000"] }]
+
+  - job_name: xai-narrative-api
+    metrics_path: /metrics
+    static_configs: [{ targets: ["xai-narrative-api:8000"] }]
+
+  - job_name: immudb
+    static_configs: [{ targets: ["immudb-audit-ledger:9497"] }]
+
+  # GPU temperature needs NVIDIA dcgm-exporter (not one of the 14 containers).
+  # Add it later and scrape it here.

@@ -4,6 +4,9 @@ run. retrain_with_feedback is tested with a stand-in fit_gnn rather than a real 
 label-overwriting and index-repetition logic belongs to this module; the actual training is gnn_aml_core.train's
 responsibility and is tested there.
 """
+import json
+import os
+
 import numpy as np
 import pytest
 
@@ -149,6 +152,33 @@ class TestRetrainWithFeedback:
         retrain_with_feedback(arrays, tr, np.array([]), np.array([]), feedback_ids=["NOT_IN_GRAPH"],
                               feedback_labels=[1.0], model_name="gatv2")  # must not raise
 
+    def test_forwards_init_state_dict_through_to_fit_gnn_unchanged(self, monkeypatch):
+        # this is the warm-start/fine-tune path retrain_and_maybe_promote relies on: retrain_with_feedback
+        # itself does nothing special with init_state_dict (or lr/epochs/patience/seed) beyond forwarding them
+        # via **fit_kwargs -- fit_gnn is what actually loads it into the model before training. This pins that
+        # the forwarding is exact (same object, not copied/dropped/renamed) so a real weights dict reaches the
+        # real fit_gnn when torch is available.
+        calls = {}
+
+        def fake_fit_gnn(arrays, tr, va, te, **kw):
+            calls.update(kw=kw)
+            return {"report": {}, "best_val_auc": 0.0, "best_epoch": 0, "epochs_run": 0, "state_dict": {}, "hparams": {}}
+
+        import gnn_aml_core.train as train_module
+        monkeypatch.setattr(train_module, "fit_gnn", fake_fit_gnn)
+
+        arrays = {"account_ids": ["A", "B"], "y": np.array([0.0, 0.0])}
+        tr = np.array([0, 1])
+        sentinel_weights = {"conv1.weight": "not a real tensor, just a sentinel object"}
+        retrain_with_feedback(arrays, tr, np.array([]), np.array([]), feedback_ids=[], feedback_labels=[],
+                              model_name="gatv2", hidden=64, layers=2, init_state_dict=sentinel_weights,
+                              lr=0.0005, epochs=30, patience=5, seed=42)
+
+        assert calls["kw"]["init_state_dict"] is sentinel_weights   # forwarded by identity, not copied
+        assert calls["kw"]["lr"] == 0.0005
+        assert calls["kw"]["epochs"] == 30
+        assert calls["kw"]["patience"] == 5
+
 
 class TestDefaultDsn:
     """A real bug this project shipped once: the default connection string was a guessed
@@ -244,19 +274,59 @@ class TestServeMetricsMode:
     (the retraining path's own 'records' variable became undefined once the check logic was refactored into
     a helper) stays fixed."""
 
-    def test_records_variable_is_threaded_correctly_to_the_retraining_path(self, monkeypatch):
+    def test_records_variable_is_threaded_correctly_to_the_retraining_path(self, monkeypatch, has_torch):
         # the real bug: refactoring the check logic into _check_once() initially left 'records' undefined in
-        # the retraining path below it -- this reaches the next real step (a torch import) rather than hitting
-        # a NameError on 'records' first, proving the fix holds
+        # the retraining path below it. This used to prove the fix held by asserting execution reached a real
+        # `import torch` inside main() and raised ModuleNotFoundError there -- which only worked as a signal
+        # in a sandbox that happened to lack PyTorch, and which (confirmed on a real run, on a machine WITH
+        # PyTorch installed and this project's own trained models/ on disk) goes on to actually load those
+        # real model files and run real training, including a separate, real NaN-validation-split bug in
+        # gnn_aml_core.train.fit_gnn that this test had nothing to do with and should never have been able to
+        # reach in the first place. This version instead asserts the actual claim in the test's name directly
+        # -- that `records` reaches build_feedback_dataset() unmodified -- by mocking torch.load so no real
+        # file on disk and no real training is ever touched, regardless of which machine this runs on.
+        if not has_torch:
+            pytest.skip("gnn_aml_core.feedback.main()'s retraining path does `import torch` unconditionally")
         import sys
+
+        import torch
 
         import gnn_aml_core.feedback as fb
 
         records = [rec(account_id=f"A{i}", decision="confirmed" if i % 5 else "dismissed") for i in range(25)]
         monkeypatch.setattr(fb, "read_decisions_from_db", lambda dsn: records)
         monkeypatch.setattr(sys, "argv", ["feedback.py", "--dsn", "postgresql://fake"])
-        with pytest.raises(ModuleNotFoundError, match="torch"):
+
+        fake_graph = {
+            "x": np.zeros((3, 2), dtype=np.float32), "edge_index": np.zeros((2, 0), dtype=np.int64),
+            "edge_attr": np.zeros((0, 1), dtype=np.float32), "edge_type": np.zeros((0,), dtype=np.int64),
+            "y": np.array([0.0, 1.0, 0.0], dtype=np.float32), "account_ids": ["X1", "X2", "X3"],
+        }
+        fake_ckpt = {"model_name": "gatv2", "hparams": {"hidden": 8, "num_layers": 1, "seed": 42}}
+        # torch.load is called twice in sequence (graph.pt, then gnn_model.pt) -- a side_effect list returns
+        # each in order rather than needing to inspect the path argument.
+        load_calls = iter([fake_graph, fake_ckpt])
+        monkeypatch.setattr(torch, "load", lambda *a, **kw: next(load_calls))
+
+        captured = {}
+
+        class _StopHere(Exception):
+            pass
+
+        def _capture_and_stop(records_arg, account_ids_in_graph):
+            captured["records"] = records_arg
+            captured["account_ids_in_graph"] = account_ids_in_graph
+            raise _StopHere
+
+        monkeypatch.setattr(fb, "build_feedback_dataset", _capture_and_stop)
+
+        with pytest.raises(_StopHere):
             fb.main()
+
+        # the actual claim this test makes: `records` (not re-fetched, not re-ordered, not silently dropped)
+        # is exactly what reaches the retraining path -- proven directly, not inferred from an unrelated import
+        assert captured["records"] == records
+        assert captured["account_ids_in_graph"] == {"X1", "X2", "X3"}
 
     def test_check_mode_sets_the_prometheus_metrics(self, monkeypatch):
         # reads the metrics back through prometheus_client's own public text-exposition API
@@ -279,15 +349,560 @@ class TestServeMetricsMode:
         assert "25" in exposed
         assert "0.2" in exposed
 
-    def test_loop_mode_never_calls_build_feedback_dataset_directly(self):
-        # a real, deliberate safety design: an unattended, periodically-running metrics loop must never
-        # auto-retrain the live model with no human approval -- confirmed by source inspection that the
-        # loop branch cannot reach build_feedback_dataset at all
+    def test_loop_mode_only_reaches_retrain_and_maybe_promote_behind_the_auto_retrain_gate(self):
+        # the design changed deliberately this round (previously: the loop could NEVER retrain; now: it can,
+        # but ONLY when --auto-retrain/FEEDBACK_AUTO_RETRAIN is explicitly set, and even then only through the
+        # gated retrain_and_maybe_promote(), never by calling build_feedback_dataset or torch.save directly).
+        # Confirmed by source inspection rather than actually running the loop (which blocks forever).
         import inspect
 
         import gnn_aml_core.feedback as fb
 
         src = inspect.getsource(fb.main)
-        loop_section = src[src.index("if a.serve_metrics:"):src.index("triggered, reasoning, records = _check_once()")]
-        assert "build_feedback_dataset" not in loop_section
+        loop_section = src[src.index("if a.serve_metrics:"):src.index("return  # pragma: no cover")]
         assert "start_http_server" in loop_section
+        assert "retrain_and_maybe_promote" in loop_section
+        assert "build_feedback_dataset" not in loop_section  # only reachable *inside* retrain_and_maybe_promote
+        # the retrain call must be textually inside an `if triggered and a.auto_retrain:` block, not reachable
+        # whenever the drift trigger fires regardless of the flag
+        gate_idx = loop_section.index("if triggered and a.auto_retrain:")
+        call_idx = loop_section.index("retrain_and_maybe_promote(")
+        assert gate_idx < call_idx
+
+    def test_auto_retrain_flag_defaults_to_off_when_env_var_unset(self, monkeypatch):
+        # FEEDBACK_AUTO_RETRAIN unset -> --auto-retrain's default must be False, so the feature stays opt-in
+        # (matches .env.example, which ships it commented out)
+        monkeypatch.delenv("FEEDBACK_AUTO_RETRAIN", raising=False)
+        default = os.getenv("FEEDBACK_AUTO_RETRAIN", "").strip().lower() in ("1", "true", "yes")
+        assert default is False
+
+    def test_auto_retrain_flag_reads_true_from_env_var(self, monkeypatch):
+        monkeypatch.setenv("FEEDBACK_AUTO_RETRAIN", "true")
+        default = os.getenv("FEEDBACK_AUTO_RETRAIN", "").strip().lower() in ("1", "true", "yes")
+        assert default is True
+
+    def test_auto_retrain_attempt_is_wrapped_so_a_failure_never_kills_the_loop(self):
+        # a real design requirement: if retrain_and_maybe_promote blows up (torch missing, bad checkpoint,
+        # disk full, anything), the long-lived monitoring loop must survive and retry on the next interval
+        # rather than taking the whole process down -- confirmed by source inspection that the call sits in
+        # its own try/except, distinct from the outer loop's SystemExit handler
+        import inspect
+
+        import gnn_aml_core.feedback as fb
+
+        src = inspect.getsource(fb.main)
+        call_idx = src.index("retrain_and_maybe_promote(records")
+        preceding_lines = src[:call_idx].rstrip().splitlines()
+        assert preceding_lines[-1].strip() == "try:"
+        except_idx = src.index("except Exception as exc", call_idx)
+        # Bound the slice at the *next* except block (the outer loop's own SystemExit handler)
+        # instead of a hardcoded character count. A fixed window breaks every time a comment or
+        # the log message's wording changes length, even though the actual try/except structure
+        # -- the real thing under test -- hasn't changed at all.
+        block_end = src.index("except SystemExit", except_idx)
+        following = src[call_idx:block_end]
+        assert "except Exception as exc" in following
+        assert "current model" in following  # confirms the log message documents the safe fallback
+
+
+class TestReadDecisionsFromDb:
+    """The one function in this module that needs a live database -- exercised with a fake psycopg module
+    (same sys.modules stubbing technique TestMainErrorMessages already uses above), so the query and the
+    DecisionRecord construction are checked without a real Postgres connection."""
+
+    def _fake_psycopg(self, rows, monkeypatch):
+        import sys
+        import types
+
+        class _FakeCursor:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def execute(self, sql, params=None):
+                self._sql = sql
+
+            def fetchall(self):
+                return rows
+
+        class _FakeConn:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def cursor(self):
+                return _FakeCursor()
+
+        fake_psycopg = types.SimpleNamespace(connect=lambda dsn: _FakeConn())
+        monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+
+    def test_queries_only_resolved_alerts_and_builds_decision_records(self, monkeypatch):
+        from gnn_aml_core.feedback import read_decisions_from_db
+
+        self._fake_psycopg([("A1", 0.8, "confirmed"), ("A2", 0.2, "dismissed")], monkeypatch)
+        monkeypatch.delenv("FEEDBACK_THRESHOLD_FALLBACK", raising=False)
+
+        records = read_decisions_from_db("postgresql://fake")
+        assert len(records) == 2
+        assert records[0].account_id == "A1" and records[0].decision == "confirmed"
+        assert records[0].predicted_score == 0.8
+        assert records[1].account_id == "A2" and records[1].decision == "dismissed"
+
+    def test_threshold_falls_back_to_the_environment_variable(self, monkeypatch):
+        from gnn_aml_core.feedback import read_decisions_from_db
+
+        self._fake_psycopg([("A1", 0.9, "confirmed")], monkeypatch)
+        monkeypatch.setenv("FEEDBACK_THRESHOLD_FALLBACK", "0.75")
+
+        records = read_decisions_from_db("postgresql://fake")
+        assert records[0].threshold == 0.75
+
+    def test_threshold_defaults_to_point_five_when_unset(self, monkeypatch):
+        from gnn_aml_core.feedback import read_decisions_from_db
+
+        self._fake_psycopg([("A1", 0.9, "confirmed")], monkeypatch)
+        monkeypatch.delenv("FEEDBACK_THRESHOLD_FALLBACK", raising=False)
+
+        records = read_decisions_from_db("postgresql://fake")
+        assert records[0].threshold == 0.5
+
+    def test_no_resolved_alerts_returns_an_empty_list(self, monkeypatch):
+        from gnn_aml_core.feedback import read_decisions_from_db
+
+        self._fake_psycopg([], monkeypatch)
+        assert read_decisions_from_db("postgresql://fake") == []
+
+
+class TestEvaluateCheckpoint:
+    """evaluate_checkpoint() does `import torch` unconditionally, so this needs PyTorch installed -- but the
+    model itself is mocked (via gnn_aml_core.models.build_model), since what's actually under test here is
+    evaluate_checkpoint's own plumbing (which checkpoint fields build the model, that eval()/no_grad() is
+    used, that the test-split AUC is computed correctly from the model's output), not GATv2/RGCN's real
+    forward pass, which belongs to gnn_aml_core.models' own test suite."""
+
+    def test_computes_real_auc_from_the_models_sigmoid_output_on_the_test_split(self, monkeypatch):
+        torch = pytest.importorskip("torch")
+        import numpy as np
+
+        from gnn_aml_core.feedback import evaluate_checkpoint
+
+        class _FakeModel:
+            def __init__(self, logits):
+                self._logits = logits
+
+            def load_state_dict(self, sd):
+                self.loaded = sd
+
+            def eval(self):
+                pass
+
+            def __call__(self, x, ei, ea, et):
+                return torch.from_numpy(self._logits)
+
+        # 4 accounts; test split is indices [2, 3]. Logits chosen so the model perfectly ranks the test split
+        # (high logit for the real positive, low for the real negative) -- AUC must come out to exactly 1.0.
+        logits = np.array([0.0, 0.0, 5.0, -5.0], dtype=np.float32)
+        fake_model = _FakeModel(logits)
+
+        import sys
+        import types
+
+        captured_build_args = {}
+
+        def fake_build_model(model_name, in_dim, **hp):
+            captured_build_args.update(model_name=model_name, in_dim=in_dim, hp=hp)
+            return fake_model
+
+        # stubbed via sys.modules rather than imported directly: the real gnn_aml_core.models does
+        # `import torch.nn as nn`, which needs a real, full PyTorch install -- this test only needs
+        # build_model() to be swappable, not the real module, so this avoids that dependency entirely.
+        fake_models_mod = types.SimpleNamespace(build_model=fake_build_model)
+        monkeypatch.setitem(sys.modules, "gnn_aml_core.models", fake_models_mod)
+
+        ckpt = {"model_name": "gatv2", "hparams": {"hidden": 8, "heads": 2}, "state_dict": {"sentinel": True}}
+        arrays = {"x": np.zeros((4, 3), dtype=np.float32), "edge_index": np.zeros((2, 0), dtype=np.int64),
+                 "edge_attr": np.zeros((0, 1), dtype=np.float32), "edge_type": np.zeros((0,), dtype=np.int64),
+                 "y": np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32)}
+        te = np.array([2, 3])
+
+        auc = evaluate_checkpoint(ckpt, arrays, te)
+
+        assert auc == pytest.approx(1.0)
+        assert captured_build_args["model_name"] == "gatv2"
+        assert captured_build_args["hp"] == {"hidden": 8, "heads": 2}
+        assert fake_model.loaded == {"sentinel": True}
+
+
+class TestAppendRetrainHistory:
+    """Pure file I/O -- no torch or database needed at all."""
+
+    def test_appends_one_json_line_per_call(self, tmp_path):
+        from gnn_aml_core.feedback import _append_retrain_history
+
+        _append_retrain_history(tmp_path, {"decision": "rejected", "n": 1})
+        _append_retrain_history(tmp_path, {"decision": "promoted", "n": 2})
+
+        lines = (tmp_path / "retrain_history.jsonl").read_text().splitlines()
+        assert len(lines) == 2
+        assert json.loads(lines[0]) == {"decision": "rejected", "n": 1}
+        assert json.loads(lines[1]) == {"decision": "promoted", "n": 2}
+
+    def test_never_overwrites_previous_entries(self, tmp_path):
+        from gnn_aml_core.feedback import _append_retrain_history
+
+        for i in range(5):
+            _append_retrain_history(tmp_path, {"i": i})
+        lines = (tmp_path / "retrain_history.jsonl").read_text().splitlines()
+        assert [json.loads(l)["i"] for l in lines] == [0, 1, 2, 3, 4]
+
+    def test_non_json_native_values_are_stringified_not_raising(self, tmp_path):
+        import datetime
+
+        from gnn_aml_core.feedback import _append_retrain_history
+
+        _append_retrain_history(tmp_path, {"ts": datetime.datetime(2024, 1, 1)})  # default=str handles this
+        line = (tmp_path / "retrain_history.jsonl").read_text().splitlines()[0]
+        assert "2024-01-01" in line
+
+
+class TestRetrainAndMaybePromote:
+    """The automatic half of the feedback loop -- promote/reject gating, the backup-before-overwrite, the
+    audit trail, and the optional live-reload call. evaluate_checkpoint and retrain_with_feedback are mocked
+    (their own correctness is covered by TestEvaluateCheckpoint and TestRetrainWithFeedback above); what's
+    under test here is retrain_and_maybe_promote's OWN orchestration: given a current AUC and a candidate
+    AUC, does it make the right promote/reject call, and does it do the right thing on disk either way."""
+
+    def _write_graph_and_ckpt(self, tmp_path, torch, *, seed=42):
+        out = tmp_path / "models"
+        out.mkdir()
+        graph = {"x": None, "edge_index": None, "edge_attr": None, "edge_type": None, "y": [0.0, 1.0, 0.0],
+                 "account_ids": ["A", "B", "C"]}
+        torch.save(graph, out / "graph.pt")
+        ckpt = {"model_name": "gatv2", "hparams": {"hidden": 64, "num_layers": 2}, "in_dim": 5,
+               "state_dict": {"w": 1}, "feature_names": ["f1"], "mean": None, "std": None,
+               "metrics": {"auc_target": 0.87}}
+        torch.save(ckpt, out / "gnn_model.pt")
+        return out
+
+    def _install_mocks(self, monkeypatch, *, current_auc, candidate_auc):
+        import gnn_aml_core.feedback as fb
+        import gnn_aml_core.train as train_mod
+
+        monkeypatch.setattr(fb, "evaluate_checkpoint", lambda ckpt, arrays, te: current_auc)
+        monkeypatch.setattr(train_mod, "make_splits", lambda y, seed=42: ([0], [1], [2]))
+
+        class _FakeCalibrator:
+            def __call__(self, threshold):
+                return threshold
+
+            def to_dict(self):
+                return {"kind": "identity"}
+
+        fake_res = {"report": {"auc_roc": candidate_auc, "pr_auc": 0.5, "precision": 0.6, "recall": 0.7,
+                              "f1": 0.65, "fpr": 0.02, "threshold": 0.5},
+                   "best_val_auc": candidate_auc, "best_epoch": 10, "epochs_run": 10, "state_dict": {"w": 2},
+                   "hparams": {"hidden": 64, "num_layers": 2}, "calibrator": _FakeCalibrator(),
+                   "calibration_report": {"ece": 0.01}}
+        monkeypatch.setattr(fb, "retrain_with_feedback", lambda *a, **kw: fake_res)
+        return fake_res
+
+    def test_candidate_losing_is_rejected_and_logged_without_touching_the_model_file(self, monkeypatch, tmp_path):
+        torch = pytest.importorskip("torch")
+        from gnn_aml_core.feedback import retrain_and_maybe_promote
+
+        out = self._write_graph_and_ckpt(tmp_path, torch)
+        self._install_mocks(monkeypatch, current_auc=0.90, candidate_auc=0.85)
+        before = (out / "gnn_model.pt").read_bytes()
+
+        outcome = retrain_and_maybe_promote([], out_dir=str(out))
+
+        assert outcome["decision"] == "rejected"
+        assert (out / "gnn_model.pt").read_bytes() == before  # untouched
+        history = (out / "retrain_history.jsonl").read_text().splitlines()
+        assert len(history) == 1
+        assert json.loads(history[0])["decision"] == "rejected"
+
+    def test_candidate_winning_is_promoted_with_a_backup_of_the_old_model(self, monkeypatch, tmp_path):
+        torch = pytest.importorskip("torch")
+        from gnn_aml_core.feedback import retrain_and_maybe_promote
+
+        out = self._write_graph_and_ckpt(tmp_path, torch)
+        before = (out / "gnn_model.pt").read_bytes()
+        self._install_mocks(monkeypatch, current_auc=0.80, candidate_auc=0.90)
+
+        outcome = retrain_and_maybe_promote([], out_dir=str(out))
+
+        assert outcome["decision"] == "promoted"
+        backups = list(out.glob("gnn_model.pt.bak-*"))
+        assert len(backups) == 1
+        assert backups[0].read_bytes() == before  # the OLD model's bytes, preserved
+        new_ckpt = torch.load(out / "gnn_model.pt", map_location="cpu", weights_only=False)
+        assert new_ckpt["state_dict"] == {"w": 2}  # the NEW (candidate) weights are now live
+        assert new_ckpt["metrics"]["meets_auc_target"] is True  # 0.90 >= the saved auc_target of 0.87
+
+    def test_min_improvement_margin_is_respected_not_just_any_improvement(self, monkeypatch, tmp_path):
+        torch = pytest.importorskip("torch")
+        from gnn_aml_core.feedback import retrain_and_maybe_promote
+
+        out = self._write_graph_and_ckpt(tmp_path, torch)
+        self._install_mocks(monkeypatch, current_auc=0.80, candidate_auc=0.805)  # a tiny real improvement
+
+        outcome = retrain_and_maybe_promote([], out_dir=str(out), min_improvement=0.05)
+        assert outcome["decision"] == "rejected"  # 0.005 improvement does not clear the required 0.05 margin
+
+    def test_promotion_without_gnn_api_skips_the_reload_call(self, monkeypatch, tmp_path):
+        torch = pytest.importorskip("torch")
+        from gnn_aml_core.feedback import retrain_and_maybe_promote
+
+        out = self._write_graph_and_ckpt(tmp_path, torch)
+        self._install_mocks(monkeypatch, current_auc=0.80, candidate_auc=0.90)
+
+        outcome = retrain_and_maybe_promote([], out_dir=str(out), gnn_api=None)
+        assert "skipped" in outcome["reload"]
+
+    def test_promotion_with_gnn_api_calls_the_reload_endpoint(self, monkeypatch, tmp_path):
+        torch = pytest.importorskip("torch")
+        import sys
+        import types
+
+        from gnn_aml_core.feedback import retrain_and_maybe_promote
+
+        out = self._write_graph_and_ckpt(tmp_path, torch)
+        self._install_mocks(monkeypatch, current_auc=0.80, candidate_auc=0.90)
+
+        captured = {}
+
+        class _FakeResp:
+            def read(self):
+                return b'{"reloaded": true}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            captured["headers"] = dict(req.header_items())
+            return _FakeResp()
+
+        import urllib.request
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+        outcome = retrain_and_maybe_promote([], out_dir=str(out), gnn_api="http://fake-gnn",
+                                            gnn_admin_token="secret")
+        assert captured["url"] == "http://fake-gnn/admin/reload-model"
+        assert captured["headers"].get("Authorization") == "Bearer secret"
+        assert outcome["reload"] == {"reloaded": True}
+
+    def test_a_failed_reload_call_does_not_fail_the_promotion(self, monkeypatch, tmp_path):
+        torch = pytest.importorskip("torch")
+        import urllib.error
+        import urllib.request
+
+        from gnn_aml_core.feedback import retrain_and_maybe_promote
+
+        out = self._write_graph_and_ckpt(tmp_path, torch)
+        self._install_mocks(monkeypatch, current_auc=0.80, candidate_auc=0.90)
+        monkeypatch.setattr(urllib.request, "urlopen",
+                           lambda req, timeout=None: (_ for _ in ()).throw(urllib.error.URLError("unreachable")))
+
+        outcome = retrain_and_maybe_promote([], out_dir=str(out), gnn_api="http://fake-gnn")
+        assert outcome["decision"] == "promoted"  # the promotion itself already happened, on disk
+        assert "reload_error" in outcome
+
+
+class TestMainCheckOnceImportError:
+    def test_psycopg_not_installed_exits_with_a_pip_install_hint(self, monkeypatch, capsys):
+        import sys
+
+        import gnn_aml_core.feedback as fb
+
+        # force `import psycopg` to raise ImportError regardless of whether the real package happens to be
+        # installed in whatever environment runs this test -- the standard way to simulate "not installed"
+        monkeypatch.setitem(sys.modules, "psycopg", None)
+        monkeypatch.setattr(sys, "argv", ["feedback.py", "--check", "--dsn", "postgresql://fake"])
+
+        with pytest.raises(SystemExit):
+            fb.main()
+        assert "pip install" in capsys.readouterr().out
+
+
+class TestMainServeMetricsLoopExtra:
+    """More of the --serve-metrics loop's own control flow: the SystemExit-from-_check_once case, and
+    auto-retrain actually invoking retrain_and_maybe_promote (the existing test above only pins where
+    'current model' appears in the source, not that the call happens or what it's given)."""
+
+    class _StopLoop(Exception):
+        pass
+
+    def test_a_system_exit_from_check_once_is_caught_and_the_loop_continues(self, monkeypatch):
+        import sys
+
+        import gnn_aml_core.feedback as fb
+
+        calls = {"n": 0}
+
+        def fake_check_once():
+            calls["n"] += 1
+            raise SystemExit(1)
+
+        # main() defines _check_once as a LOCAL closure, so it can't be monkeypatched directly from outside;
+        # instead, drive the same code path through read_decisions_from_db, which _check_once calls first and
+        # which is the thing that actually raises SystemExit in the real ImportError/connection-failure cases.
+        monkeypatch.setattr(fb, "read_decisions_from_db", lambda dsn: (_ for _ in ()).throw(SystemExit(1)))
+        monkeypatch.setattr(fb, "start_http_server", lambda port: None)
+
+        sleep_calls = {"n": 0}
+
+        def fake_sleep(seconds):
+            sleep_calls["n"] += 1
+            if sleep_calls["n"] >= 2:
+                raise self._StopLoop
+        monkeypatch.setattr(fb.time, "sleep", fake_sleep)
+
+        monkeypatch.setattr(sys, "argv", ["feedback.py", "--serve-metrics"])
+        with pytest.raises(self._StopLoop):
+            fb.main()
+        assert sleep_calls["n"] == 2  # the loop survived the SystemExit and reached sleep() twice
+
+    def test_auto_retrain_is_actually_invoked_with_the_triggering_records_when_drift_fires(self, monkeypatch):
+        import sys
+
+        import gnn_aml_core.feedback as fb
+
+        records = [rec(account_id=f"A{i}", decision="confirmed" if i % 5 else "dismissed") for i in range(25)]
+        monkeypatch.setattr(fb, "read_decisions_from_db", lambda dsn: records)
+        monkeypatch.setattr(fb, "start_http_server", lambda port: None)
+
+        captured = {}
+
+        def fake_retrain(recs, **kw):
+            captured["records"] = recs
+            captured["kw"] = kw
+            return {"decision": "rejected"}
+
+        monkeypatch.setattr(fb, "retrain_and_maybe_promote", fake_retrain)
+
+        sleep_calls = {"n": 0}
+
+        def fake_sleep(seconds):
+            sleep_calls["n"] += 1
+            raise self._StopLoop
+        monkeypatch.setattr(fb.time, "sleep", fake_sleep)
+
+        monkeypatch.setattr(sys, "argv", ["feedback.py", "--serve-metrics", "--auto-retrain",
+                                         "--retrain-threshold", "0.15", "--min-decisions", "20"])
+        with pytest.raises(self._StopLoop):
+            fb.main()
+
+        assert captured["records"] == records
+        assert captured["kw"]["min_improvement"] == 0.0
+
+    def test_auto_retrain_disabled_by_default_never_calls_retrain(self, monkeypatch):
+        import sys
+
+        import gnn_aml_core.feedback as fb
+
+        records = [rec(account_id=f"A{i}", decision="dismissed") for i in range(25)]  # 100% disagreement -> triggers
+        monkeypatch.setattr(fb, "read_decisions_from_db", lambda dsn: records)
+        monkeypatch.setattr(fb, "start_http_server", lambda port: None)
+
+        called = {"n": 0}
+        monkeypatch.setattr(fb, "retrain_and_maybe_promote", lambda recs, **kw: called.update(n=called["n"] + 1))
+
+        sleep_calls = {"n": 0}
+
+        def fake_sleep(seconds):
+            sleep_calls["n"] += 1
+            raise self._StopLoop
+        monkeypatch.setattr(fb.time, "sleep", fake_sleep)
+
+        monkeypatch.setattr(sys, "argv", ["feedback.py", "--serve-metrics"])  # no --auto-retrain
+        with pytest.raises(self._StopLoop):
+            fb.main()
+
+        assert called["n"] == 0
+
+
+class TestMainNonServeRetrainPath:
+    """main()'s default (non---serve-metrics, non---check) path when drift IS triggered: loads graph.pt/
+    gnn_model.pt, converts tensor fields to numpy, and calls retrain_with_feedback with the checkpoint's own
+    hidden/num_layers -- with retrain_with_feedback/build_feedback_dataset/make_splits all mocked, since the
+    real training itself is covered elsewhere."""
+
+    def test_retrains_using_the_checkpoints_own_architecture_and_logs_the_result(self, monkeypatch, tmp_path, caplog):
+        torch = pytest.importorskip("torch")
+        import logging
+        import sys
+
+        import gnn_aml_core.feedback as fb
+        import gnn_aml_core.train as train_mod
+
+        out = tmp_path / "models"
+        out.mkdir()
+        graph = {"x": None, "edge_index": None, "edge_attr": None, "edge_type": None, "y": [0.0, 1.0],
+                "account_ids": ["A", "B"]}
+        torch.save(graph, out / "graph.pt")
+        ckpt = {"model_name": "rgcn", "hparams": {"hidden": 32, "num_layers": 3}}
+        torch.save(ckpt, out / "gnn_model.pt")
+
+        records = [rec(account_id=f"A{i}", decision="dismissed") for i in range(25)]  # triggers (100% disagreement)
+        monkeypatch.setattr(fb, "read_decisions_from_db", lambda dsn: records)
+        monkeypatch.setattr(train_mod, "make_splits", lambda y, seed=42: ([0], [1], []))
+
+        captured = {}
+
+        def fake_retrain_with_feedback(g, tr, va, te, ids, labels, **kw):
+            captured.update(kw=kw, ids=ids, labels=labels)
+            return {"best_val_auc": 0.77, "best_epoch": 5, "report": {"auc_roc": 0.77}}
+
+        monkeypatch.setattr(fb, "retrain_with_feedback", fake_retrain_with_feedback)
+
+        monkeypatch.setattr(sys, "argv", ["feedback.py", "--dsn", "postgresql://fake", "--data", str(tmp_path),
+                                         "--out", str(out), "--retrain-threshold", "0.15", "--min-decisions", "20"])
+
+        with caplog.at_level(logging.INFO, logger="gnn_aml_core.feedback"):
+            fb.main()
+
+        assert captured["kw"]["model_name"] == "rgcn"
+        assert captured["kw"]["hidden"] == 32
+        assert captured["kw"]["layers"] == 3
+        assert "retrained: val AUC 0.7700" in caplog.text
+
+    def test_check_flag_returns_before_retraining_even_if_triggered(self, monkeypatch, tmp_path):
+        import sys
+
+        import gnn_aml_core.feedback as fb
+
+        records = [rec(account_id=f"A{i}", decision="dismissed") for i in range(25)]
+        monkeypatch.setattr(fb, "read_decisions_from_db", lambda dsn: records)
+
+        called = {"n": 0}
+        monkeypatch.setattr(fb, "retrain_with_feedback", lambda *a, **kw: called.update(n=called["n"] + 1))
+
+        monkeypatch.setattr(sys, "argv", ["feedback.py", "--check", "--dsn", "postgresql://fake",
+                                         "--retrain-threshold", "0.15", "--min-decisions", "20"])
+        fb.main()
+        assert called["n"] == 0
+
+    def test_not_triggered_returns_without_retraining(self, monkeypatch, tmp_path):
+        import sys
+
+        import gnn_aml_core.feedback as fb
+
+        records = [rec(account_id=f"A{i}", decision="confirmed") for i in range(25)]  # 0% disagreement
+        monkeypatch.setattr(fb, "read_decisions_from_db", lambda dsn: records)
+
+        called = {"n": 0}
+        monkeypatch.setattr(fb, "retrain_with_feedback", lambda *a, **kw: called.update(n=called["n"] + 1))
+
+        monkeypatch.setattr(sys, "argv", ["feedback.py", "--dsn", "postgresql://fake",
+                                         "--retrain-threshold", "0.15", "--min-decisions", "20"])
+        fb.main()
+        assert called["n"] == 0

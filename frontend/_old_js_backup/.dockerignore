@@ -1,0 +1,6 @@
+node_modules
+.next
+preview
+demo
+_old_js_backup
+*.tsbuildinfo

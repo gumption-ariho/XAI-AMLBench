@@ -1,14 +1,14 @@
 # XAI-AMLBench
 
 [![PyPI](https://img.shields.io/pypi/v/xai-amlbench.svg)](https://pypi.org/project/xai-amlbench/)
-[![CI](https://github.com/OWNER/xai-amlbench/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/xai-amlbench/actions/workflows/ci.yml)
+[![CI](https://github.com/gumption-ariho/xai-amlbench/actions/workflows/ci.yml/badge.svg)](https://github.com/gumption-ariho/xai-amlbench/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Dataset: CC BY 4.0](https://img.shields.io/badge/Dataset-CC%20BY%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by/4.0/)
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.PLACEHOLDER.svg)](https://doi.org/10.5281/zenodo.PLACEHOLDER)
-[![Hugging Face Dataset](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset-blue)](https://huggingface.co/datasets/OWNER/xai-amlbench)
+[![Hugging Face Dataset](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset-blue)](https://huggingface.co/datasets/gumption-ariho/xai-amlbench)
 
-*(Badges are placeholders until the project is published: `OWNER` needs the real GitHub org/user, and the Zenodo
-DOI is minted on first release. See [.zenodo.json](.zenodo.json) and [CITATION.cff](CITATION.cff).)*
+*(The Zenodo DOI badge above is still a placeholder -- it's minted automatically on the first GitHub release.
+See [.zenodo.json](.zenodo.json) and [CITATION.cff](CITATION.cff).)*
 
 An explainable, open-source benchmark for **multi-hop money-laundering detection**: a synthetic transaction-graph
 generator with five embedded laundering typologies, GATv2/RGCN graph neural network detectors, and an
@@ -107,7 +107,7 @@ described as a benchmark and methodology contribution rather than a validated pr
   author       = {{XAI-AMLBench contributors}},
   year         = {2026},
   version      = {0.1.0},
-  url          = {https://github.com/OWNER/xai-amlbench},
+  url          = {https://github.com/gumption-ariho/xai-amlbench},
   license      = {MIT}
 }
 ```

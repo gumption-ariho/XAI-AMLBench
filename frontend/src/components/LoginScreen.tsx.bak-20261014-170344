@@ -1,0 +1,95 @@
+"use client";
+
+import { useState } from "react";
+import type { FormEvent, ReactElement } from "react";
+import Glass from "@/components/Glass";
+import { IconShield } from "@/components/Icons";
+import { api, setSessionToken } from "@/lib/api";
+import type { LoginResponse } from "@/types";
+
+interface LoginScreenProps {
+  /** Called once POST /api/login accepts the passkey -- the signed-in name is whatever was typed below,
+   * since there's no per-person account to look it up against (see backend/main.py's module docstring on why
+   * that's an intentional tradeoff of a shared, predefined passkey). */
+  onSuccess: (name: string) => void;
+}
+
+/** One shared passkey per role (admin/analyst) -- no per-person account to create or manage. The name typed
+ * here is what every action gets attributed to afterward, so it's asked for up front, not assumed. */
+export default function LoginScreen({ onSuccess }: LoginScreenProps): ReactElement {
+  const [name, setName] = useState<string>("");
+  const [passkey, setPasskey] = useState<string>("");
+  const [error, setError] = useState<string>("");
+  const [busy, setBusy] = useState<boolean>(false);
+
+  const handleSubmit = async (e: FormEvent): Promise<void> => {
+    e.preventDefault();
+    const trimmedName = name.trim();
+    if (!trimmedName) {
+      setError("Enter your name.");
+      return;
+    }
+    if (!passkey) {
+      setError("Enter the admin or analyst passkey.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      const res = await api<LoginResponse>("/login", {
+        method: "POST",
+        body: JSON.stringify({ name: trimmedName, passkey }),
+      });
+      setSessionToken(res.token);
+      onSuccess(res.name);
+    } catch {
+      setError("That passkey wasn't accepted. Check it for typos, or ask whoever set up this console for the admin/analyst passkey.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="login-screen">
+      <form className="login-card-wrap" onSubmit={(e) => void handleSubmit(e)}>
+        <Glass as="div" className="login-card">
+          <div className="login-brand">
+            <span className="login-shield"><IconShield /></span>
+            <div>
+              <div className="login-title">XAI·AMLBench</div>
+              <div className="login-subtitle">Compliance Console</div>
+            </div>
+          </div>
+          <p className="login-hint">
+            Sign in with your name and the admin or analyst passkey. Every action you take is recorded under the
+            name you enter here.
+          </p>
+          <input
+            className="input login-input"
+            type="text"
+            placeholder="Your name"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            autoFocus
+            disabled={busy}
+            autoComplete="name"
+          />
+          <input
+            className="input login-input"
+            type="password"
+            placeholder="Passkey"
+            value={passkey}
+            onChange={(e) => setPasskey(e.target.value)}
+            disabled={busy}
+            autoComplete="off"
+            spellCheck={false}
+          />
+          {error && <p className="login-error">{error}</p>}
+          <button className="btn shine login-submit" type="submit" disabled={busy || !name.trim() || !passkey}>
+            {busy ? "Checking…" : "Sign in"}
+          </button>
+        </Glass>
+      </form>
+    </div>
+  );
+}

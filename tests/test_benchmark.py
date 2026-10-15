@@ -1,12 +1,14 @@
 """Tests for the pure, torch-free logic in gnn_aml_core.benchmark: aggregation, paired comparison, target
-counting and the markdown table. `main()` itself runs the full generate -> train -> evaluate pipeline and needs
-PyTorch; it is exercised end to end by running `python -m gnn_aml_core.benchmark` manually, not by this suite."""
+counting and the markdown table. main()'s own --no-gnn path (baselines only, "fast, no PyTorch needed" per the
+module's own docstring) is exercised end to end below with a tiny real synthetic graph; the GNN-training branch
+(fit_gnn) needs PyTorch and belongs to gnn_aml_core.train's own test suite, not this module's CLI/resumability
+logic, which is what TestMain actually checks."""
 import json
 
 import numpy as np
 import pytest
 
-from gnn_aml_core.benchmark import (TARGETS, aggregate, config_fingerprint, load_resumable, markdown_table,
+from gnn_aml_core.benchmark import (TARGETS, aggregate, config_fingerprint, load_resumable, main, markdown_table,
                                     meets_targets, paired, save_progress, strongest_baseline)
 
 
@@ -179,4 +181,68 @@ class TestResumeAndCheckpointing:
         save_progress(tmp_path, [PER_SEED[0]], [{"seed": 1, "nodes": 100, "positive_rate": 0.08}], fp, 0, final=True)
         _, extra = load_resumable(tmp_path, fp)
         assert {e["seed"] for e in extra} == {1}
+
+
+class TestMain:
+    """main()'s own CLI/resumability logic, run for real with --no-gnn (a tiny real synthetic graph, real
+    baselines, no PyTorch needed) rather than mocked, since the whole point of --no-gnn is that this path
+    doesn't need PyTorch at all."""
+
+    _BASE_ARGS = ["--no-gnn", "--accounts", "60", "--seed0", "1"]
+
+    def test_runs_the_requested_seeds_and_writes_both_output_files(self, monkeypatch, tmp_path):
+        import sys
+
+        out_dir = tmp_path / "bench"
+        monkeypatch.setattr(sys, "argv", ["benchmark.py", *self._BASE_ARGS, "--seeds", "2", "--out", str(out_dir)])
+        main()
+
+        assert (out_dir / "results.md").exists()
+        assert (out_dir / "results.json").exists()
+        saved = json.loads((out_dir / "results.json").read_text())
+        assert saved["complete"] is True
+        assert {e["seed"] for e in saved["seed_info"]} == {1, 2}
+        # --no-gnn: no "GNN (...)" row should appear anywhere in the aggregate
+        assert not any(k.startswith("GNN") for k in saved["aggregate"])
+
+    def test_rerunning_the_same_command_resumes_instead_of_redoing_completed_seeds(self, monkeypatch, tmp_path):
+        import sys
+
+        out_dir = tmp_path / "bench"
+        monkeypatch.setattr(sys, "argv", ["benchmark.py", *self._BASE_ARGS, "--seeds", "1", "--out", str(out_dir)])
+        main()
+        first = json.loads((out_dir / "results.json").read_text())
+        assert {e["seed"] for e in first["seed_info"]} == {1}
+
+        # ask for 2 seeds now (seed0=1 again) -- seed 1 is already done, only seed 2 should actually run
+        monkeypatch.setattr(sys, "argv", ["benchmark.py", *self._BASE_ARGS, "--seeds", "2", "--out", str(out_dir)])
+        main()
+        second = json.loads((out_dir / "results.json").read_text())
+        assert {e["seed"] for e in second["seed_info"]} == {1, 2}
+
+    def test_requesting_already_completed_seeds_again_does_no_new_work(self, monkeypatch, tmp_path, caplog):
+        import logging
+        import sys
+
+        out_dir = tmp_path / "bench"
+        args = ["benchmark.py", *self._BASE_ARGS, "--seeds", "1", "--out", str(out_dir)]
+        monkeypatch.setattr(sys, "argv", args)
+        main()
+
+        with caplog.at_level(logging.INFO, logger="gnn_aml_core.benchmark"):
+            main()  # identical command again -- seed 1 is already done
+        assert "nothing new to do" in caplog.text
+
+    def test_fresh_flag_ignores_any_previous_partial_run(self, monkeypatch, tmp_path):
+        import sys
+
+        out_dir = tmp_path / "bench"
+        monkeypatch.setattr(sys, "argv", ["benchmark.py", *self._BASE_ARGS, "--seeds", "1", "--out", str(out_dir)])
+        main()
+
+        monkeypatch.setattr(sys, "argv", ["benchmark.py", *self._BASE_ARGS, "--seeds", "1", "--out", str(out_dir),
+                                         "--fresh"])
+        main()  # must redo seed 1 from scratch rather than treating it as already resumed
+        saved = json.loads((out_dir / "results.json").read_text())
+        assert {e["seed"] for e in saved["seed_info"]} == {1}
 

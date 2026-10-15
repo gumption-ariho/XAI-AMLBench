@@ -1,0 +1,81 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xai-amlbench"
+version = "0.1.0"
+description = "Explainable, open-source benchmark for multi-hop money-laundering detection with graph neural networks"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "XAI-AMLBench contributors" }]
+keywords = ["anti-money-laundering", "explainable-ai", "graph-neural-networks", "fincen", "regtech"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Office/Business :: Financial",
+]
+
+# Core: generating and reading synthetic AML graphs (aml_synth), no GPU/ML framework required.
+dependencies = [
+    "numpy<2",
+    "pandas",
+    "networkx",
+    "pyarrow",
+]
+
+[project.optional-dependencies]
+# GNN training and serving (gnn_aml_core): torch is listed here but the CPU wheel needs its own index
+# (see README "Install" section) -- a plain `pip install xai-amlbench[gnn]` pulls whatever wheel PyPI
+# resolves for your platform, which is usually the CUDA build; for CPU-only, install torch first from
+# https://download.pytorch.org/whl/cpu, then `pip install xai-amlbench[gnn]`.
+gnn = [
+    "torch>=2.4,<2.5",
+    "torch_geometric",
+    "scikit-learn",
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic",
+    "redis",
+    "prometheus-client",
+    "prometheus-fastapi-instrumentator",
+]
+# The exact XGBoost baseline named in the project brief. Optional: gnn_aml_core.baselines falls back to
+# scikit-learn's HistGradientBoostingClassifier (and says so) when this is not installed.
+xgboost = ["xgboost"]
+# SAR narrative generation and the audit trail (xai_explainer).
+xai = [
+    "httpx",
+    "networkx",
+    "immudb-py",
+    "prometheus-client",
+    "prometheus-fastapi-instrumentator",
+]
+kafka = ["kafka-python"]
+neo4j = ["neo4j"]
+test = ["pytest>=7", "pytest-cov"]
+dev = ["xai-amlbench[gnn,xgboost,xai,kafka,neo4j,test]"]
+
+[project.urls]
+Homepage = "https://github.com/OWNER/xai-amlbench"
+Repository = "https://github.com/OWNER/xai-amlbench"
+Issues = "https://github.com/OWNER/xai-amlbench/issues"
+
+[tool.setuptools.packages.find]
+include = ["aml_synth*", "gnn_aml_core*", "xai_explainer*"]
+exclude = ["tests*", "backend*", "frontend*", "node_agent*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra"
+
+[tool.coverage.run]
+source = ["aml_synth", "gnn_aml_core", "xai_explainer"]
+omit = ["*/main.py"]  # FastAPI wiring, exercised by the stack checker rather than unit tests

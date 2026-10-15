@@ -22,9 +22,9 @@ interface LaidEdge extends ExplainEdge {
 }
 
 const TYPE_COLOR: Record<string, string> = {
-  individual: "#60a5fa",
-  business: "#22d3ee",
-  shell: "#fb7185",
+  individual: "#3b82f6",
+  business: "#2563eb",
+  shell: "#dc2626",
   unknown: "#94a3b8",
 };
 
@@ -244,10 +244,10 @@ export default function NetworkGraph({ data }: NetworkGraphProps) {
         <svg viewBox={`0 0 ${W} ${H}`} className="net" role="img" aria-label="Transaction network of the flagged account">
           <defs>
             <marker id="arrD" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
-              <path d="M0,0 L10,5 L0,10 Z" fill="#22d3ee" />
+              <path d="M0,0 L10,5 L0,10 Z" fill="#2563eb" />
             </marker>
             <marker id="arrX" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
-              <path d="M0,0 L10,5 L0,10 Z" fill="#fbbf24" />
+              <path d="M0,0 L10,5 L0,10 Z" fill="#d97706" />
             </marker>
             <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
               <feGaussianBlur stdDeviation="4" result="b" />
@@ -262,12 +262,11 @@ export default function NetworkGraph({ data }: NetworkGraphProps) {
             <path
               key={`${e.tx_id}-${i}`}
               d={edgePath(model.pos[e.a], model.pos[e.b], model.radius[e.b], e.k)}
-              className={`edge flow ${sel !== null && !isConnected(e) ? "dim" : ""}`}
-              stroke={e.cross_border ? "#fbbf24" : "#22d3ee"}
+              className={`edge ${sel !== null && !isConnected(e) ? "dim" : ""}`}
+              stroke={e.cross_border ? "#d97706" : "#2563eb"}
               strokeWidth={1 + e.w * 2.6}
               opacity={0.35 + e.w * 0.65}
               markerEnd={`url(#${e.cross_border ? "arrX" : "arrD"})`}
-              style={{ animationDuration: `${1.6 - e.w * 0.9}s` }}
             >
               <title>{`${e.src} → ${e.dst} · ${money(e.amount)}${e.cross_border ? " · cross-border" : ""}`}</title>
             </path>
@@ -283,15 +282,12 @@ export default function NetworkGraph({ data }: NetworkGraphProps) {
                 className={`node ${sel === i ? "sel" : ""}`}
                 transform={`translate(${model.pos[i].x.toFixed(1)},${model.pos[i].y.toFixed(1)})`}
                 onClick={() => setSel(sel === i ? null : i)}
-                style={{ animationDelay: `${(i % 12) * 60}ms` }}
               >
-                {isSubject && <circle className="pulse" r={r} fill="none" stroke="#e8f0ff" strokeWidth="2" />}
                 <circle r={r + 6} fill={color} opacity="0.13" />
                 <circle
                   r={r}
                   fill={color}
-                  filter={isSubject || n.account_type === "shell" ? "url(#glow)" : undefined}
-                  stroke={isSubject ? "#ffffff" : "rgba(3,7,18,.7)"}
+                  stroke={isSubject ? "#0f172a" : "rgba(15,23,42,.3)"}
                   strokeWidth={isSubject ? 3 : 1.5}
                 />
                 <text y={r + 15} textAnchor="middle" className="node-label">
@@ -306,8 +302,8 @@ export default function NetworkGraph({ data }: NetworkGraphProps) {
           <span><i style={{ background: TYPE_COLOR.individual }} />Individual</span>
           <span><i style={{ background: TYPE_COLOR.business }} />Business</span>
           <span><i style={{ background: TYPE_COLOR.shell }} />Shell</span>
-          <span><i className="ln" style={{ background: "#22d3ee" }} />Domestic</span>
-          <span><i className="ln" style={{ background: "#fbbf24" }} />Cross-border</span>
+          <span><i className="ln" style={{ background: "#2563eb" }} />Domestic</span>
+          <span><i className="ln" style={{ background: "#d97706" }} />Cross-border</span>
           <span className="hint">Click a node · thicker = more influential to the model</span>
         </div>
       </Glass>
@@ -320,14 +316,14 @@ export default function NetworkGraph({ data }: NetworkGraphProps) {
             <b>{(data.risk_score * 100).toFixed(1)}%</b>
           </div>
           {data.top_features.length === 0 && <p className="muted">No feature attribution returned.</p>}
-          {data.top_features.map((f, i) => (
+          {data.top_features.map((f) => (
             <div className="feat" key={f.feature}>
               <div className="feat-top">
                 <span>{FEATURE_LABELS[f.feature] ?? f.feature}</span>
                 <em>{(f.weight * 100).toFixed(0)}%</em>
               </div>
               <div className="feat-bar">
-                <div style={{ width: `${Math.min(100, f.weight * 260)}%`, animationDelay: `${i * 90}ms` }} />
+                <div style={{ width: `${Math.min(100, f.weight * 260)}%` }} />
               </div>
             </div>
           ))}

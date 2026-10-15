@@ -1,13 +1,16 @@
-"""Tests for gnn_aml_core.livegraph's live (non-synthetic) transaction store -- ingest()/read_live(), and
+"""Tests for gnn_aml_core.livegraph's live (non-synthetic) transaction store -- ingest()/read_live(),
 remove_accounts() (the backing function for POST /admin/remove-live / backend's POST /intake/clear, the Intake
-tab's "clear temporary data" control). rebuild_live_graph()/write_blank_graph() need PyTorch and the trained
-model's checkpoint shape, so they're out of scope here (and this module's own existing test suite, if any,
-should cover them under the `torch` marker); this file only exercises the on-disk CSV manipulation, which is
-exactly what remove_accounts() is responsible for getting right.
+tab's "clear temporary data" control), _accounts_from_tx(), and the PyTorch-dependent
+write_blank_graph()/rebuild_live_graph()/main() (skipped automatically, via pytest.importorskip, on a machine
+without PyTorch installed).
 """
 import os
 
 os.environ.setdefault("LIVE_DATA_DIR", "data/live")   # read once at import time by the module under test
+
+import numpy as np
+import pandas as pd
+import pytest
 
 import gnn_aml_core.livegraph as lg
 
@@ -37,6 +40,165 @@ class TestIngestAndReadLive:
         result = lg.ingest([{"src": "", "dst": "B", "amount": 100}, {"src": "X", "dst": "Y", "amount": 10}])
         assert len(result) == 1
         assert result.iloc[0]["src"] == "X"
+
+    def test_a_document_of_entirely_malformed_rows_is_a_no_op_and_never_touches_disk(self, monkeypatch, tmp_path):
+        # every row is malformed (blank src/dst) -- new_rows ends up empty, so ingest() must return the
+        # existing table untouched and must not write an (empty) file, rather than silently creating one
+        _use_tmp_store(monkeypatch, tmp_path)
+        result = lg.ingest([{"src": "", "dst": "", "amount": 1}, {"src": "", "dst": "B", "amount": 2}])
+        assert len(result) == 0
+        assert not lg._live_tx_path().exists()
+
+    def test_ingest_fills_in_timestamp_and_cross_border_defaults(self, monkeypatch, tmp_path):
+        _use_tmp_store(monkeypatch, tmp_path)
+        result = lg.ingest([{"src": "A", "dst": "B", "amount": 10}])  # no timestamp/cross_border given
+        row = result.iloc[0]
+        assert row["cross_border"] == 0
+        assert row["timestamp"] > 0  # defaulted to "now", not left blank or zero
+
+    def test_ingest_honors_an_explicit_timestamp_and_cross_border(self, monkeypatch, tmp_path):
+        _use_tmp_store(monkeypatch, tmp_path)
+        result = lg.ingest([{"src": "A", "dst": "B", "amount": 10, "timestamp": 1700000000, "cross_border": 1}])
+        row = result.iloc[0]
+        assert row["timestamp"] == 1700000000
+        assert row["cross_border"] == 1
+
+
+class TestAccountsFromTx:
+    def test_builds_one_row_per_unique_account_seen_as_either_src_or_dst(self):
+        tx = pd.DataFrame({"src": ["A", "B", "A"], "dst": ["B", "C", "C"]})
+        accounts = lg._accounts_from_tx(tx)
+        assert set(accounts["account_id"]) == {"A", "B", "C"}
+        assert len(accounts) == 3  # no duplicates even though A and B each appear more than once
+
+    def test_uses_the_same_honest_placeholder_fields_amlworld_uses(self):
+        # a raw transaction document carries no account_type/country/opened_ts/risk_score -- these must be
+        # filled with the documented placeholder values, not left missing or guessed
+        tx = pd.DataFrame({"src": ["A"], "dst": ["B"]})
+        accounts = lg._accounts_from_tx(tx)
+        assert set(accounts["account_type"]) == {"unknown"}
+        assert set(accounts["country"]) == {"unknown"}
+        assert (accounts["opened_ts"] == 0).all()
+        assert (accounts["risk_score"] == 0.0).all()
+
+
+torch = pytest.importorskip("torch")
+
+
+def _fake_ckpt(feature_names):
+    n = len(feature_names)
+    return {"feature_names": feature_names, "mean": torch.zeros(n), "std": torch.from_numpy(np.ones(n))}
+
+
+class TestWriteBlankGraph:
+    def test_writes_a_zero_account_graph_matching_the_checkpoints_feature_names(self, tmp_path):
+        ckpt = _fake_ckpt(["f1", "f2", "f3"])
+        result = lg.write_blank_graph(ckpt, tmp_path)
+        assert result == {"n_accounts": 0, "n_transactions": 0}
+        graph = torch.load(tmp_path / "graph.pt", map_location="cpu", weights_only=False)
+        assert graph["account_ids"] == []
+        assert graph["feature_names"] == ["f1", "f2", "f3"]
+        assert graph["x"].shape == (0, 3)
+
+    def test_never_touches_gnn_model_pt(self, tmp_path):
+        # write_blank_graph must only ever write graph.pt -- the trained weights file must not exist, let
+        # alone be modified, as a result of calling it
+        ckpt = _fake_ckpt(["f1"])
+        lg.write_blank_graph(ckpt, tmp_path)
+        assert not (tmp_path / "gnn_model.pt").exists()
+
+
+class TestRebuildLiveGraph:
+    def _real_feature_names(self, accounts, tx):
+        from gnn_aml_core.features import build_node_features
+        _, names = build_node_features(accounts, tx)
+        return names
+
+    def test_empty_live_store_writes_a_blank_graph_instead(self, monkeypatch, tmp_path):
+        _use_tmp_store(monkeypatch, tmp_path / "live")
+        accounts = lg._accounts_from_tx(pd.DataFrame({"src": ["A"], "dst": ["B"]}))
+        names = self._real_feature_names(accounts, pd.DataFrame({"src": ["A"], "dst": ["B"], "amount": [1.0],
+                                                                  "timestamp": [1], "cross_border": [0]}))
+        ckpt = _fake_ckpt(names)
+        out_dir = tmp_path / "models"
+        result = lg.rebuild_live_graph(ckpt, out_dir)
+        assert result == {"n_accounts": 0, "n_transactions": 0}
+        graph = torch.load(out_dir / "graph.pt", map_location="cpu", weights_only=False)
+        assert graph["account_ids"] == []
+
+    def test_rebuilds_a_graph_matching_the_full_accumulated_live_population(self, monkeypatch, tmp_path):
+        _use_tmp_store(monkeypatch, tmp_path / "live")
+        lg.ingest([{"src": "A", "dst": "B", "amount": 100}, {"src": "B", "dst": "C", "amount": 50}])
+
+        tx_for_names = lg.read_live()
+        accounts_for_names = lg._accounts_from_tx(tx_for_names)
+        names = self._real_feature_names(accounts_for_names, tx_for_names)
+        ckpt = _fake_ckpt(names)
+
+        out_dir = tmp_path / "models"
+        result = lg.rebuild_live_graph(ckpt, out_dir)
+
+        assert result["n_accounts"] == 3   # A, B, C
+        assert result["n_transactions"] == 2
+        graph = torch.load(out_dir / "graph.pt", map_location="cpu", weights_only=False)
+        assert set(graph["account_ids"]) == {"A", "B", "C"}
+        assert graph["n_tx"] == 2
+        assert graph["feature_names"] == names
+
+    def test_mismatched_feature_names_raises_instead_of_silently_mis_scoring(self, monkeypatch, tmp_path):
+        # if the live store's feature set no longer matches what the trained model expects (e.g. the model
+        # was retrained with a different feature list since this live store was last rebuilt), this MUST
+        # raise rather than silently feed misaligned columns into a model that will score them anyway
+        _use_tmp_store(monkeypatch, tmp_path / "live")
+        lg.ingest([{"src": "A", "dst": "B", "amount": 100}])
+        ckpt = _fake_ckpt(["totally_wrong_feature_set"])
+        with pytest.raises(ValueError, match="feature_names"):
+            lg.rebuild_live_graph(ckpt, tmp_path / "models")
+
+
+class TestMain:
+    def test_missing_checkpoint_exits_with_a_helpful_message(self, monkeypatch, tmp_path, capsys):
+        monkeypatch.setattr("sys.argv", ["livegraph.py", "--models", str(tmp_path / "nope")])
+        with pytest.raises(SystemExit, match="not found"):
+            lg.main()
+
+    def test_reset_wipes_the_live_store_and_writes_a_blank_graph_without_touching_gnn_model(self, monkeypatch, tmp_path):
+        models_dir = tmp_path / "models"
+        models_dir.mkdir()
+        ckpt = _fake_ckpt(["f1", "f2"])
+        torch.save(ckpt, models_dir / "gnn_model.pt")
+        before = (models_dir / "gnn_model.pt").read_bytes()
+
+        _use_tmp_store(monkeypatch, tmp_path / "live")
+        lg.ingest([{"src": "A", "dst": "B", "amount": 100}])
+        assert lg._live_tx_path().exists()
+
+        monkeypatch.setattr("sys.argv", ["livegraph.py", "--models", str(models_dir), "--reset"])
+        lg.main()
+
+        assert not lg._live_tx_path().exists()
+        assert (models_dir / "graph.pt").exists()
+        graph = torch.load(models_dir / "graph.pt", map_location="cpu", weights_only=False)
+        assert graph["account_ids"] == []
+        assert (models_dir / "gnn_model.pt").read_bytes() == before  # the trained weights are untouched
+
+    def test_without_reset_rebuilds_from_the_existing_live_store(self, monkeypatch, tmp_path):
+        models_dir = tmp_path / "models"
+        models_dir.mkdir()
+
+        _use_tmp_store(monkeypatch, tmp_path / "live")
+        lg.ingest([{"src": "A", "dst": "B", "amount": 100}])
+        tx = lg.read_live()
+        accounts = lg._accounts_from_tx(tx)
+        from gnn_aml_core.features import build_node_features
+        _, names = build_node_features(accounts, tx)
+        torch.save(_fake_ckpt(names), models_dir / "gnn_model.pt")
+
+        monkeypatch.setattr("sys.argv", ["livegraph.py", "--models", str(models_dir)])
+        lg.main()
+
+        graph = torch.load(models_dir / "graph.pt", map_location="cpu", weights_only=False)
+        assert graph["account_ids"] == ["A", "B"]
 
 
 class TestRemoveAccounts:

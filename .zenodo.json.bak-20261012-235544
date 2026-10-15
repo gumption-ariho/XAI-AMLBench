@@ -1,0 +1,26 @@
+{
+  "title": "XAI-AMLBench v0.1.0: Synthetic Multi-Hop Money Laundering Detection Dataset and Explainable GNN Benchmark",
+  "description": "A privacy-preserving, synthetic benchmark for multi-hop money-laundering detection. Includes a directed transaction-graph generator with five embedded laundering typologies (smurfing, scatter-gather, cyclic loops, shell-company chains, cross-border velocity) plus realistic benign look-alike structures, GATv2/RGCN graph neural network detectors, baseline comparisons, and an explainable-AI layer that turns GNNExplainer subgraphs into audit-ready SAR narratives. Motivated by FinCEN's April 2026 AML/CFT explainability mandate. All data is synthetic; no real customer or transaction data is used or required.",
+  "creators": [
+    { "name": "XAI-AMLBench contributors" }
+  ],
+  "license": "CC-BY-4.0",
+  "access_right": "open",
+  "upload_type": "dataset",
+  "keywords": [
+    "anti-money-laundering",
+    "explainable-ai",
+    "graph-neural-networks",
+    "synthetic-data",
+    "fincen",
+    "regtech"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/OWNER/xai-amlbench",
+      "relation": "isSupplementTo",
+      "resource_type": "software"
+    }
+  ],
+  "notes": "Fill in the real GitHub owner/org in repository-code (CITATION.cff), project.urls (pyproject.toml) and related_identifiers (this file) before minting the DOI on Zenodo."
+}

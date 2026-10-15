@@ -1,0 +1,177 @@
+/** Types shared between the UI and the backend JSON (see backend/main.py and gnn_aml_core/main.py). */
+
+export type AlertStatus = "open" | "confirmed" | "dismissed";
+export type TabId = "overview" | "pipeline" | "scan" | "intake" | "alerts" | "investigate" | "network" | "activity" | "connect";
+export type ToastKind = "ok" | "err" | "warn";
+
+/* ---- GET /api/activity -- a merged, real feedback-log feed (see backend/main.py's activity() docstring) ---- */
+export interface ActivityEntry {
+  ts: number;
+  pipeline: "model1" | "model2";
+  kind: string;
+  account_id: string;
+  by: string | null;
+  detail: string;
+  ref_id: number;
+}
+
+/* ---- GET /api/system/status -- live reachability + Kafka wiring info (see backend/main.py) ---- */
+export interface ServiceStatus {
+  name: string;
+  ok: boolean;
+  latency_ms: number | null;
+  error?: string;
+}
+
+export interface SystemStatus {
+  services: ServiceStatus[];
+  all_ok: boolean;
+  kafka: {
+    external_listener: string;
+    transactions_topic: string;
+    alerts_topic: string;
+    note: string;
+  };
+}
+
+export interface WhoamiResponse {
+  officer: string;
+}
+
+export interface LoginResponse {
+  token: string;
+  name: string;
+  role: "admin" | "analyst";
+}
+
+/* ---- Model 2 (anomaly detector) -- see gnn_aml_core/anomaly.py and backend/main.py's /api/anomalies/* ---- */
+export type AnomalyStatus = "new" | "under_investigation" | "confirmed_mule" | "cleared";
+
+export interface InvestigationLogEntry {
+  ts: number;
+  by: string;
+  status: string;
+  note: string;
+}
+
+export interface AnomalyAlert {
+  id: number;
+  account_id: string;
+  anomaly_score: number;
+  threshold: number;
+  status: AnomalyStatus;
+  assigned_to: string | null;
+  investigation_log: InvestigationLogEntry[];
+  created_at: string;
+  updated_at: string | null;
+  trained_at: string | null;
+}
+
+export interface Alert {
+  id: number;
+  account_id: string;
+  risk_score: number;
+  status: AlertStatus;
+  typology: string | null;
+  narrative: string | null;
+  narrative_source: string | null;
+  narrative_sha256: string | null;
+  reviewed_by: string | null;
+  review_note: string | null;
+  created_at: string;
+  reviewed_at: string | null;
+}
+
+export interface ScanResponse {
+  score: number;
+  calibrated_score?: number;
+  flagged: boolean;
+  threshold: number;
+  calibrated_threshold?: number;
+  latency_ms: number;
+  alert: Alert | null;
+}
+
+export interface ScanResult extends ScanResponse {
+  account_id: string;
+}
+
+export interface SampleAccounts {
+  suspicious: string[];
+  benign: string[];
+}
+
+export interface ModelMetrics {
+  val_auc_roc: number;
+  test_auc_roc: number;
+  test_pr_auc: number;
+  test_precision: number;
+  test_recall: number;
+  threshold: number;
+  auc_target: number;
+  meets_auc_target: boolean;
+}
+
+export interface ModelInfo {
+  model: string;
+  hparams: Record<string, number>;
+  threshold: number;
+  metrics: ModelMetrics;
+  targets: { auc_roc: number; latency_ms: number };
+  n_nodes: number;
+  n_features: number;
+}
+
+/* ---- GNNExplainer payload returned by POST /explain ---- */
+export interface ExplainNode {
+  account_id: string;
+  account_type: string; // individual | business | shell
+  country: string;
+}
+
+export interface ExplainEdge {
+  tx_id: string;
+  src: string;
+  dst: string;
+  amount: number;
+  timestamp: number;
+  cross_border: number; // 0 | 1
+  importance: number;
+}
+
+export interface TopFeature {
+  feature: string;
+  weight: number;
+}
+
+export interface Explanation {
+  account_id: string;
+  risk_score: number;
+  raw_risk_score?: number;
+  threshold: number;
+  reporting_threshold: number;
+  model: string;
+  method: string;
+  nodes: ExplainNode[];
+  edges: ExplainEdge[];
+  top_features: TopFeature[];
+}
+
+/* ---- POST /intake/ingest -- the Intake tab's real-transaction ingestion path (see backend/main.py and
+   gnn_aml_core/livegraph.py). Adds the given transactions to the live, non-synthetic account population and
+   rebuilds the served graph standardized with the already-trained model's own mean/std -- no weights change,
+   nothing is retrained. ---- */
+export interface IntakeIngestResponse {
+  status: string;
+  ingested_rows: number;
+  n_accounts: number;
+  n_transactions: number;
+  model_version?: string;
+  [key: string]: unknown;   // _reload_model() may include extra fields (e.g. reload timing); pass through as-is
+}
+
+export interface Toast {
+  id: number;
+  kind: ToastKind;
+  msg: string;
+}
