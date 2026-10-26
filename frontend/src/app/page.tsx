@@ -2,6 +2,7 @@
 
 import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import type { ReactElement } from "react";
+import { useRouter } from "next/navigation";
 import Background from "@/components/Background";
 import Sidebar from "@/components/Sidebar";
 import type { DockTab } from "@/components/Sidebar";
@@ -216,6 +217,7 @@ function ModelCard({ info }: { info: ModelInfo | null }) {
 
 /* ----------------------------------------------------------------------- page */
 export default function Home(): ReactElement {
+  const router = useRouter();
   const demoMode = isDemo();
   // In demo mode we must install the mock backend BEFORE the first request, so wait for it.
   const [ready, setReady] = useState<boolean>(!demoMode);
@@ -328,7 +330,13 @@ export default function Home(): ReactElement {
     // this only ever makes login EASIER when the backend explicitly allows it, never less secure on its own.
     if (!hasStoredApiKey()) {
       api<WhoamiResponse>("/whoami")
-        .then((who) => { setAuthedOfficer(who.officer); setAuthedBank(who.bank); })
+        .then((who) => {
+          // An admin passkey has no bank console of its own -- this page is the customer/bank console, so
+          // send an admin session straight to the owner backoffice instead of rendering it here. See
+          // handleLoginSuccess below for the same redirect right after login.
+          if (who.role === "admin") { router.replace("/owner"); return; }
+          setAuthedOfficer(who.officer); setAuthedBank(who.bank);
+        })
         .catch(() => {})   // no stored key and bypass is off: expected, fall through to the login screen
         .finally(() => setAuthChecked(true));
       return;
@@ -336,15 +344,20 @@ export default function Home(): ReactElement {
     // a key is already stored (e.g. this tab's sessionStorage survived a reload) -- verify it still works
     // rather than trusting it blindly, since it may have been revoked since the last page load
     api<WhoamiResponse>("/whoami")
-      .then((who) => { setAuthedOfficer(who.officer); setAuthedBank(who.bank); })
+      .then((who) => {
+        if (who.role === "admin") { router.replace("/owner"); return; }
+        setAuthedOfficer(who.officer); setAuthedBank(who.bank);
+      })
       .catch(() => clearApiKey())
       .finally(() => setAuthChecked(true));
-  }, [demoMode]);
+  }, [demoMode, router]);
 
-  const handleLoginSuccess = useCallback((officerName: string, bank: string | null): void => {
+  const handleLoginSuccess = useCallback((officerName: string, bank: string | null, role: "admin" | "analyst"): void => {
+    // Same split as the whoami check above: the owner passkey has no business on the bank console.
+    if (role === "admin") { router.replace("/owner"); return; }
     setAuthedOfficer(officerName);
     setAuthedBank(bank);
-  }, []);
+  }, [router]);
 
   const handleLogout = useCallback((): void => {
     clearApiKey();
@@ -1054,6 +1067,14 @@ export default function Home(): ReactElement {
               <span className={`pill s-${a.status}`}>{a.status}</span>
               <span className="pill neutral" title="Which bank this account's data came from">{a.source_bank}</span>
               {a.typology && <span className="pill neutral">{niceType(a.typology)}</span>}
+              {a.identity_status && a.identity_status !== "unconfigured" && (
+                <span
+                  className={`pill ${a.identity_status === "match" ? "ok" : "s-confirmed"}`}
+                  title={a.identity_detail ?? ""}
+                >
+                  ID: {a.identity_status.replace("_", " ")}
+                </span>
+              )}
             </div>
             <div className="row">
               <div className="bar"><div style={{ width: `${Math.round(a.risk_score * 100)}%` }} /></div>
@@ -1739,6 +1760,7 @@ export default function Home(): ReactElement {
                 <div className="row officer-badge">
                   {authedBank && <span className="tenant-badge">{authedBank}</span>}
                   <span className="muted">Signed in as {authedOfficer}</span>
+                  <button className="btn ghost" onClick={() => router.push("/identity")}>Identity check</button>
                   <button className="btn ghost" onClick={handleLogout}>Sign out</button>
                 </div>
               )}

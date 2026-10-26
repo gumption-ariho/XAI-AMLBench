@@ -1,6 +1,13 @@
 # Local-development override: opens ONLY the three ports the venv-run services need, bound to 127.0.0.1 (this laptop only).
 # Use together with the main file, so the data volumes are kept:
 #   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d database redis-feature-cache immudb-audit-ledger
+#
+# It also swaps Traefik onto a real, locally-trusted certificate for https://localhost instead of the
+# self-signed fallback -- see traefik/dynamic.yml's own comment for the one-time mkcert setup. Skip that
+# setup and this still works fine; Traefik just falls back to the self-signed cert exactly as before
+# (meaning the browser's "not private" warning, same as always) since traefik/certs/localhost.pem simply
+# won't exist yet. Add this file whenever you bring up the full app stack too, not just the three ports above:
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml --profile app --profile ml up -d --build
 services:
   database:
     ports: ["127.0.0.1:15432:5432"]      # Postgres
@@ -8,3 +15,10 @@ services:
     ports: ["127.0.0.1:16379:6379"]      # Redis
   immudb-audit-ledger:
     ports: ["127.0.0.1:13322:3322"]      # immudb gRPC (the audit ledger)
+  traefik-edge-router:
+    volumes:
+      - ./traefik/traefik.local.yml:/etc/traefik/traefik.yml:ro
+      - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+      - ./traefik/certs:/certs:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - acme-certs:/letsencrypt

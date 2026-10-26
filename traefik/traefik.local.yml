@@ -1,0 +1,49 @@
+# LOCAL-DEV ONLY variant of traefik.yml -- identical except for the added `providers.file` block at the
+# bottom, which loads dynamic.yml's real, locally-trusted certificate for localhost (see dynamic.yml's own
+# comment for the one-time mkcert setup). Mounted in place of traefik.yml ONLY when you explicitly add
+# docker-compose.local.yml on the command line -- the real deployment never sees this file, and ACME/Let's
+# Encrypt below is untouched either way; this only changes which certificate Traefik falls back to when ACME
+# doesn't have one for the host you're asking for (exactly the localhost case).
+api:
+  dashboard: true
+  insecure: true          # dashboard on :8081 -- DEV ONLY, localhost-bound in docker-compose.yml, not exposed to the internet
+
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+  websecure:
+    address: ":443"
+  traefik:
+    address: ":8081"
+  metrics:
+    address: ":8082"
+
+providers:
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    exposedByDefault: false
+    network: xai-net
+  file:
+    filename: /etc/traefik/dynamic.yml
+
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: "${ACME_EMAIL}"
+      storage: /letsencrypt/acme.json
+      httpChallenge:
+        entryPoint: web
+
+metrics:
+  prometheus:
+    entryPoint: metrics
+
+log:
+  level: INFO
+accessLog: {}

@@ -6,3 +6,4 @@ psycopg[binary]
 immudb-py
 prometheus-fastapi-instrumentator   # real gap found: the backend had zero Prometheus metrics at all, unlike
                                     # gnn-detection-api and xai-narrative-api, which both already use this
+pyotp                               # TOTP 2FA for per-person accounts -- pure Python, no C extension to build

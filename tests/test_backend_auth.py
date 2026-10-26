@@ -1,9 +1,12 @@
 """Tests for backend.main's authentication: the stateless, HMAC-signed session-token system issued by
-POST /api/login (one predefined passkey per role -- ADMIN_PASSKEY / ANALYST_PASSKEY -- plus the person's own
-name). This replaced an earlier per-officer, database-backed API-key system (hash_api_key / the api_keys table /
-manage_keys.py) -- those are gone, and so are the tests that exercised them. Only the database call is mocked
-where a route happens to touch it (login's audit() call); everything else -- FastAPI's own HTTPException, the
-real HMAC signing/verification, the real header-parsing logic -- runs for real.
+POST /api/login (the customer/bank door: ANALYST_PASSKEY or a bank's own passkey, plus the person's own name)
+and POST /api/admin/login (the platform owner's door: ADMIN_PASSKEY only -- split into its own endpoint so
+the admin passkey can never be tried on the same public page every bank tenant signs in on; see login()'s
+and admin_login()'s own docstrings). This replaced an earlier per-officer, database-backed API-key system
+(hash_api_key / the api_keys table / manage_keys.py) -- those are gone, and so are the tests that exercised
+them. Only the database call is mocked where a route happens to touch it (login's audit() call); everything
+else -- FastAPI's own HTTPException, the real HMAC signing/verification, the real header-parsing logic --
+runs for real.
 """
 import os
 import time
@@ -123,14 +126,16 @@ class TestGetCurrentRole:
 
 
 class TestLoginRoute:
-    def test_admin_passkey_issues_an_admin_token(self, monkeypatch):
+    def test_admin_passkey_is_rejected_here_even_though_it_is_correct(self, monkeypatch):
+        # The split that closed a real finding: this is the customer/bank door, and it must NEVER be able to
+        # issue an admin session, even with the genuinely correct ADMIN_PASSKEY -- that only works through
+        # the separate admin_login() below (see login()'s own docstring for why). Before this split, a leaked
+        # or guessed admin passkey was usable on the exact same public page every bank tenant already knows.
         monkeypatch.setattr(m, "ADMIN_PASSKEY", "letmein-admin")
         monkeypatch.setattr(m, "ANALYST_PASSKEY", "letmein-analyst")
-        monkeypatch.setattr(m, "audit", lambda *a, **kw: None)  # no live DB in this test
-        res = m.login(m.LoginRequest(passkey="letmein-admin", name="Jane Smith"))
-        assert res["role"] == "admin"
-        assert res["name"] == "Jane Smith"
-        assert m._decode_session_token(res["token"])["role"] == "admin"
+        with pytest.raises(HTTPException) as exc:
+            m.login(m.LoginRequest(passkey="letmein-admin", name="Jane Smith"))
+        assert exc.value.status_code == 401
 
     def test_analyst_passkey_issues_an_analyst_token(self, monkeypatch):
         monkeypatch.setattr(m, "ADMIN_PASSKEY", "letmein-admin")
@@ -162,15 +167,116 @@ class TestLoginRoute:
         assert exc.value.status_code == 401
 
 
-class TestWhoami:
-    """whoami() is deliberately trivial -- it just echoes the officer name and bank get_current_officer /
-    get_current_bank already resolved and verified (see TestGetCurrentOfficer and TestGetCurrentBank for that
-    logic's real tests). This confirms the route itself returns the correct shape, not a re-test of
-    authentication logic that already has its own tests."""
+class TestAdminLoginRoute:
+    """POST /admin/login -- the ONLY door ADMIN_PASSKEY works through, split out from the customer-facing
+    /login above specifically so a bank tenant's own sign-in page can never be used to try the admin passkey
+    at all (see login()'s and admin_login()'s own docstrings)."""
 
-    def test_returns_the_authenticated_officer_name_and_bank(self):
-        assert m.whoami(officer="Jane Smith", bank=None) == {"officer": "Jane Smith", "bank": None}
-        assert m.whoami(officer="Jane Smith", bank="Acme Bank") == {"officer": "Jane Smith", "bank": "Acme Bank"}
+    def test_admin_passkey_issues_an_admin_token(self, monkeypatch):
+        monkeypatch.setattr(m, "ADMIN_PASSKEY", "letmein-admin")
+        monkeypatch.setattr(m, "audit", lambda *a, **kw: None)
+        res = m.admin_login(m.LoginRequest(passkey="letmein-admin", name="Jane Smith"))
+        assert res["role"] == "admin"
+        assert res["name"] == "Jane Smith"
+        assert res["bank"] is None
+        assert m._decode_session_token(res["token"])["role"] == "admin"
+
+    def test_analyst_passkey_does_not_work_here(self, monkeypatch):
+        monkeypatch.setattr(m, "ADMIN_PASSKEY", "letmein-admin")
+        monkeypatch.setattr(m, "ANALYST_PASSKEY", "letmein-analyst")
+        with pytest.raises(HTTPException) as exc:
+            m.admin_login(m.LoginRequest(passkey="letmein-analyst", name="Jane Smith"))
+        assert exc.value.status_code == 401
+
+    def test_bank_passkey_does_not_work_here(self, monkeypatch):
+        monkeypatch.setattr(m, "ADMIN_PASSKEY", "letmein-admin")
+        monkeypatch.setattr(m, "PASSKEY_TO_BANK", {"acme-secret": "Acme Bank"})
+        with pytest.raises(HTTPException) as exc:
+            m.admin_login(m.LoginRequest(passkey="acme-secret", name="Jane Smith"))
+        assert exc.value.status_code == 401
+
+    def test_unconfigured_admin_passkey_never_matches_anything(self, monkeypatch):
+        monkeypatch.setattr(m, "ADMIN_PASSKEY", None)
+        with pytest.raises(HTTPException) as exc:
+            m.admin_login(m.LoginRequest(passkey="None", name="Jane Smith"))
+        assert exc.value.status_code == 401
+
+    def test_blank_name_is_rejected(self, monkeypatch):
+        monkeypatch.setattr(m, "ADMIN_PASSKEY", "letmein-admin")
+        with pytest.raises(HTTPException) as exc:
+            m.admin_login(m.LoginRequest(passkey="letmein-admin", name="   "))
+        assert exc.value.status_code == 400
+
+
+class TestWhoami:
+    """whoami() is deliberately trivial -- it just echoes the officer name, bank, and role get_current_officer /
+    get_current_bank / get_current_role already resolved and verified (see TestGetCurrentOfficer,
+    TestGetCurrentBank and TestGetCurrentRole for that logic's real tests). This confirms the route itself
+    returns the correct shape, not a re-test of authentication logic that already has its own tests. `role` was
+    added so the frontend can route an admin session to the owner backoffice (/owner) instead of the bank
+    console -- see frontend/src/app/owner/page.tsx and page.tsx's whoami-driven redirect."""
+
+    def test_returns_the_authenticated_officer_name_bank_and_role(self):
+        assert m.whoami(officer="Jane Smith", bank=None, role="admin") == \
+            {"officer": "Jane Smith", "bank": None, "role": "admin"}
+        assert m.whoami(officer="Jane Smith", bank="Acme Bank", role="analyst") == \
+            {"officer": "Jane Smith", "bank": "Acme Bank", "role": "analyst"}
+
+
+class TestAdminTenants:
+    """GET /admin/tenants backs the owner backoffice (frontend/src/app/owner/page.tsx) -- the one route in this
+    file that genuinely must refuse a non-admin caller, since it's the only place a bank-tenant or legacy
+    shared-analyst session could otherwise see every OTHER bank's volumes in one call. This only tests that
+    gate (the part a role mix-up would actually break); the query itself is exercised for real in
+    tests/test_livegraph.py-adjacent integration coverage, not re-mocked here."""
+
+    def test_a_non_admin_role_is_refused_with_403(self):
+        # "analyst" covers both a BANK_PASSKEYS tenant AND the legacy single-institution ANALYST_PASSKEY --
+        # neither gets the platform-wide view, only ADMIN_PASSKEY's "admin" role does.
+        with pytest.raises(HTTPException) as exc:
+            m.admin_tenants(role="analyst", officer="Jane Smith")
+        assert exc.value.status_code == 403
+        assert "admin" in exc.value.detail
+
+
+class TestTenantManagementRoleGate:
+    """The rest of the owner backoffice's write routes (add/suspend/remove a bank, list/approve/decline a
+    signup request) -- every one of them checks role before touching the database, same pattern as
+    admin_tenants above and for the same reason: a bank-tenant or legacy-analyst session must never manage
+    OTHER tenants, even by guessing the URL. This covers only that gate (the part that would actually break
+    tenant isolation if removed or mistyped), not the DB-backed happy path -- this project's tests don't mock
+    psycopg connections anywhere else either, so that part is exercised for real against a live Postgres."""
+
+    def test_create_bank_refuses_non_admin(self):
+        with pytest.raises(HTTPException) as exc:
+            m.admin_create_bank(m.CreateBankRequest(name="Acme Bank"), role="analyst", officer="Jane Smith")
+        assert exc.value.status_code == 403
+
+    def test_set_bank_status_refuses_non_admin(self):
+        with pytest.raises(HTTPException) as exc:
+            m.admin_set_bank_status("Acme Bank", m.BankStatusRequest(status="suspended"),
+                                    role="analyst", officer="Jane Smith")
+        assert exc.value.status_code == 403
+
+    def test_delete_bank_refuses_non_admin(self):
+        with pytest.raises(HTTPException) as exc:
+            m.admin_delete_bank("Acme Bank", role="analyst", officer="Jane Smith")
+        assert exc.value.status_code == 403
+
+    def test_list_signup_requests_refuses_non_admin(self):
+        with pytest.raises(HTTPException) as exc:
+            m.admin_list_signup_requests(status="pending", role="analyst")
+        assert exc.value.status_code == 403
+
+    def test_approve_signup_request_refuses_non_admin(self):
+        with pytest.raises(HTTPException) as exc:
+            m.admin_approve_signup_request(1, role="analyst", officer="Jane Smith")
+        assert exc.value.status_code == 403
+
+    def test_decline_signup_request_refuses_non_admin(self):
+        with pytest.raises(HTTPException) as exc:
+            m.admin_decline_signup_request(1, role="analyst", officer="Jane Smith")
+        assert exc.value.status_code == 403
 
 
 class TestGetCurrentBank:
@@ -236,11 +342,14 @@ class TestBankPasskeyLogin:
         assert beta["bank"] == "Beta Bank"
 
     def test_admin_passkey_still_has_no_bank_even_when_bank_passkeys_are_configured(self, monkeypatch):
+        # Admin login moved to its own endpoint (see TestAdminLoginRoute) -- this now exercises admin_login()
+        # directly, keeping the original point: an admin token never carries a bank, even with BANK_PASSKEYS
+        # configured alongside it.
         monkeypatch.setattr(m, "ADMIN_PASSKEY", "letmein-admin")
         monkeypatch.setattr(m, "ANALYST_PASSKEY", None)
         monkeypatch.setattr(m, "PASSKEY_TO_BANK", {"acme-secret": "Acme Bank"})
         monkeypatch.setattr(m, "audit", lambda *a, **kw: None)
-        res = m.login(m.LoginRequest(passkey="letmein-admin", name="Jane Smith"))
+        res = m.admin_login(m.LoginRequest(passkey="letmein-admin", name="Jane Smith"))
         assert res["role"] == "admin"
         assert res["bank"] is None
 
@@ -369,4 +478,280 @@ class TestIntakeClear:
         assert "DELETE FROM alerts" not in src
         assert "DELETE FROM anomaly_alerts" not in src
         assert "UPDATE alerts" not in src
-        assert "UPDATE anomaly_alerts" not in src
+
+
+class TestPasswordHashing:
+    """_hash_password/_verify_password -- the per-person-account counterpart to a bank's shared passkey. Pure
+    stdlib (hashlib.scrypt), no DB involved at all."""
+
+    def test_correct_password_verifies(self):
+        h, salt = m._hash_password("a-real-password-123")
+        assert m._verify_password("a-real-password-123", h, salt)
+
+    def test_wrong_password_does_not_verify(self):
+        h, salt = m._hash_password("a-real-password-123")
+        assert not m._verify_password("guessing", h, salt)
+
+    def test_same_password_different_salts_gives_different_hashes(self):
+        h1, salt1 = m._hash_password("a-real-password-123")
+        h2, salt2 = m._hash_password("a-real-password-123")
+        assert salt1 != salt2       # a fresh random salt every time a password is set
+        assert h1 != h2             # so the stored hash differs too, even for the identical password
+
+    def test_verifying_against_the_wrong_salt_fails_even_with_the_right_password(self):
+        h, _salt = m._hash_password("a-real-password-123")
+        _, other_salt = m._hash_password("unrelated")
+        assert not m._verify_password("a-real-password-123", h, other_salt)
+
+
+class TestGetCurrentUserId:
+    """The dependency that gates 2FA setup/enable/disable and any future per-account-settings route -- only a
+    per-person session (one with a `uid` claim, issued by POST /auth/login) may pass it."""
+
+    def test_demo_bypass_is_refused(self, monkeypatch):
+        monkeypatch.setattr(m, "DEMO_LOGIN_BYPASS", True)
+        with pytest.raises(HTTPException) as exc:
+            m.get_current_user_id(authorization=None)
+        assert exc.value.status_code == 403
+
+    def test_missing_header_is_rejected(self, monkeypatch):
+        monkeypatch.setattr(m, "DEMO_LOGIN_BYPASS", False)
+        with pytest.raises(HTTPException) as exc:
+            m.get_current_user_id(authorization=None)
+        assert exc.value.status_code == 401
+
+    def test_a_shared_passkey_session_has_no_uid_and_is_refused(self, monkeypatch):
+        # issue_session_token with no uid -- exactly what /login (the shared-passkey route) issues
+        monkeypatch.setattr(m, "DEMO_LOGIN_BYPASS", False)
+        token = m.issue_session_token("Jane Smith", "analyst")
+        with pytest.raises(HTTPException) as exc:
+            m.get_current_user_id(authorization=f"Bearer {token}")
+        assert exc.value.status_code == 403
+
+    def test_a_per_person_session_returns_its_uid(self, monkeypatch):
+        monkeypatch.setattr(m, "DEMO_LOGIN_BYPASS", False)
+        token = m.issue_session_token("Jane Smith", "analyst", bank=None, uid=42)
+        assert m.get_current_user_id(authorization=f"Bearer {token}") == 42
+
+
+class TestUserManagementRoleGate:
+    """Same pattern as TestTenantManagementRoleGate above: every admin/users route checks role=="admin" before
+    doing anything else, so a non-admin call never reaches the database at all -- these can be asserted
+    without mocking db()."""
+
+    def test_invite_user_refuses_non_admin(self):
+        with pytest.raises(HTTPException) as exc:
+            m.admin_invite_user(
+                m.InviteUserRequest(name="Jane", email="jane@bank.com"), role="analyst", officer="Jane Smith",
+            )
+        assert exc.value.status_code == 403
+
+    def test_list_users_refuses_non_admin(self):
+        with pytest.raises(HTTPException) as exc:
+            m.admin_list_users(bank=None, role="analyst")
+        assert exc.value.status_code == 403
+
+    def test_set_user_status_refuses_non_admin(self):
+        with pytest.raises(HTTPException) as exc:
+            m.admin_set_user_status(1, m.UserStatusRequest(status="disabled"), role="analyst", officer="Jane Smith")
+        assert exc.value.status_code == 403
+
+    def test_delete_user_refuses_non_admin(self):
+        with pytest.raises(HTTPException) as exc:
+            m.admin_delete_user(1, role="analyst", officer="Jane Smith")
+        assert exc.value.status_code == 403
+
+    def test_invite_refuses_a_bank_scoped_admin(self):
+        # there is no such thing as a bank-scoped admin -- see InviteUserRequest's own docstring/comment
+        with pytest.raises(HTTPException) as exc:
+            m.admin_invite_user(
+                m.InviteUserRequest(name="Jane", email="jane@bank.com", bank="Acme Bank", role="admin"),
+                role="admin", officer="Owner",
+            )
+        assert exc.value.status_code == 400
+
+
+class TestAuthLogin:
+    """POST /auth/login -- the per-person email+password counterpart to the shared-passkey /login. Rate
+    limiting and attempt-recording are stubbed out here (they have their own DB-outage-fails-open behavior,
+    not re-tested per call site); db() is faked to return one fixed user row per test, the same shape the
+    real SELECT in auth_login() returns."""
+
+    def _stub_rate_limit(self, monkeypatch):
+        monkeypatch.setattr(m, "_check_login_rate_limit", lambda identifier: None)
+        monkeypatch.setattr(m, "_record_login_attempt", lambda identifier, success: None)
+        monkeypatch.setattr(m, "audit", lambda *a, **kw: None)
+
+    def _fake_db(self, monkeypatch, user_row):
+        class FakeCursor:
+            def fetchone(self):
+                return user_row
+
+        class FakeConn:
+            def execute(self, *a, **kw):
+                return FakeCursor()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        monkeypatch.setattr(m, "db", lambda: FakeConn())
+
+    def test_unknown_email_is_rejected_generically(self, monkeypatch):
+        self._stub_rate_limit(monkeypatch)
+        self._fake_db(monkeypatch, None)
+        with pytest.raises(HTTPException) as exc:
+            m.auth_login(m.AuthLoginRequest(email="nobody@example.com", password="whatever-123"))
+        assert exc.value.status_code == 401
+        assert "invalid email or password" in exc.value.detail
+
+    def test_disabled_account_is_rejected_generically(self, monkeypatch):
+        self._stub_rate_limit(monkeypatch)
+        pw_hash, pw_salt = m._hash_password("correct-password-1")
+        self._fake_db(monkeypatch, {
+            "id": 1, "name": "Jane", "email": "jane@bank.com", "bank": None, "role": "analyst",
+            "status": "disabled", "password_hash": pw_hash, "password_salt": pw_salt,
+            "totp_enabled": False, "totp_secret": None,
+        })
+        with pytest.raises(HTTPException) as exc:
+            m.auth_login(m.AuthLoginRequest(email="jane@bank.com", password="correct-password-1"))
+        assert exc.value.status_code == 401
+
+    def test_wrong_password_is_rejected(self, monkeypatch):
+        self._stub_rate_limit(monkeypatch)
+        pw_hash, pw_salt = m._hash_password("correct-password-1")
+        self._fake_db(monkeypatch, {
+            "id": 1, "name": "Jane", "email": "jane@bank.com", "bank": None, "role": "analyst",
+            "status": "active", "password_hash": pw_hash, "password_salt": pw_salt,
+            "totp_enabled": False, "totp_secret": None,
+        })
+        with pytest.raises(HTTPException) as exc:
+            m.auth_login(m.AuthLoginRequest(email="jane@bank.com", password="wrong-password"))
+        assert exc.value.status_code == 401
+
+    def test_correct_password_without_2fa_issues_a_token_bound_to_that_user(self, monkeypatch):
+        self._stub_rate_limit(monkeypatch)
+        pw_hash, pw_salt = m._hash_password("correct-password-1")
+        self._fake_db(monkeypatch, {
+            "id": 42, "name": "Jane", "email": "jane@bank.com", "bank": "Acme Bank", "role": "analyst",
+            "status": "active", "password_hash": pw_hash, "password_salt": pw_salt,
+            "totp_enabled": False, "totp_secret": None,
+        })
+        res = m.auth_login(m.AuthLoginRequest(email="jane@bank.com", password="correct-password-1"))
+        assert res["bank"] == "Acme Bank"
+        assert m._decode_session_token(res["token"])["uid"] == 42
+
+    def test_correct_password_with_2fa_enabled_but_no_code_asks_for_one(self, monkeypatch):
+        self._stub_rate_limit(monkeypatch)
+        pw_hash, pw_salt = m._hash_password("correct-password-1")
+        self._fake_db(monkeypatch, {
+            "id": 1, "name": "Jane", "email": "jane@bank.com", "bank": None, "role": "analyst",
+            "status": "active", "password_hash": pw_hash, "password_salt": pw_salt,
+            "totp_enabled": True, "totp_secret": "JBSWY3DPEHPK3PXP",
+        })
+        with pytest.raises(HTTPException) as exc:
+            m.auth_login(m.AuthLoginRequest(email="jane@bank.com", password="correct-password-1"))
+        assert exc.value.status_code == 401
+        assert exc.value.detail == "totp_required"
+
+    def test_correct_password_with_valid_totp_code_succeeds(self, monkeypatch):
+        import pyotp
+        self._stub_rate_limit(monkeypatch)
+        secret = pyotp.random_base32()
+        pw_hash, pw_salt = m._hash_password("correct-password-1")
+        self._fake_db(monkeypatch, {
+            "id": 7, "name": "Jane", "email": "jane@bank.com", "bank": None, "role": "admin",
+            "status": "active", "password_hash": pw_hash, "password_salt": pw_salt,
+            "totp_enabled": True, "totp_secret": secret,
+        })
+        code = pyotp.TOTP(secret).now()
+        res = m.auth_login(
+            m.AuthLoginRequest(email="jane@bank.com", password="correct-password-1", totp_code=code),
+        )
+        assert m._decode_session_token(res["token"])["uid"] == 7
+
+    def test_correct_password_with_wrong_totp_code_is_rejected(self, monkeypatch):
+        import pyotp
+        self._stub_rate_limit(monkeypatch)
+        secret = pyotp.random_base32()
+        pw_hash, pw_salt = m._hash_password("correct-password-1")
+        self._fake_db(monkeypatch, {
+            "id": 7, "name": "Jane", "email": "jane@bank.com", "bank": None, "role": "admin",
+            "status": "active", "password_hash": pw_hash, "password_salt": pw_salt,
+            "totp_enabled": True, "totp_secret": secret,
+        })
+        with pytest.raises(HTTPException) as exc:
+            m.auth_login(m.AuthLoginRequest(
+                email="jane@bank.com", password="correct-password-1", totp_code="000000",
+            ))
+        assert exc.value.status_code == 401
+        assert exc.value.detail != "totp_required"   # a wrong code is a distinct failure from "no code yet"
+
+
+class Test2faSetupEnableDisable:
+    def _fake_db(self, monkeypatch, fetchone_results):
+        results = list(fetchone_results)
+
+        class FakeCursor:
+            def __init__(self, result):
+                self._result = result
+
+            def fetchone(self):
+                return self._result
+
+        class FakeConn:
+            def execute(self, *a, **kw):
+                result = results.pop(0) if results else None
+                return FakeCursor(result)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        monkeypatch.setattr(m, "db", lambda: FakeConn())
+        monkeypatch.setattr(m, "audit", lambda *a, **kw: None)
+
+    def test_setup_returns_a_secret_and_provisioning_uri(self, monkeypatch):
+        self._fake_db(monkeypatch, [{"email": "jane@bank.com"}])
+        res = m.setup_2fa(uid=1)
+        assert len(res["secret"]) >= 16
+        assert res["provisioning_uri"].startswith("otpauth://")
+
+    def test_enable_requires_setup_to_have_run_first(self, monkeypatch):
+        self._fake_db(monkeypatch, [{"totp_secret": None}])
+        with pytest.raises(HTTPException) as exc:
+            m.enable_2fa(m.Totp2faVerifyRequest(code="123456"), uid=1)
+        assert exc.value.status_code == 400
+
+    def test_enable_rejects_a_wrong_code(self, monkeypatch):
+        import pyotp
+        secret = pyotp.random_base32()
+        self._fake_db(monkeypatch, [{"totp_secret": secret}])
+        with pytest.raises(HTTPException) as exc:
+            m.enable_2fa(m.Totp2faVerifyRequest(code="000000"), uid=1)
+        assert exc.value.status_code == 401
+
+    def test_enable_accepts_the_correct_code(self, monkeypatch):
+        import pyotp
+        secret = pyotp.random_base32()
+        self._fake_db(monkeypatch, [{"totp_secret": secret}, None])
+        res = m.enable_2fa(m.Totp2faVerifyRequest(code=pyotp.TOTP(secret).now()), uid=1)
+        assert res["totp_enabled"] is True
+
+    def test_disable_refuses_when_2fa_is_not_enabled(self, monkeypatch):
+        self._fake_db(monkeypatch, [{"totp_secret": None, "totp_enabled": False}])
+        with pytest.raises(HTTPException) as exc:
+            m.disable_2fa(m.Totp2faVerifyRequest(code="123456"), uid=1)
+        assert exc.value.status_code == 400
+
+    def test_disable_requires_a_valid_code_even_though_already_signed_in(self, monkeypatch):
+        import pyotp
+        secret = pyotp.random_base32()
+        self._fake_db(monkeypatch, [{"totp_secret": secret, "totp_enabled": True}])
+        with pytest.raises(HTTPException) as exc:
+            m.disable_2fa(m.Totp2faVerifyRequest(code="000000"), uid=1)
+        assert exc.value.status_code == 401

@@ -32,9 +32,17 @@ export const hasStoredApiKey = hasStoredSessionToken;
 export const setApiKey = setSessionToken;
 export const clearApiKey = clearSessionToken;
 
+// Public, unauthenticated routes -- same treatment as /health and /login: never attach a stale Authorization
+// header (harmless either way, since the backend ignores it on these), and never let a 401 FROM one of these
+// (a wrong password, a missing 2FA code) clear out some unrelated already-signed-in session this tab happens
+// to be holding in sessionStorage at the same time.
+const PUBLIC_PATHS = ["/health", "/login", "/admin/login", "/auth/login", "/auth/signup", "/auth/accept-invite",
+  "/auth/forgot-password", "/auth/reset-password", "/signup-requests", "/public"];
+
 export async function api<T>(path: string, options?: RequestInit): Promise<T> {
+  const isPublic = PUBLIC_PATHS.some((p) => path === p || path.startsWith(`${p}/`));
   const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (path !== "/health" && path !== "/login") {
+  if (!isPublic) {
     const token = getStoredSessionToken();
     if (token) headers["Authorization"] = `Bearer ${token}`;
   }
@@ -51,7 +59,7 @@ export async function api<T>(path: string, options?: RequestInit): Promise<T> {
     data = { detail: text };
   }
 
-  if (res.status === 401 && path !== "/login") {
+  if (res.status === 401 && !isPublic) {
     clearSessionToken();   // the stored token was rejected (wrong, expired, or the server restarted and
                            // rotated its signing secret) -- drop it so the app re-shows the login screen
                            // rather than silently retrying the same bad token forever

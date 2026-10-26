@@ -1,11 +1,22 @@
 # Static configuration for Traefik v3 (container 1)
 api:
   dashboard: true
-  insecure: true          # dashboard on :8081 -- DEV ONLY, remove for production
+  insecure: true          # dashboard on :8081 -- DEV ONLY, localhost-bound in docker-compose.yml, not exposed to the internet
 
 entryPoints:
   web:
     address: ":80"
+    http:
+      # Every plain-HTTP request is redirected to HTTPS before it reaches any router below -- so a passkey
+      # typed on http://yourdomain never actually travels unencrypted, even if someone links the http:// URL
+      # by mistake. (301, not a silent proxy: the browser's address bar ends up on https:// too.)
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+  websecure:
+    address: ":443"
   traefik:
     address: ":8081"
   metrics:
@@ -16,6 +27,20 @@ providers:
     endpoint: "unix:///var/run/docker.sock"
     exposedByDefault: false          # only containers with traefik.enable=true are routed
     network: xai-net
+
+# Let's Encrypt. On first boot, Traefik requests a real certificate for ${PUBLIC_HOST} using the HTTP-01
+# challenge (it answers a one-time HTTP request from Let's Encrypt on port 80, which is why port 80 must stay
+# reachable from the internet even though it immediately redirects everything else to 443). The certificate
+# is cached in /letsencrypt/acme.json (see the acme-certs volume in docker-compose.yml) and auto-renews --
+# nothing to run by hand afterward. ACME_EMAIL only receives renewal-failure warnings from Let's Encrypt, it
+# is never shown to visitors.
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: "${ACME_EMAIL}"
+      storage: /letsencrypt/acme.json
+      httpChallenge:
+        entryPoint: web
 
 metrics:
   prometheus:

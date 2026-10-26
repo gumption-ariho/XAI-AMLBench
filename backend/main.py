@@ -53,7 +53,8 @@ from typing import Literal
 
 import httpx
 import psycopg
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException
+import pyotp
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
 from prometheus_fastapi_instrumentator import Instrumentator, metrics
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
@@ -121,6 +122,127 @@ CREATE TABLE IF NOT EXISTS anomaly_alerts (
     trained_at        TIMESTAMPTZ   -- set once gnn_aml_core.anomaly has fed a confirmed_mule case into Model 1
 );
 CREATE INDEX IF NOT EXISTS anomaly_alerts_status_idx ON anomaly_alerts (status);
+
+-- DB-backed tenants: this is what lets the owner add/suspend/remove a bank from the /owner backoffice at
+-- runtime, no .env edit and no restart -- the BANK_PASSKEYS env var (see its own comment above
+-- _BANK_PASSKEYS_RAW below) still works too, as a legacy/static set of tenants, and the two are merged at
+-- login time, env first: an env-configured bank name can't be shadowed or suspended by a row here, since the
+-- operator who controls the env file already has the stronger form of control.
+CREATE TABLE IF NOT EXISTS banks (
+    name          TEXT        PRIMARY KEY,
+    passkey       TEXT        NOT NULL,
+    status        TEXT        NOT NULL DEFAULT 'active',   -- active | suspended
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    logo_url      TEXT,
+    accent_color  TEXT,
+    contact_email TEXT   -- who notify_email() tells about a new alert for this bank, if set (see POST
+                         -- /alerts/scan and /system/live-ingest); null is a silent no-op, same as SMTP_HOST unset
+);
+-- Full registration detail, captured when the bank itself signs up (see SignupRequestBody/create_signup_request
+-- below) or added by the owner by hand (CreateBankRequest/admin_create_bank) -- this is what lets the owner
+-- actually tell WHICH bank this is and where: its own registration/license number, which country/region it
+-- operates in, a postal address, a public website. All nullable and never guessed -- a bank added before this
+-- field existed, or added manually with only a name on hand, simply shows blanks here, not invented values.
+ALTER TABLE banks ADD COLUMN IF NOT EXISTS registration_number TEXT;
+ALTER TABLE banks ADD COLUMN IF NOT EXISTS country TEXT;
+ALTER TABLE banks ADD COLUMN IF NOT EXISTS region TEXT;
+ALTER TABLE banks ADD COLUMN IF NOT EXISTS address TEXT;
+ALTER TABLE banks ADD COLUMN IF NOT EXISTS website TEXT;
+
+-- A bank that wants in but hasn't been given a passkey yet -- the public, unauthenticated "request access"
+-- form posts here (POST /signup-requests); the owner backoffice lists pending rows and turns an approval
+-- into a real `banks` row (generating its passkey) in one action. Deliberately its own table, not a status
+-- column tacked onto `banks`, since a request isn't a tenant yet and never silently becomes one without the
+-- owner acting on it.
+CREATE TABLE IF NOT EXISTS signup_requests (
+    id            SERIAL PRIMARY KEY,
+    bank_name     TEXT        NOT NULL,
+    contact_name  TEXT        NOT NULL,
+    contact_email TEXT        NOT NULL,
+    note          TEXT        NOT NULL DEFAULT '',
+    status        TEXT        NOT NULL DEFAULT 'pending',   -- pending | approved | declined
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    decided_at    TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS signup_requests_status_idx ON signup_requests (status);
+-- Same registration detail as banks' own new columns (see the ALTER TABLE block above `banks`) -- carried on
+-- the REQUEST too, not just the eventual tenant, so approving a request (admin_approve_signup_request) can
+-- copy it straight across instead of asking the bank to re-enter it a second time.
+ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS registration_number TEXT;
+ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS country TEXT;
+ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS region TEXT;
+ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS address TEXT;
+ALTER TABLE signup_requests ADD COLUMN IF NOT EXISTS website TEXT;
+
+-- Per-person accounts, layered on top of (not replacing) the shared admin/analyst/bank passkeys above. A
+-- passkey still works exactly as before -- this exists so one compromised or departing person's access can be
+-- revoked without rotating an entire bank's passkey and handing out a new one to everybody else there. `bank`
+-- is NULL for a platform-level account (an owner-side admin); a bank-scoped account always has role='analyst'
+-- (there is no bank-scoped admin -- see admin_invite_user()'s own check). `password_hash`/`password_salt` are
+-- NULL until the invite is accepted (see accept-invite below); `status='invited'` cannot sign in either way.
+--
+-- 'pending' is the other way a row here gets created: a bank's own analyst self-registering on the public
+-- /analyst-signup page (POST /auth/signup) rather than being invited by the owner. That row already HAS a
+-- password (the person set it themselves at signup) but stays unable to sign in -- /auth/login only accepts
+-- status='active' -- until the owner reviews and approves it from the "People" section of /owner. This is the
+-- enforcement point behind "only people whose details are registered get an account, and every account is
+-- tied to exactly one specific bank chosen at signup, never guessed, never shared across banks": a passkey
+-- still proves a ROLE and a TENANT the way it always did, but a per-person account proves a specific person
+-- vouched for, one bank at a time, by the owner.
+CREATE TABLE IF NOT EXISTS users (
+    id              SERIAL PRIMARY KEY,
+    bank            TEXT,
+    name            TEXT        NOT NULL,
+    email           TEXT        NOT NULL,
+    role            TEXT        NOT NULL DEFAULT 'analyst',   -- admin | analyst
+    status          TEXT        NOT NULL DEFAULT 'invited',   -- invited | pending | active | disabled
+    password_hash   TEXT,
+    password_salt   TEXT,
+    totp_secret     TEXT,
+    totp_enabled    BOOLEAN     NOT NULL DEFAULT false,
+    invite_token    TEXT,
+    invite_expires  TIMESTAMPTZ,
+    reset_token     TEXT,
+    reset_expires   TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS users_email_idx ON users (lower(email));
+CREATE INDEX IF NOT EXISTS users_invite_token_idx ON users (invite_token);
+CREATE INDEX IF NOT EXISTS users_reset_token_idx ON users (reset_token);
+
+-- One row per login attempt (success or failure), used only to answer "how many recent failures for this
+-- identifier" -- see _check_login_rate_limit() below. Pruned lazily (a DELETE of rows older than the lockout
+-- window runs inside the same check, so this table never grows unbounded even with no separate cron job).
+CREATE TABLE IF NOT EXISTS login_attempts (
+    id          SERIAL PRIMARY KEY,
+    identifier  TEXT        NOT NULL,   -- IP address, or IP address + the passkey/email tried, see caller
+    success     BOOLEAN     NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS login_attempts_identifier_idx ON login_attempts (identifier, created_at);
+
+-- Identity verification checks (see check_identity() below) -- "does this ID number actually belong to a
+-- real, living person, and does that person's real name match the name on this account". Deliberately never
+-- stores the raw national ID number: only a SHA-256 hash (for "has this exact ID been checked before")
+-- plus the last 4 characters for an officer to visually confirm which ID a row refers to. The hash still
+-- lets two different accounts that share one stolen ID surface as a pattern without this table itself
+-- becoming a second place a real ID number could leak from.
+CREATE TABLE IF NOT EXISTS identity_checks (
+    id              SERIAL PRIMARY KEY,
+    account_id      TEXT        NOT NULL,
+    bank            TEXT        NOT NULL DEFAULT 'unknown',
+    claimed_name    TEXT        NOT NULL,
+    id_number_hash  TEXT        NOT NULL,
+    id_number_last4 TEXT        NOT NULL,
+    provider        TEXT        NOT NULL,   -- which IDENTITY_PROVIDER ran this check, or 'unconfigured'
+    status          TEXT        NOT NULL,   -- unconfigured | match | mismatch | not_found | deceased | provider_error
+    detail          TEXT        NOT NULL DEFAULT '',
+    raw_response    JSONB,                  -- whatever the provider returned, for an officer who wants the full record
+    checked_by      TEXT        NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS identity_checks_account_idx ON identity_checks (account_id);
+CREATE INDEX IF NOT EXISTS identity_checks_bank_idx ON identity_checks (bank);
 """
 
 
@@ -181,6 +303,172 @@ def audit(kind: str, payload: dict) -> None:
         _immu = None
 
 
+# ------------------------------------------------------------------ email notifications
+# Off unless SMTP_HOST is set in .env -- same optional-service pattern as audit()/immudb above: nothing here
+# ever blocks or fails the request that triggered it. This deployment has no email provider wired up out of
+# the box (no SendGrid/Resend/SES account comes bundled, by design -- that's a real external account someone
+# has to create), so until SMTP_HOST is set this silently no-ops and the only place a new alert surfaces is
+# the console itself. Set SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASSWORD/SMTP_FROM in .env to turn it on.
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM = os.getenv("SMTP_FROM", "alerts@xai-amlbench.local")
+
+
+def notify_email(to: list[str], subject: str, body: str) -> None:
+    """Best-effort email notification -- never raises, never blocks the caller on a slow/down SMTP server
+    beyond its own short timeout. `to` with no addresses is a silent no-op (a bank that hasn't set a contact
+    email yet just doesn't get notified, same as SMTP_HOST being unset entirely)."""
+    if not SMTP_HOST or not to:
+        return
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+        msg = MIMEText(body)
+        msg["Subject"] = subject
+        msg["From"] = SMTP_FROM
+        msg["To"] = ", ".join(to)
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=8) as s:
+            s.starttls()
+            if SMTP_USER:
+                s.login(SMTP_USER, SMTP_PASSWORD)
+            s.sendmail(SMTP_FROM, to, msg.as_string())
+    except Exception as exc:  # noqa: BLE001 -- a notification failing must never fail the alert/scan it rode in on
+        log.warning("email notification failed (%s)", exc.__class__.__name__)
+
+
+# ------------------------------------------------------------------ identity verification (ID-theft check)
+# Answers one question only: does this claimed name/ID number pair match a real identity on file with
+# whichever KYC/identity-verification provider you've configured below (e.g. Smile ID, which backs its Kenya
+# checks with the government's own IPRS registry)? It does NOT and CANNOT answer "is the real owner aware
+# this account exists" -- no API can; that is a manual follow-up step, which is why a mismatch below is
+# surfaced as "needs manual follow-up", never as a verdict. It also does NOT reliably know whether the real
+# ID holder has died -- some providers expose a deceased flag from the civil registry and some don't; this
+# adapter passes through whatever the provider actually returns rather than inventing a field for one that
+# doesn't.
+#
+# Unconfigured by default (IDENTITY_PROVIDER unset) -- every check then returns status="unconfigured" rather
+# than silently pretending to have verified something. Once you have a real account with a provider:
+#   IDENTITY_PROVIDER=<any name, just a label for the UI/audit trail>
+#   IDENTITY_API_URL=<the provider's real endpoint for a single identity/ID-number lookup>
+#   IDENTITY_API_KEY=<your key from that provider>
+#
+# IMPORTANT: the request/response shape below is a generic placeholder (name + id_number in, a few common
+# field names read back out) -- it is NOT verified against any specific provider's real API, because no
+# provider was named or an account provided. Every real KYC provider (Smile ID, Onfido, Trulioo, ...) has its
+# own exact request format, auth header, and response field names, documented once you have an account with
+# them. Before this goes live: open that provider's API reference and adjust the request body built below and
+# the field names read out of `data` to match it exactly -- this function is the ONLY place that needs to
+# change.
+IDENTITY_PROVIDER = os.getenv("IDENTITY_PROVIDER", "")
+IDENTITY_API_URL = os.getenv("IDENTITY_API_URL", "")
+IDENTITY_API_KEY = os.getenv("IDENTITY_API_KEY", "")
+
+
+def check_identity(claimed_name: str, id_number: str) -> dict:
+    """Returns {status, detail, raw}. status is one of:
+      unconfigured   -- IDENTITY_PROVIDER/IDENTITY_API_URL/IDENTITY_API_KEY not set
+      match          -- provider confirms a real identity with this ID number, name matches
+      mismatch       -- provider found a real identity with this ID number, but the name does NOT match
+                        (the classic stolen-ID pattern: a real ID number, a different real owner)
+      not_found      -- provider has no record of this ID number at all
+      deceased       -- provider's own record marks the real ID holder as deceased (ONLY set if the
+                        provider actually returns such a flag -- never inferred)
+      provider_error -- the provider call itself failed (network, auth, bad response) -- NOT the same as
+                        "not_found"; this means we don't actually know yet, re-run once the provider is reachable
+    Never raises -- a provider outage must surface as a status an officer can see and act on, not a 500 that
+    takes the rest of the check down with it."""
+    if not (IDENTITY_PROVIDER and IDENTITY_API_URL and IDENTITY_API_KEY):
+        return {"status": "unconfigured",
+                "detail": "No identity-verification provider is configured (set IDENTITY_PROVIDER, "
+                          "IDENTITY_API_URL, IDENTITY_API_KEY in .env). This account's identity has NOT been "
+                          "verified against any external source.",
+                "raw": None}
+    try:
+        r = httpx.post(
+            IDENTITY_API_URL,
+            headers={"Authorization": f"Bearer {IDENTITY_API_KEY}", "Content-Type": "application/json"},
+            json={"name": claimed_name, "id_number": id_number},   # <-- adjust to the real provider's request shape
+            timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except httpx.HTTPError as exc:
+        log.warning("identity provider call failed (%s)", exc.__class__.__name__)
+        return {"status": "provider_error", "detail": f"{exc.__class__.__name__}: {exc}", "raw": None}
+
+    # <-- adjust these field reads to the real provider's response shape
+    found = bool(data.get("found", data.get("exists")))
+    name_match = bool(data.get("name_match", data.get("match")))
+    deceased = bool(data.get("deceased")) if "deceased" in data else None
+
+    if not found:
+        return {"status": "not_found",
+                "detail": "No record of this ID number was found with the configured provider.", "raw": data}
+    if deceased:
+        return {"status": "deceased",
+                "detail": "The provider's own record marks this ID's registered owner as deceased.", "raw": data}
+    if not name_match:
+        return {"status": "mismatch",
+                "detail": "This ID number is real, but its registered owner's name does NOT match the name "
+                          "on this account. This needs manual follow-up with the real owner of record -- no "
+                          "system can confirm on its own whether they are aware of this account.", "raw": data}
+    return {"status": "match", "detail": "The claimed name matches this ID number's registered owner.", "raw": data}
+
+
+def _store_identity_check(account_id: str, bank: str, claimed_name: str, id_number: str, result: dict, by: str) -> None:
+    id_hash = hashlib.sha256(id_number.encode()).hexdigest()
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO identity_checks (account_id, bank, claimed_name, id_number_hash, id_number_last4, "
+            "provider, status, detail, raw_response, checked_by) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (account_id, bank, claimed_name, id_hash, id_number[-4:], IDENTITY_PROVIDER or "unconfigured",
+             result["status"], result["detail"], Jsonb(result["raw"]) if result["raw"] is not None else None, by),
+        )
+
+
+def _auto_identity_checks(rows: "list[IntakeIngestRow]", bank: str, by: str) -> None:
+    """The automatic half of identity verification: runs check_identity() the moment a row arrives with both
+    claimed_name and id_number set, with no officer action at all -- this is what makes identity checking
+    "automatical by the model" for any ingestion path that supplies those two fields (today: /intake/ingest
+    and /system/live-ingest; see IntakeIngestRow's own docstring on why `src` is the account checked). One
+    identity check per distinct account per batch, even if several rows repeat it. Never raises -- a provider
+    hiccup on one account must not fail the transaction ingestion it rode in on; see check_identity()'s own
+    docstring for why a provider error is its own status, not silently swallowed."""
+    seen: set[str] = set()
+    for r in rows:
+        if not (r.claimed_name and r.id_number) or r.src in seen:
+            continue
+        seen.add(r.src)
+        try:
+            result = check_identity(r.claimed_name, r.id_number)
+            _store_identity_check(r.src, bank, r.claimed_name, r.id_number, result, by)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("auto identity check failed for %s (%s)", r.src, exc.__class__.__name__)
+
+
+def _attach_identity_status(alerts: list[dict]) -> list[dict]:
+    """Merges each alert's most recent identity_checks result (if any) in as identity_status/identity_detail,
+    so an officer sees a mule account's ID-verification result right on the alert itself, without a separate
+    trip to the Identity Check page. Both fields are simply absent (None) on an alert whose account has never
+    had an identity check run -- that absence means "nothing checked yet", never "confirmed clean"."""
+    if not alerts:
+        return alerts
+    account_ids = sorted({a["account_id"] for a in alerts})
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT ON (account_id) account_id, status, detail FROM identity_checks "
+            "WHERE account_id = ANY(%s) ORDER BY account_id, created_at DESC", (account_ids,),
+        ).fetchall()
+    by_account = {r["account_id"]: r for r in rows}
+    for a in alerts:
+        hit = by_account.get(a["account_id"])
+        a["identity_status"] = hit["status"] if hit else None
+        a["identity_detail"] = hit["detail"] if hit else None
+    return alerts
+
+
 def tag_accounts_bank(account_ids: list[str], bank: str) -> None:
     """Records which bank each of these accounts came from, first-seen-wins (see account_banks' own comment
     in SCHEMA above). Called from both ingestion paths -- /intake/ingest (Option 1, one bank per pasted
@@ -193,6 +481,93 @@ def tag_accounts_bank(account_ids: list[str], bank: str) -> None:
             "INSERT INTO account_banks (account_id, bank) VALUES (%s, %s) ON CONFLICT (account_id) DO NOTHING",
             [(a, bank) for a in account_ids],
         )
+
+
+def _bank_contact_emails(bank: str) -> list[str]:
+    """notify_email()'s recipient list for a given bank -- [] (silent no-op) for 'unknown', an env-configured
+    BANK_PASSKEYS tenant (no row in `banks` to hold an email), or a DB-backed tenant that hasn't set one."""
+    if bank in ("unknown", ""):
+        return []
+    with db() as conn:
+        row = conn.execute("SELECT contact_email FROM banks WHERE name = %s", (bank,)).fetchone()
+    return [row["contact_email"]] if row and row["contact_email"] else []
+
+
+# ------------------------------------------------------------------ passwords (per-person accounts)
+# hashlib.scrypt is stdlib -- no bcrypt/argon2 C-extension dependency to install on a box that may not have a
+# compiler handy. scrypt is a well-regarded KDF in its own right (RFC 7914); these cost parameters (N=2**14,
+# r=8, p=1) match the values that RFC recommends for an interactive login, where the hash needs to take a
+# noticeable fraction of a second, not longer -- a slower setting would make every login sluggish.
+_SCRYPT_N, _SCRYPT_R, _SCRYPT_P = 2 ** 14, 8, 1
+
+
+def _hash_password(password: str, salt_hex: str | None = None) -> tuple[str, str]:
+    """Returns (hash_hex, salt_hex). Pass salt_hex back in to verify an existing password against the same
+    salt; omit it to generate a new salt when setting a password for the first time."""
+    salt = bytes.fromhex(salt_hex) if salt_hex else secrets.token_bytes(16)
+    digest = hashlib.scrypt(password.encode(), salt=salt, n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P, dklen=32)
+    return digest.hex(), salt.hex()
+
+
+def _verify_password(password: str, hash_hex: str, salt_hex: str) -> bool:
+    candidate, _ = _hash_password(password, salt_hex)
+    return hmac.compare_digest(candidate, hash_hex)
+
+
+# ------------------------------------------------------------------ login rate limiting / lockout
+# Postgres-backed (not Redis/in-memory) so this works the same whether the backend is one process or several,
+# and survives a restart -- see login_attempts in SCHEMA. Deliberately conservative defaults: a genuine user
+# who mistypes a passkey a couple of times is barely affected, but repeated automated guessing hits the wall
+# fast. Overridable via env for a deployment that wants a different balance.
+LOGIN_LOCKOUT_MAX_FAILURES = int(os.getenv("LOGIN_LOCKOUT_MAX_FAILURES", "5"))
+LOGIN_LOCKOUT_WINDOW_S = int(os.getenv("LOGIN_LOCKOUT_WINDOW_S", str(15 * 60)))
+
+
+def _check_login_rate_limit(identifier: str) -> None:
+    """Raises 429 if `identifier` (caller IP, optionally combined with the passkey/email tried -- see each
+    caller) has LOGIN_LOCKOUT_MAX_FAILURES or more failed attempts within the last LOGIN_LOCKOUT_WINDOW_S
+    seconds. Call this BEFORE checking the submitted credential; call _record_login_attempt() AFTER, with the
+    real outcome, from every login path (passkey and per-person) so the two can't be guessed around
+    separately.
+
+    Fails OPEN on a DB outage (logs and returns, same as the DB-backed-passkey fallback in login()): the DB
+    being briefly unreachable is an availability incident, not a reason to make a correct passkey/password
+    stop working. The tradeoff is explicit -- during that window, lockout protection is off, not that logins
+    themselves fail."""
+    try:
+        with db() as conn:
+            conn.execute("DELETE FROM login_attempts WHERE created_at < now() - interval '1 day'")
+            row = conn.execute(
+                "SELECT count(*) AS n FROM login_attempts "
+                "WHERE identifier = %s AND success = false AND created_at > now() - interval '%s seconds'",
+                (identifier, LOGIN_LOCKOUT_WINDOW_S),
+            ).fetchone()
+    except psycopg.Error:
+        log.exception("login rate-limit check failed (DB unreachable) -- failing open, no lockout applied")
+        return
+    if row["n"] >= LOGIN_LOCKOUT_MAX_FAILURES:
+        raise HTTPException(429, "too many failed sign-in attempts -- try again in a few minutes")
+
+
+def _record_login_attempt(identifier: str, success: bool) -> None:
+    try:
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO login_attempts (identifier, success) VALUES (%s, %s)", (identifier, success),
+            )
+    except psycopg.Error:
+        log.exception("could not record login attempt (DB unreachable)")
+
+
+def _client_ip(request) -> str:
+    """Best-effort caller IP for rate-limiting -- X-Forwarded-For first (Traefik/any reverse proxy in front of
+    this service sets it), falling back to the direct connection. Not used for anything security-critical
+    beyond "which bucket does this attempt count against" -- a spoofed header at worst lets an attacker split
+    their own attempts across more buckets, it can never let them see or touch another identifier's data."""
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 
 def lookup_bank(account_id: str) -> str:
@@ -287,7 +662,7 @@ def _sign(payload: str) -> str:
     return hmac.new(AUTH_TOKEN_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
 
 
-def issue_session_token(name: str, role: str, bank: str | None = None) -> str:
+def issue_session_token(name: str, role: str, bank: str | None = None, uid: int | None = None) -> str:
     """A stateless, server-signed session token: base64(json payload) + '.' + HMAC-SHA256 of that payload.
     Nothing is stored server-side -- there is no session table to manage, expire or look up, which is the
     whole appeal of a predefined-passkey login over the per-officer database-backed API keys this replaces.
@@ -297,8 +672,14 @@ def issue_session_token(name: str, role: str, bank: str | None = None) -> str:
 
     `bank` is None for ADMIN_PASSKEY/ANALYST_PASSKEY logins (sees every bank's data, exactly as before this
     field existed) and a specific bank name for a BANK_PASSKEYS login -- bound into the token the same
-    tamper-evident way `name` is, so a tenant session can't be widened by anything the caller sends later."""
-    payload = json.dumps({"name": name, "role": role, "bank": bank, "iat": time.time()}, sort_keys=True)
+    tamper-evident way `name` is, so a tenant session can't be widened by anything the caller sends later.
+
+    `uid` is set only for a per-person account (POST /auth/login) -- it is the `users.id` row this session
+    belongs to, and is what lets 2FA setup/enable and "disable this one person" (admin_set_user_status) apply
+    to the right account. A legacy shared-passkey session has no uid at all (None), which is also how
+    get_current_user_id() tells the two kinds of session apart -- a passkey session can never pass that check,
+    by design: there's no individual account behind it to act on."""
+    payload = json.dumps({"name": name, "role": role, "bank": bank, "uid": uid, "iat": time.time()}, sort_keys=True)
     encoded = base64.urlsafe_b64encode(payload.encode()).decode()
     return f"{encoded}.{_sign(payload)}"
 
@@ -369,6 +750,23 @@ def get_current_bank(authorization: str | None = Header(None)) -> str | None:
     return _decode_session_token(token).get("bank")
 
 
+def get_current_user_id(authorization: str | None = Header(None)) -> int:
+    """Only a per-person session (issued by POST /auth/login) carries a uid -- a shared admin/analyst/bank
+    passkey session never does, and is refused here with 403 rather than silently treated as "no account":
+    2FA and account-settings routes act on a specific users row, and there is no such row for a passkey
+    session to act on. DEMO_LOGIN_BYPASS has no uid either and is refused the same way -- 2FA on a bypass
+    identity would be meaningless."""
+    if DEMO_LOGIN_BYPASS:
+        raise HTTPException(403, "not available under DEMO_LOGIN_BYPASS")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "missing or malformed Authorization header")
+    token = authorization.removeprefix("Bearer ").strip()
+    uid = _decode_session_token(token).get("uid")
+    if uid is None:
+        raise HTTPException(403, "this action requires an individual account, not a shared passkey session")
+    return uid
+
+
 # ------------------------------------------------------------------ schemas
 class ScanRequest(BaseModel):
     account_id: str
@@ -383,6 +781,88 @@ class DecisionRequest(BaseModel):
 class LoginRequest(BaseModel):
     passkey: str
     name: str = Field(..., min_length=1, max_length=200)
+
+
+class CreateBankRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    contact_email: str | None = Field(None, max_length=320)
+    registration_number: str | None = Field(None, max_length=200)
+    country: str | None = Field(None, max_length=200)
+    region: str | None = Field(None, max_length=200)
+    address: str | None = Field(None, max_length=500)
+    website: str | None = Field(None, max_length=300)
+
+
+class BankStatusRequest(BaseModel):
+    status: Literal["active", "suspended"]
+
+
+class SignupRequestBody(BaseModel):
+    bank_name: str = Field(..., min_length=1, max_length=200)
+    contact_name: str = Field(..., min_length=1, max_length=200)
+    contact_email: str = Field(..., min_length=3, max_length=320)
+    note: str = Field("", max_length=2000)
+    # Full registration detail -- see the comment above `banks`' own new columns in SCHEMA for why this exists:
+    # so the owner governing several banks can actually tell which bank this is and where, not just a name.
+    # All optional: a bank filling this in on a phone, in a hurry, may not have every field on hand right now.
+    registration_number: str | None = Field(None, max_length=200)
+    country: str | None = Field(None, max_length=200)
+    region: str | None = Field(None, max_length=200)
+    address: str | None = Field(None, max_length=500)
+    website: str | None = Field(None, max_length=300)
+
+
+class AnalystSignupRequest(BaseModel):
+    """The public, self-service counterpart to admin_invite_user() below -- a bank's own analyst registers
+    THEMSELVES, picking which already-onboarded bank they belong to, instead of waiting for the owner to type
+    their details in first. Deliberately still gated: this creates a status='pending' row (see users' own
+    comment in SCHEMA) that cannot sign in (/auth/login requires status='active') until the owner reviews and
+    approves it on /owner -- self-registering proves nothing on its own about who someone actually is, only
+    the owner's approval does. `password` is set by the person themselves, right here, not issued later the
+    way an invited account's is -- there is no separate accept-invite step for this path."""
+    name: str = Field(..., min_length=1, max_length=200)
+    email: str = Field(..., min_length=3, max_length=320)
+    password: str = Field(..., min_length=10, max_length=200)
+    bank: str = Field(..., min_length=1, max_length=200)
+
+
+# ------------------------------------------------------------------ schemas: per-person accounts
+class InviteUserRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    email: str = Field(..., min_length=3, max_length=320)
+    # Omitted/None => a platform-level admin (owner backoffice). Set => a bank-scoped analyst for that bank.
+    # There is no "bank-scoped admin": a person managing one bank's own people uses the admin role at the
+    # platform level, or just shares that bank's passkey -- see admin_invite_user()'s own check.
+    bank: str | None = Field(None, max_length=200)
+    role: Literal["admin", "analyst"] = "analyst"
+
+
+class UserStatusRequest(BaseModel):
+    status: Literal["active", "disabled"]
+
+
+class AcceptInviteRequest(BaseModel):
+    token: str = Field(..., min_length=1)
+    password: str = Field(..., min_length=10, max_length=200)
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=320)
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(..., min_length=1)
+    password: str = Field(..., min_length=10, max_length=200)
+
+
+class AuthLoginRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=320)
+    password: str = Field(..., min_length=1, max_length=200)
+    totp_code: str | None = Field(None, max_length=10)
+
+
+class Totp2faVerifyRequest(BaseModel):
+    code: str = Field(..., min_length=1, max_length=10)
 
 
 class AnomalyNoteRequest(BaseModel):
@@ -403,6 +883,14 @@ class IntakeIngestRow(BaseModel):
     bank: str | None = None   # per-row override -- lets one Kafka batch carry transactions from several
                               # banks at once (each message says which); /intake/ingest's paste path doesn't
                               # use this, since one pasted document is always treated as one bank
+    # Both optional, and both ONLY meaningful together -- when a row carries the account holder's claimed
+    # name and national ID number, _auto_identity_checks() (see below) runs a real identity verification for
+    # `src` automatically, the moment this row is ingested, with no separate officer step. `src` is treated
+    # as the account these describe (the bank's own customer side of the transaction, by convention -- `dst`
+    # is the counterparty and is never identity-checked from this field). Neither is ever persisted raw: see
+    # check_identity()'s own docstring on why only a hash + last 4 digits of the ID number are ever stored.
+    claimed_name: str | None = None
+    id_number: str | None = None
 
 
 class IntakeIngestRequest(BaseModel):
@@ -410,6 +898,12 @@ class IntakeIngestRequest(BaseModel):
     bank: str | None = None   # the whole-batch bank/institution name. REQUIRED by /intake/ingest (one
                               # analyst paste = one bank, enforced there); used by /system/live-ingest only
                               # as the fallback for a row that didn't carry its own `bank` field.
+
+
+class IdentityCheckRequest(BaseModel):
+    account_id: str
+    claimed_name: str = Field(..., min_length=1, max_length=200)
+    id_number: str = Field(..., min_length=1, max_length=64)   # raw value, used in-memory only -- never persisted
 
 
 class IntakeClearRequest(BaseModel):
@@ -427,41 +921,109 @@ def health():
 
 
 @api.post("/login")
-def login(req: LoginRequest):
-    """The only unauthenticated route besides /health. Checks the submitted passkey against ADMIN_PASSKEY,
-    ANALYST_PASSKEY, and every configured BANK_PASSKEYS passkey, in that order -- there is no per-person
-    credential to issue or revoke here, by design. The name is NOT verified against anything (there's nothing
-    to verify it against -- that's the tradeoff of a shared passkey instead of per-officer accounts), but it IS
-    what gets signed into the session token and used for every action this person takes afterward, so the
-    audit trail still reflects a specific person's name on every decision, not just 'an analyst'.
+def login(req: LoginRequest, request: Request = None):
+    """The CUSTOMER/bank door -- deliberately CANNOT issue an admin session, even if someone types the real
+    ADMIN_PASSKEY in here. That's not an oversight: a real security finding from a later pass was that this
+    endpoint and /admin/login (below) used to be the same door, meaning the platform owner's own passkey was
+    reachable from the exact same public page every bank tenant signs in on. If that admin passkey were ever
+    guessed, phished, or leaked, the attacker's only way in was already sitting on the one URL every tenant
+    already knows about. Splitting this into two separate endpoints (and two separate frontend pages -- see
+    /admin) means a leaked admin passkey is useless unless someone also knows to try /admin in the first
+    place, and a leaked/guessed ANALYST_PASSKEY or bank passkey typed in here can never escalate to admin
+    under any circumstance, because this function no longer has an admin branch to fall into at all.
+
+    Checks the submitted passkey against ANALYST_PASSKEY and every configured BANK_PASSKEYS passkey, in that
+    order -- there is no per-person credential to issue or revoke here, by design. The name is NOT verified
+    against anything (there's nothing to verify it against -- that's the tradeoff of a shared passkey instead
+    of per-officer accounts), but it IS what gets signed into the session token and used for every action
+    this person takes afterward, so the audit trail still reflects a specific person's name on every
+    decision, not just 'an analyst'.
 
     A BANK_PASSKEYS match additionally binds that bank into the session (see issue_session_token): everything
     this person does afterward is silently scoped to that one bank, same role ('analyst') as the legacy shared
-    passkey but with a real tenant boundary instead of seeing every institution's data."""
+    passkey but with a real tenant boundary instead of seeing every institution's data.
+
+    Rate-limited per caller IP (see _check_login_rate_limit): `request` defaults to None so this can still be
+    called directly the way the test suite does (no real HTTP request object to hand it), in which case rate
+    limiting is skipped entirely rather than crashing on a missing client -- a unit test calling this function
+    in-process was never the thing this protects against."""
+    ip = _client_ip(request) if request is not None else None
+    if ip is not None:
+        _check_login_rate_limit(ip)
     name = req.name.strip()
     if not name:
         raise HTTPException(400, "name is required")
     bank: str | None = None
-    if ADMIN_PASSKEY and req.passkey == ADMIN_PASSKEY:
-        role = "admin"
-    elif ANALYST_PASSKEY and req.passkey == ANALYST_PASSKEY:
+    if ANALYST_PASSKEY and req.passkey == ANALYST_PASSKEY:
         role = "analyst"
     elif req.passkey in PASSKEY_TO_BANK:
         role = "analyst"
         bank = PASSKEY_TO_BANK[req.passkey]
     else:
-        raise HTTPException(401, "invalid passkey")
+        # Not one of the env-configured passkeys above -- check the DB-backed tenants the owner has added
+        # through /owner since this process started (see the `banks` table in SCHEMA). A suspended bank's
+        # passkey is deliberately treated exactly like a wrong passkey, not a distinct "account suspended"
+        # error: that distinction is the owner's business on the owner page, not something to hand a locked-out
+        # caller for free.
+        #
+        # A DB outage here must not turn a routine "wrong passkey" into an unhandled 500 -- fail closed into
+        # the same 401 a real wrong passkey gets, and log it so the owner can tell "nobody could log in because
+        # the DB was down" apart from "somebody mistyped a passkey".
+        row = None
+        try:
+            with db() as conn:
+                row = conn.execute(
+                    "SELECT name FROM banks WHERE passkey = %s AND status = 'active'", (req.passkey,),
+                ).fetchone()
+        except psycopg.Error:
+            log.exception("login: DB-backed passkey lookup failed, treating as invalid passkey")
+        if not row:
+            if ip is not None:
+                _record_login_attempt(ip, False)
+            raise HTTPException(401, "invalid passkey")
+        role = "analyst"
+        bank = row["name"]
+    if ip is not None:
+        _record_login_attempt(ip, True)
     token = issue_session_token(name, role, bank)
     audit("login", {"name": name, "role": role, "bank": bank})
     return {"token": token, "name": name, "role": role, "bank": bank}
 
 
+@api.post("/admin/login")
+def admin_login(req: LoginRequest, request: Request = None):
+    """The PLATFORM OWNER's door -- the only place ADMIN_PASSKEY works at all. See login()'s own docstring
+    for why this is a separate endpoint (and the frontend's /admin a separate, unlinked page) rather than one
+    shared door: a bank tenant's login page should never be the same surface an attacker could try the admin
+    passkey against. Rate-limited the same way login() is, on the same per-IP bucket (a brute-force attempt
+    against either door counts against the same lockout, so splitting the endpoint doesn't also split an
+    attacker's attempt budget in their favor)."""
+    ip = _client_ip(request) if request is not None else None
+    if ip is not None:
+        _check_login_rate_limit(ip)
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(400, "name is required")
+    if not (ADMIN_PASSKEY and req.passkey == ADMIN_PASSKEY):
+        if ip is not None:
+            _record_login_attempt(ip, False)
+        raise HTTPException(401, "invalid passkey")
+    if ip is not None:
+        _record_login_attempt(ip, True)
+    token = issue_session_token(name, "admin", None)
+    audit("login", {"name": name, "role": "admin", "bank": None})
+    return {"token": token, "name": name, "role": "admin", "bank": None}
+
+
 @api.get("/whoami")
-def whoami(officer: str = Depends(get_current_officer), bank: str | None = Depends(get_current_bank)):
+def whoami(officer: str = Depends(get_current_officer), bank: str | None = Depends(get_current_bank),
+           role: str = Depends(get_current_role)):
     """Lets the frontend verify a stored session token still works (e.g. after a page reload), and display who
     is signed in (and which bank's console this is, if any), without needing to decode anything client-side --
-    both come from the signed token, the same way every other route's identity does."""
-    return {"officer": officer, "bank": bank}
+    all three come from the signed token, the same way every other route's identity does. `role` is what the
+    frontend uses to route an admin session straight to the owner backoffice (/owner) instead of the bank
+    console -- see the Next.js app's root page.tsx."""
+    return {"officer": officer, "bank": bank, "role": role}
 
 
 @api.get("/accounts/sample")
@@ -626,11 +1188,16 @@ def scan(req: ScanRequest, officer: str = Depends(get_current_officer), bank: st
             ).fetchone()
         audit("alert_created", {"alert_id": alert["id"], "account_id": req.account_id, "score": res["score"],
                                 "scanned_by": officer})
+        notify_email(_bank_contact_emails(alert["source_bank"]), f"New alert #{alert['id']} -- {req.account_id}",
+                     f"Account {req.account_id} was flagged (risk score {res['score']:.3f}) and scanned by "
+                     f"{officer}. Open the console to review it.")
     # "score"/"threshold" (raw) are what the flagged decision and the stored alert are based on, and stay
     # exactly as before; "calibrated_score"/"calibrated_threshold" are the same pair mapped through isotonic
     # calibration, meaningful as an actual probability -- meant for display (a risk gauge showing "99.9%" for
     # every flagged account is not informative), never used for the flagged decision itself. .get() with a
     # fallback keeps this working against an older gnn-detection-api that predates calibration.
+    if alert:
+        alert = _attach_identity_status([alert])[0]
     return {"score": res["score"], "calibrated_score": res.get("calibrated_score", res["score"]),
             "flagged": res["flagged"], "threshold": pred["threshold"],
             "calibrated_threshold": pred.get("calibrated_threshold", pred["threshold"]),
@@ -659,6 +1226,7 @@ def intake_ingest(req: IntakeIngestRequest, officer: str = Depends(get_current_o
     result = _call("POST", f"{GNN_API_URL}/admin/ingest-live", timeout=60, json={"rows": gnn_rows}, headers=headers)
     account_ids = sorted({r.src for r in req.rows} | {r.dst for r in req.rows})
     tag_accounts_bank(account_ids, bank)
+    _auto_identity_checks(req.rows, bank, officer)
     audit("intake_ingest", {"ingested_rows": result.get("ingested_rows"), "n_accounts": result.get("n_accounts"),
                             "n_transactions": result.get("n_transactions"), "bank": bank, "by": officer})
     return {**result, "bank": bank}
@@ -735,6 +1303,7 @@ def live_ingest(req: IntakeIngestRequest, authorization: str | None = Header(Non
         bank_by_account.setdefault(r.dst, b)
     for b in set(bank_by_account.values()):
         tag_accounts_bank([a for a, ab in bank_by_account.items() if ab == b], b)
+        _auto_identity_checks([r for r in req.rows if bank_by_account.get(r.src) == b], b, "system:live-feed")
 
     account_ids = sorted(bank_by_account)
     alerts_created: list[int] = []
@@ -751,6 +1320,9 @@ def live_ingest(req: IntakeIngestRequest, authorization: str | None = Header(Non
             alerts_created.append(alert["id"])
             audit("alert_created", {"alert_id": alert["id"], "account_id": account_id, "score": res["score"],
                                     "scanned_by": "system:live-feed"})
+            notify_email(_bank_contact_emails(alert["source_bank"]), f"New alert #{alert['id']} -- {account_id}",
+                         f"Account {account_id} was flagged (risk score {res['score']:.3f}) by the live feed. "
+                         f"Open the console to review it.")
 
     return {**ingest_result, "accounts_scanned": len(account_ids), "alerts_created": alerts_created}
 
@@ -775,7 +1347,8 @@ def list_alerts(status: str | None = None, bank: str | None = None, limit: int =
     q += " ORDER BY created_at DESC LIMIT %s"
     args.append(min(limit, 500))
     with db() as conn:
-        return conn.execute(q, args).fetchall()
+        rows = conn.execute(q, args).fetchall()
+    return _attach_identity_status(rows)
 
 
 @api.get("/banks")
@@ -789,6 +1362,584 @@ def list_banks(officer: str = Depends(get_current_officer), tenant_bank: str | N
     with db() as conn:
         rows = conn.execute("SELECT DISTINCT source_bank FROM alerts ORDER BY source_bank").fetchall()
     return [r["source_bank"] for r in rows]
+
+
+@api.get("/admin/tenants")
+def admin_tenants(role: str = Depends(get_current_role), officer: str = Depends(get_current_officer)):
+    """Owner-only usage summary, one row per bank tenant -- what the frontend's separate /owner backoffice
+    shows instead of the bank-facing console (see frontend/src/app/owner/page.tsx). This is deliberately NOT
+    reachable from a bank-tenant or legacy shared-analyst session: 403s unless the token's role is 'admin',
+    the same role ADMIN_PASSKEY issues (see issue_session_token / BANK_PASSKEYS above) -- a bank must never be
+    able to see another bank's volumes, let alone the full tenant list, through any route.
+
+    A bank counts as a tenant here if it has a row in `banks` (DB-onboarded, including one with zero activity
+    yet -- the whole point of letting the owner add a tenant before it's done anything), OR an alert
+    attributed to it (alerts.source_bank), OR at least one account tagged to it via Intake/Connect
+    (account_banks) -- an env-configured BANK_PASSKEYS tenant has no `banks` row but still shows up once it
+    has done either of the other two, same as before this table existed."""
+    if role != "admin":
+        raise HTTPException(403, "admin passkey required")
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT
+                b.bank,
+                COALESCE(bk.status, 'active')   AS status,
+                bk.registration_number,
+                bk.country,
+                bk.region,
+                bk.website,
+                COALESCE(al.total_alerts, 0)    AS total_alerts,
+                COALESCE(al.open_alerts, 0)     AS open_alerts,
+                COALESCE(an.total_anomalies, 0) AS total_anomalies,
+                COALESCE(an.open_anomalies, 0)  AS open_anomalies,
+                COALESCE(acc.accounts, 0)       AS accounts,
+                GREATEST(al.last_alert, an.last_anomaly) AS last_activity
+            FROM (
+                SELECT name AS bank FROM banks
+                UNION
+                SELECT bank FROM account_banks
+                UNION
+                SELECT source_bank AS bank FROM alerts WHERE source_bank <> 'unknown'
+            ) b
+            LEFT JOIN banks bk ON bk.name = b.bank
+            LEFT JOIN (
+                SELECT source_bank AS bank, COUNT(*) AS total_alerts,
+                       COUNT(*) FILTER (WHERE status = 'open') AS open_alerts,
+                       MAX(created_at) AS last_alert
+                FROM alerts GROUP BY source_bank
+            ) al ON al.bank = b.bank
+            LEFT JOIN (
+                SELECT ab.bank, COUNT(*) AS total_anomalies,
+                       COUNT(*) FILTER (WHERE aa.status IN ('new', 'under_investigation')) AS open_anomalies,
+                       MAX(aa.created_at) AS last_anomaly
+                FROM anomaly_alerts aa JOIN account_banks ab ON ab.account_id = aa.account_id
+                GROUP BY ab.bank
+            ) an ON an.bank = b.bank
+            LEFT JOIN (
+                SELECT bank, COUNT(*) AS accounts FROM account_banks GROUP BY bank
+            ) acc ON acc.bank = b.bank
+            ORDER BY b.bank
+        """).fetchall()
+    return rows
+
+
+@api.post("/admin/banks")
+def admin_create_bank(req: CreateBankRequest, role: str = Depends(get_current_role),
+                       officer: str = Depends(get_current_officer)):
+    """Owner-only: onboards a new bank tenant without touching .env or restarting anything -- the gap flagged
+    as the top priority for a real pilot (BANK_PASSKEYS alone means every new tenant needs a manual .env edit
+    and a full backend restart, which briefly drops every OTHER bank's session too). Generates the passkey
+    server-side (never accepted from the caller) and returns it exactly once in this response -- same
+    "shown once, store it" pattern as every real API-key-issuing SaaS, since this isn't stored in a
+    retrievable form here either (plaintext today, see the note below, but still never re-displayed)."""
+    if role != "admin":
+        raise HTTPException(403, "admin passkey required")
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(400, "bank name is required")
+    passkey = secrets.token_urlsafe(18)
+    with db() as conn:
+        existing = conn.execute("SELECT 1 FROM banks WHERE name = %s", (name,)).fetchone()
+        if existing or name in BANK_NAME_TO_PASSKEY:
+            raise HTTPException(409, f"a bank named {name!r} already exists")
+        conn.execute(
+            "INSERT INTO banks (name, passkey, contact_email, registration_number, country, region, address, "
+            "website) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            (name, passkey, req.contact_email, req.registration_number, req.country, req.region, req.address,
+             req.website),
+        )
+    audit("admin_create_bank", {"bank": name, "by": officer})
+    return {"name": name, "passkey": passkey, "status": "active"}
+
+
+@api.patch("/admin/banks/{bank_name}")
+def admin_set_bank_status(bank_name: str, req: BankStatusRequest, role: str = Depends(get_current_role),
+                          officer: str = Depends(get_current_officer)):
+    """Owner-only: suspend (passkey stops working immediately, data untouched) or reactivate a DB-backed
+    tenant. Only ever touches the `banks` table -- an env-configured BANK_PASSKEYS tenant has no row here and
+    can't be suspended this way, by design (see login()'s comment on why env always wins)."""
+    if role != "admin":
+        raise HTTPException(403, "admin passkey required")
+    with db() as conn:
+        row = conn.execute(
+            "UPDATE banks SET status = %s WHERE name = %s RETURNING name, status", (req.status, bank_name),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, f"no DB-backed bank named {bank_name!r} (an env-configured BANK_PASSKEYS "
+                                  f"tenant can't be suspended here)")
+    audit("admin_set_bank_status", {"bank": bank_name, "status": req.status, "by": officer})
+    return row
+
+
+@api.post("/admin/banks/{bank_name}/regenerate-passkey")
+def admin_regenerate_bank_passkey(bank_name: str, role: str = Depends(get_current_role),
+                                  officer: str = Depends(get_current_officer)):
+    """Owner-only: the recovery lever for the exact mistake of losing a passkey that was only ever shown once
+    (admin_create_bank / admin_approve_signup_request's "shown once, store it" reveal) -- rather than having
+    to delete the whole tenant and re-add it (which would also hand out a brand new bank name's worth of
+    passkey, losing nothing of the bank's own data, but is a clumsy way to just get a new secret). The OLD
+    passkey stops working the instant this runs -- same "rotate, don't duplicate" security posture as
+    everything else here. Only works for a DB-backed tenant (one with a row in `banks`); an env-configured
+    BANK_PASSKEYS tenant has no row to update here, same restriction admin_set_bank_status/admin_delete_bank
+    already have, for the same reason (see login()'s comment on why env always wins)."""
+    if role != "admin":
+        raise HTTPException(403, "admin passkey required")
+    new_passkey = secrets.token_urlsafe(18)
+    with db() as conn:
+        row = conn.execute(
+            "UPDATE banks SET passkey = %s WHERE name = %s RETURNING name, status",
+            (new_passkey, bank_name),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, f"no DB-backed bank named {bank_name!r} (an env-configured BANK_PASSKEYS "
+                                  f"tenant's passkey can't be regenerated here -- change it in .env instead)")
+    audit("admin_regenerate_bank_passkey", {"bank": bank_name, "by": officer})
+    return {"name": row["name"], "passkey": new_passkey, "status": row["status"]}
+
+
+@api.delete("/admin/banks/{bank_name}")
+def admin_delete_bank(bank_name: str, role: str = Depends(get_current_role),
+                      officer: str = Depends(get_current_officer)):
+    """Owner-only: removes a DB-backed tenant's passkey entirely (it stops being a valid login, period).
+    Deliberately does NOT touch alerts/anomaly_alerts/account_banks -- exactly like /intake/clear, removing a
+    tenant must never silently erase its compliance history."""
+    if role != "admin":
+        raise HTTPException(403, "admin passkey required")
+    with db() as conn:
+        row = conn.execute("DELETE FROM banks WHERE name = %s RETURNING name", (bank_name,)).fetchone()
+    if not row:
+        raise HTTPException(404, f"no DB-backed bank named {bank_name!r}")
+    audit("admin_delete_bank", {"bank": bank_name, "by": officer})
+    return {"removed": bank_name}
+
+
+@api.post("/signup-requests", status_code=201)
+def create_signup_request(req: SignupRequestBody):
+    """Public, unauthenticated -- the front door for a bank that wants a pilot and doesn't have a passkey yet.
+    Never creates a tenant by itself; it only queues a request the owner reviews on /owner and explicitly
+    approves or declines. No email is sent from here (this deployment has no email service wired up yet --
+    see notify_email()'s own docstring); the owner sees new requests by checking the backoffice, same as
+    everything else there today."""
+    with db() as conn:
+        row = conn.execute(
+            "INSERT INTO signup_requests (bank_name, contact_name, contact_email, note, registration_number, "
+            "country, region, address, website) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id, status",
+            (req.bank_name.strip(), req.contact_name.strip(), req.contact_email.strip(), req.note.strip(),
+             (req.registration_number or "").strip() or None, (req.country or "").strip() or None,
+             (req.region or "").strip() or None, (req.address or "").strip() or None,
+             (req.website or "").strip() or None),
+        ).fetchone()
+    return row
+
+
+@api.get("/admin/signup-requests")
+def admin_list_signup_requests(status: str | None = "pending", role: str = Depends(get_current_role)):
+    if role != "admin":
+        raise HTTPException(403, "admin passkey required")
+    q, args = "SELECT * FROM signup_requests", []
+    if status:
+        q += " WHERE status = %s"
+        args.append(status)
+    q += " ORDER BY created_at DESC"
+    with db() as conn:
+        return conn.execute(q, args).fetchall()
+
+
+@api.post("/admin/signup-requests/{request_id}/approve")
+def admin_approve_signup_request(request_id: int, role: str = Depends(get_current_role),
+                                 officer: str = Depends(get_current_officer)):
+    """Turns a pending request into a real tenant in one action -- generates the passkey (same as
+    admin_create_bank) and marks the request approved, so the owner never has to separately create the bank
+    and then remember to close out the request."""
+    if role != "admin":
+        raise HTTPException(403, "admin passkey required")
+    with db() as conn:
+        req_row = conn.execute(
+            "SELECT * FROM signup_requests WHERE id = %s AND status = 'pending'", (request_id,),
+        ).fetchone()
+        if not req_row:
+            raise HTTPException(404, "no pending signup request with that id")
+        name = req_row["bank_name"]
+        if conn.execute("SELECT 1 FROM banks WHERE name = %s", (name,)).fetchone() or name in BANK_NAME_TO_PASSKEY:
+            raise HTTPException(409, f"a bank named {name!r} already exists")
+        passkey = secrets.token_urlsafe(18)
+        conn.execute(
+            "INSERT INTO banks (name, passkey, contact_email, registration_number, country, region, address, "
+            "website) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            (name, passkey, req_row["contact_email"], req_row.get("registration_number"), req_row.get("country"),
+             req_row.get("region"), req_row.get("address"), req_row.get("website")),
+        )
+        conn.execute(
+            "UPDATE signup_requests SET status = 'approved', decided_at = now() WHERE id = %s", (request_id,),
+        )
+    audit("admin_approve_signup_request", {"request_id": request_id, "bank": name, "by": officer})
+    return {"name": name, "passkey": passkey, "status": "active"}
+
+
+@api.post("/admin/signup-requests/{request_id}/decline")
+def admin_decline_signup_request(request_id: int, role: str = Depends(get_current_role),
+                                 officer: str = Depends(get_current_officer)):
+    if role != "admin":
+        raise HTTPException(403, "admin passkey required")
+    with db() as conn:
+        row = conn.execute(
+            "UPDATE signup_requests SET status = 'declined', decided_at = now() "
+            "WHERE id = %s AND status = 'pending' RETURNING id", (request_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "no pending signup request with that id")
+    audit("admin_decline_signup_request", {"request_id": request_id, "by": officer})
+    return {"declined": request_id}
+
+
+# ------------------------------------------------------------------ per-person accounts (invite / password / 2FA)
+# Layered on top of the shared passkeys above, not a replacement for them -- a passkey still works. This
+# exists so one person can be given (and have revoked) their OWN login, instead of everyone at a bank sharing
+# one secret that has to be rotated for the whole bank the moment any one person leaves.
+#
+# PUBLIC_BASE_URL (e.g. "https://yourdomain.com") is used only to build a clickable link in the invite/reset
+# emails this sends -- if unset, the email still includes the raw token and says which page to open it on, so
+# nothing here is broken by leaving it unset, the email is just less convenient.
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+INVITE_EXPIRY_HOURS = int(os.getenv("INVITE_EXPIRY_HOURS", "168"))     # 7 days
+RESET_EXPIRY_HOURS = int(os.getenv("RESET_EXPIRY_HOURS", "2"))
+
+
+def _user_public(row: dict) -> dict:
+    """Strips password_hash/password_salt/totp_secret/invite_token/reset_token off a `users` row before it
+    ever leaves this process -- used by every endpoint that returns a user, so there's exactly one place that
+    decides what's safe to show, rather than every route remembering to exclude secrets by hand."""
+    return {k: row[k] for k in ("id", "name", "email", "bank", "role", "status", "totp_enabled", "created_at") if k in row}
+
+
+@api.post("/admin/users")
+def admin_invite_user(req: InviteUserRequest, role: str = Depends(get_current_role),
+                       officer: str = Depends(get_current_officer)):
+    """Owner-only: creates an invited (not yet active) per-person account and emails them a one-time link to
+    set their own password. Returns the invite token once, same "shown once" pattern as a new bank's passkey
+    (admin_create_bank) -- in case SMTP isn't configured (see notify_email's own docstring), the owner can
+    still hand the link to that person directly."""
+    if role != "admin":
+        raise HTTPException(403, "admin passkey required")
+    if req.role == "admin" and req.bank:
+        raise HTTPException(400, "a platform admin account can't also be scoped to one bank -- invite them "
+                                  "without a bank, or as an analyst for that bank")
+    name = req.name.strip()
+    email = req.email.strip().lower()
+    invite_token = secrets.token_urlsafe(32)
+    with db() as conn:
+        if conn.execute("SELECT 1 FROM users WHERE lower(email) = %s", (email,)).fetchone():
+            raise HTTPException(409, f"a user with email {email!r} already exists")
+        row = conn.execute(
+            "INSERT INTO users (bank, name, email, role, invite_token, invite_expires) "
+            "VALUES (%s, %s, %s, %s, %s, now() + interval '%s hours') "
+            "RETURNING id, name, email, bank, role, status, totp_enabled, created_at",
+            (req.bank, name, email, req.role, invite_token, INVITE_EXPIRY_HOURS),
+        ).fetchone()
+    link = f"{PUBLIC_BASE_URL}/accept-invite?token={invite_token}" if PUBLIC_BASE_URL else None
+    notify_email(
+        [email],
+        "You've been invited to XAI-AMLBench",
+        (f"{officer} invited you to sign in individually.\n\n"
+         + (f"Set your password here: {link}\n\n" if link
+            else f"Open the \"accept invite\" page and enter this code: {invite_token}\n\n")
+         + f"This link expires in {INVITE_EXPIRY_HOURS // 24} days."),
+    )
+    audit("admin_invite_user", {"email": email, "bank": req.bank, "role": req.role, "by": officer})
+    return {**_user_public(row), "invite_token": invite_token, "invite_link": link}
+
+
+@api.get("/admin/users")
+def admin_list_users(bank: str | None = None, status: str | None = None, role: str = Depends(get_current_role)):
+    """`status=pending` is what the owner's "People" section uses to surface self-registered analysts (POST
+    /auth/signup) waiting on a decision -- see users' own 'pending' status comment in SCHEMA. Omitted, this
+    returns every account regardless of status, same as before this filter existed."""
+    if role != "admin":
+        raise HTTPException(403, "admin passkey required")
+    q = "SELECT id, name, email, bank, role, status, totp_enabled, created_at FROM users"
+    where, args = [], []
+    if bank:
+        where.append("bank = %s")
+        args.append(bank)
+    if status:
+        where.append("status = %s")
+        args.append(status)
+    if where:
+        q += " WHERE " + " AND ".join(where)
+    q += " ORDER BY created_at DESC"
+    with db() as conn:
+        return conn.execute(q, args).fetchall()
+
+
+@api.patch("/admin/users/{user_id}")
+def admin_set_user_status(user_id: int, req: UserStatusRequest, role: str = Depends(get_current_role),
+                           officer: str = Depends(get_current_officer)):
+    """Owner-only: the actual "revoke one person" lever. Disabling blocks every FUTURE login attempt for this
+    person immediately -- but because session tokens are stateless (see issue_session_token's docstring), a
+    token this person already holds keeps working until it naturally expires (SESSION_MAX_AGE_S, 12 hours by
+    default). For a pilot that's an acceptable tradeoff; a deployment that needs instant mid-session
+    revocation would need to start checking user status on every request, not just at login."""
+    if role != "admin":
+        raise HTTPException(403, "admin passkey required")
+    with db() as conn:
+        row = conn.execute(
+            "UPDATE users SET status = %s WHERE id = %s "
+            "RETURNING id, name, email, bank, role, status, totp_enabled, created_at",
+            (req.status, user_id),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "no user with that id")
+    audit("admin_set_user_status", {"user_id": user_id, "status": req.status, "by": officer})
+    return row
+
+
+@api.delete("/admin/users/{user_id}")
+def admin_delete_user(user_id: int, role: str = Depends(get_current_role),
+                       officer: str = Depends(get_current_officer)):
+    if role != "admin":
+        raise HTTPException(403, "admin passkey required")
+    with db() as conn:
+        row = conn.execute("DELETE FROM users WHERE id = %s RETURNING email", (user_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "no user with that id")
+    audit("admin_delete_user", {"user_id": user_id, "by": officer})
+    return {"removed": row["email"]}
+
+
+def _active_bank_names() -> set[str]:
+    """Every bank an analyst is actually allowed to self-register against: the env-configured BANK_PASSKEYS
+    set (always active, no `banks` row to suspend -- see login()'s own comment on why env always wins) plus
+    every DB-backed tenant currently status='active'. A bank that's only `pending` in signup_requests (not yet
+    approved) or `suspended` is deliberately NOT in this set -- self-registration must never let someone claim
+    membership in a bank the owner hasn't actually onboarded, or has turned off."""
+    with db() as conn:
+        rows = conn.execute("SELECT name FROM banks WHERE status = 'active'").fetchall()
+    return set(BANK_NAME_TO_PASSKEY) | {r["name"] for r in rows}
+
+
+@api.get("/public/banks")
+def public_banks():
+    """Unauthenticated -- the list /analyst-signup's bank dropdown populates itself from, so a self-registering
+    analyst picks from banks that genuinely exist and are active, never types a name freehand (which would let
+    a typo, or a deliberate lie, attach their account to a bank they don't belong to -- see
+    AnalystSignupRequest's own docstring). Names only: nothing else about a tenant is exposed publicly."""
+    return sorted(_active_bank_names())
+
+
+@api.post("/auth/signup", status_code=201)
+def auth_signup(req: AnalystSignupRequest):
+    """Public, unauthenticated -- the self-service door AnalystSignupRequest's docstring describes. Creates a
+    status='pending' account that cannot sign in (see /auth/login's status check) until the owner approves it
+    on /owner. Rejects outright, before anything is written, if `bank` isn't one of the currently active
+    tenants (_active_bank_names()) -- there is no "register for a bank that doesn't exist yet" path; that bank
+    has to go through /signup-requests and be approved first. Same generic-enough-not-to-leak posture as
+    admin_invite_user: a duplicate email is refused with 409, same as there."""
+    bank = req.bank.strip()
+    if bank not in _active_bank_names():
+        raise HTTPException(
+            422,
+            f"{bank!r} isn't a bank we have on file yet. If your bank hasn't signed up with us, request access "
+            f"for it first -- an individual can only register once their own bank is already onboarded.",
+        )
+    name = req.name.strip()
+    email = req.email.strip().lower()
+    password_hash, password_salt = _hash_password(req.password)
+    with db() as conn:
+        if conn.execute("SELECT 1 FROM users WHERE lower(email) = %s", (email,)).fetchone():
+            raise HTTPException(409, f"a user with email {email!r} already exists")
+        conn.execute(
+            "INSERT INTO users (bank, name, email, role, status, password_hash, password_salt) "
+            "VALUES (%s, %s, %s, 'analyst', 'pending', %s, %s)",
+            (bank, name, email, password_hash, password_salt),
+        )
+    audit("analyst_signup", {"email": email, "bank": bank})
+    return {"email": email, "bank": bank, "status": "pending"}
+
+
+@api.post("/auth/accept-invite")
+def accept_invite(req: AcceptInviteRequest):
+    """Public, unauthenticated -- the link an invited person clicks. Sets their password and activates the
+    account in one step; the invite token is single-use (cleared immediately after)."""
+    password_hash, password_salt = _hash_password(req.password)
+    with db() as conn:
+        row = conn.execute(
+            "UPDATE users SET password_hash = %s, password_salt = %s, status = 'active', "
+            "invite_token = NULL, invite_expires = NULL "
+            "WHERE invite_token = %s AND invite_expires > now() AND status = 'invited' "
+            "RETURNING id, email", (password_hash, password_salt, req.token),
+        ).fetchone()
+    if not row:
+        raise HTTPException(400, "that invite link is invalid or has expired -- ask whoever invited you to "
+                                  "send a new one")
+    audit("accept_invite", {"user_id": row["id"], "email": row["email"]})
+    return {"email": row["email"], "status": "active"}
+
+
+@api.post("/auth/forgot-password")
+def forgot_password(req: ForgotPasswordRequest):
+    """Public, unauthenticated. ALWAYS returns the same message whether or not that email has an account --
+    the one thing this must never do is let a caller use the response to find out which emails are
+    registered."""
+    email = req.email.strip().lower()
+    reset_token = secrets.token_urlsafe(32)
+    with db() as conn:
+        row = conn.execute(
+            "UPDATE users SET reset_token = %s, reset_expires = now() + interval '%s hours' "
+            "WHERE lower(email) = %s AND status = 'active' RETURNING email",
+            (reset_token, RESET_EXPIRY_HOURS, email),
+        ).fetchone()
+    if row:
+        link = f"{PUBLIC_BASE_URL}/reset-password?token={reset_token}" if PUBLIC_BASE_URL else None
+        notify_email(
+            [email],
+            "Reset your XAI-AMLBench password",
+            (f"Reset your password here: {link}\n\n" if link
+             else f"Open the \"reset password\" page and enter this code: {reset_token}\n\n")
+            + f"This link expires in {RESET_EXPIRY_HOURS} hours. If you didn't ask for this, ignore this email.",
+        )
+    return {"message": "If that email has an account, we've sent a password reset link."}
+
+
+@api.post("/auth/reset-password")
+def reset_password(req: ResetPasswordRequest):
+    password_hash, password_salt = _hash_password(req.password)
+    with db() as conn:
+        row = conn.execute(
+            "UPDATE users SET password_hash = %s, password_salt = %s, reset_token = NULL, reset_expires = NULL "
+            "WHERE reset_token = %s AND reset_expires > now() RETURNING id, email",
+            (password_hash, password_salt, req.token),
+        ).fetchone()
+    if not row:
+        raise HTTPException(400, "that reset link is invalid or has expired -- request a new one")
+    audit("reset_password", {"user_id": row["id"], "email": row["email"]})
+    return {"email": row["email"], "status": "ok"}
+
+
+@api.post("/auth/login")
+def auth_login(req: AuthLoginRequest, request: Request = None):
+    """Per-person login -- the email+password counterpart to the shared-passkey /login above. Deliberately
+    returns the same generic "invalid email or password" for a wrong email, a wrong password, an invited-but-
+    not-yet-accepted account, and a disabled account alike: telling a caller WHICH of those is true would leak
+    whether an email is registered at all. The one exception is a correct password on a 2FA-enabled account
+    with no code yet -- that gets its own distinct response (`detail: "totp_required"`) so the frontend knows
+    to ask for the code next, which is safe to reveal only because the password has already been proven
+    correct at that point."""
+    email = req.email.strip().lower()
+    ip = _client_ip(request) if request is not None else None
+    _check_login_rate_limit(email)
+    if ip is not None:
+        _check_login_rate_limit(ip)
+    with db() as conn:
+        user = conn.execute(
+            "SELECT id, name, email, bank, role, status, password_hash, password_salt, "
+            "totp_enabled, totp_secret FROM users WHERE lower(email) = %s", (email,),
+        ).fetchone()
+    invalid = HTTPException(401, "invalid email or password")
+    if (not user or user["status"] != "active" or not user["password_hash"]
+            or not _verify_password(req.password, user["password_hash"], user["password_salt"])):
+        _record_login_attempt(email, False)
+        if ip is not None:
+            _record_login_attempt(ip, False)
+        raise invalid
+    if user["totp_enabled"]:
+        if not req.totp_code:
+            raise HTTPException(401, "totp_required")
+        if not pyotp.TOTP(user["totp_secret"]).verify(req.totp_code, valid_window=1):
+            _record_login_attempt(email, False)
+            if ip is not None:
+                _record_login_attempt(ip, False)
+            raise HTTPException(401, "invalid authentication code")
+    _record_login_attempt(email, True)
+    if ip is not None:
+        _record_login_attempt(ip, True)
+    token = issue_session_token(user["name"], user["role"], user["bank"], uid=user["id"])
+    audit("auth_login", {"email": email, "role": user["role"], "bank": user["bank"]})
+    return {"token": token, "name": user["name"], "role": user["role"], "bank": user["bank"]}
+
+
+@api.post("/auth/2fa/setup")
+def setup_2fa(uid: int = Depends(get_current_user_id)):
+    """Generates a new TOTP secret for the signed-in person and stores it (NOT yet enabled -- see
+    /auth/2fa/enable). Calling this again before enabling just replaces the pending secret, so there's never
+    more than one "in progress" setup per account. Returns the secret as plain text (type it into any
+    authenticator app's "enter code manually" option) and as an otpauth:// URI (tapping it on a phone with an
+    authenticator app installed adds the account directly, no QR scanner needed)."""
+    with db() as conn:
+        user = conn.execute("SELECT email FROM users WHERE id = %s", (uid,)).fetchone()
+        if not user:
+            raise HTTPException(404, "no such user")
+        secret = pyotp.random_base32()
+        conn.execute("UPDATE users SET totp_secret = %s, totp_enabled = false WHERE id = %s", (secret, uid))
+    uri = pyotp.TOTP(secret).provisioning_uri(name=user["email"], issuer_name="XAI-AMLBench")
+    return {"secret": secret, "provisioning_uri": uri}
+
+
+@api.post("/auth/2fa/enable")
+def enable_2fa(req: Totp2faVerifyRequest, uid: int = Depends(get_current_user_id)):
+    with db() as conn:
+        user = conn.execute("SELECT totp_secret FROM users WHERE id = %s", (uid,)).fetchone()
+        if not user or not user["totp_secret"]:
+            raise HTTPException(400, "call /auth/2fa/setup first")
+        if not pyotp.TOTP(user["totp_secret"]).verify(req.code, valid_window=1):
+            raise HTTPException(401, "invalid code")
+        conn.execute("UPDATE users SET totp_enabled = true WHERE id = %s", (uid,))
+    audit("enable_2fa", {"user_id": uid})
+    return {"totp_enabled": True}
+
+
+@api.post("/auth/2fa/disable")
+def disable_2fa(req: Totp2faVerifyRequest, uid: int = Depends(get_current_user_id)):
+    """Requires a currently-valid code to turn 2FA back off, even from an already-signed-in session -- so
+    someone who merely finds a device unlocked and signed in still can't strip 2FA off the account without the
+    authenticator itself."""
+    with db() as conn:
+        user = conn.execute(
+            "SELECT totp_secret, totp_enabled FROM users WHERE id = %s", (uid,),
+        ).fetchone()
+        if not user or not user["totp_enabled"]:
+            raise HTTPException(400, "2FA is not enabled on this account")
+        if not pyotp.TOTP(user["totp_secret"]).verify(req.code, valid_window=1):
+            raise HTTPException(401, "invalid code")
+        conn.execute("UPDATE users SET totp_enabled = false, totp_secret = NULL WHERE id = %s", (uid,))
+    audit("disable_2fa", {"user_id": uid})
+    return {"totp_enabled": False}
+
+
+@api.get("/public/status")
+def public_status():
+    """Unauthenticated, deliberately a MUCH smaller version of /system/status for a public status page testers
+    can check without logging in. No Kafka config, no exception class names, no latency numbers -- just
+    whether the platform as a whole is up, so this can never leak infrastructure topology to the open
+    internet."""
+    def ok(url: str) -> bool:
+        try:
+            httpx.get(url, timeout=4).raise_for_status()
+            return True
+        except httpx.HTTPError:
+            return False
+    try:
+        with db() as conn:
+            conn.execute("SELECT 1")
+        db_ok = True
+    except psycopg.OperationalError:
+        db_ok = False
+    all_ok = db_ok and ok(f"{GNN_API_URL}/health") and ok(f"{XAI_API_URL}/health")
+    return {"all_ok": all_ok, "checked_at": time.time()}
+
+
+@api.get("/public/banks/{bank_name}/branding")
+def public_bank_branding(bank_name: str):
+    """Unauthenticated: just enough for the login screen to show a bank's own name/logo before anyone has
+    signed in (reached via /?bank=<name> -- see frontend's LoginScreen). Returns defaults rather than 404 for
+    a name with no row (an env-configured BANK_PASSKEYS tenant, or a typo) so the login screen never breaks,
+    it just shows the generic brand instead."""
+    with db() as conn:
+        row = conn.execute(
+            "SELECT name, logo_url, accent_color FROM banks WHERE name = %s", (bank_name,),
+        ).fetchone()
+    if not row:
+        return {"name": bank_name, "logo_url": None, "accent_color": None}
+    return row
 
 
 @api.post("/alerts/{alert_id}/narrative")
@@ -955,6 +2106,49 @@ def resolve_anomaly(anomaly_id: int, req: AnomalyResolveRequest, officer: str = 
     record["record_sha256"] = hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
     audit("anomaly_resolved", record)
     return alert
+
+
+@api.post("/identity/check")
+def identity_check(req: IdentityCheckRequest, officer: str = Depends(get_current_officer),
+                   bank: str | None = Depends(get_current_bank)):
+    """Runs check_identity() against whichever provider is configured and records the result. See
+    check_identity()'s own docstring for exactly what each status means and what it does NOT mean -- in
+    particular, 'mismatch' and 'deceased' are both reasons to follow up with a human, not final verdicts this
+    system reaches on its own. The raw ID number never reaches storage, only this request's own validation and
+    the provider call above see it; only its hash and last 4 characters are kept, in identity_checks below."""
+    result = check_identity(req.claimed_name, req.id_number)
+    row_bank = bank or lookup_bank(req.account_id)
+    _store_identity_check(req.account_id, row_bank, req.claimed_name, req.id_number, result, officer)
+    audit("identity_check", {"account_id": req.account_id, "status": result["status"], "by": officer,
+                             "provider": IDENTITY_PROVIDER or "unconfigured"})
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM identity_checks WHERE account_id = %s ORDER BY created_at DESC LIMIT 1",
+            (req.account_id,),
+        ).fetchone()
+    return row
+
+
+@api.get("/identity/checks")
+def identity_checks(account_id: str | None = None, limit: int = 100,
+                    bank: str | None = Depends(get_current_bank), officer: str = Depends(get_current_officer)):
+    """History for the Identity Check page. A bank-tenant session only ever sees its own bank's checks, same
+    scoping as every other bank-attributable route (see get_current_bank's own docstring); an admin/legacy
+    session sees everything."""
+    clauses, params = [], []
+    if bank is not None:
+        clauses.append("bank = %s")
+        params.append(bank)
+    if account_id:
+        clauses.append("account_id = %s")
+        params.append(account_id)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with db() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM identity_checks {where} ORDER BY created_at DESC LIMIT %s",
+            (*params, max(1, min(limit, 500))),
+        ).fetchall()
+    return rows
 
 
 app.include_router(api)

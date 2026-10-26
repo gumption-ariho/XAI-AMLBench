@@ -4,9 +4,14 @@ POST /narrative  {account_id}  or  {account_id, explanation}
   1. gets a GNNExplainer subgraph from gnn-detection-api (unless one is supplied)
   2. reduces it to verified facts  (sar_generator.build_facts)
   3. asks the local quantized Llama-3-8B (vLLM, temperature 0) to write 4 sentences
-  4. validates the text against the fact sheet; on any problem returns the deterministic template instead
+  4. validates the text against the fact sheet; on any problem returns the deterministic template instead --
+     this is a hallucination guard on the REAL model's own output, not a separate "fake" mode: a narrative
+     only falls back to the template when the LLM it just ran said something the fact sheet can't back up.
 
-Set LLM_BACKEND=template to run without a GPU (template narratives only).
+LLM_BACKEND=template skips step 3 entirely and always returns the template narrative -- useful for local,
+GPU-less development (see run_local.py), but docker-compose.yml's deployed xai-narrative-api service always
+runs with LLM_BACKEND=vllm: there is no template-only service deployed in its place. See that file's own
+comment on why a CPU stand-in was removed rather than offered as a default.
 """
 from __future__ import annotations
 

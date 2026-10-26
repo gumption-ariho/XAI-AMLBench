@@ -158,6 +158,17 @@ button { font: inherit; }
 .login-input { width: 100%; }
 .login-error { font-size: 13px; color: var(--red); line-height: 1.4; }
 .login-submit { width: 100%; justify-content: center; }
+/* Admin/operator sign-in (the /owner door) -- deliberately more "technical" than the plain customer card
+   above, so it's visually unmistakable which door you're on: monospace type, a terminal-green accent instead
+   of the customer blue, and a scanline-style top border. Purely cosmetic -- the actual separation is which
+   backend endpoint the form posts to (see LoginScreen.tsx's `endpoint` prop). */
+.login-card.admin-variant { font-family: "SF Mono", "Fira Code", "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+  border-top: 2px solid var(--green); background: #0a0f0c; }
+.login-card.admin-variant .login-shield { background: rgba(74, 222, 128, .08); border-color: rgba(74, 222, 128, .3); color: var(--green); }
+.login-card.admin-variant .login-title { color: var(--green); letter-spacing: .02em; }
+.login-card.admin-variant .login-input { font-family: inherit; }
+.login-card.admin-variant .btn.shine { background: var(--green); color: #052e16; }
+.login-card.admin-variant .btn.shine:hover:not(:disabled) { background: #22c55e; }
 .seg { display: inline-flex; background: var(--bg0); border: 1px solid var(--line); border-radius: 9px; padding: 3px; }
 .seg button { background: none; border: 0; color: var(--muted); text-transform: capitalize; padding: 6px 14px; border-radius: 6px; cursor: pointer; }
 .seg button.on { background: var(--blue); color: #fff; }

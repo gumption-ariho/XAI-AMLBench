@@ -1,17 +1,25 @@
-# XAI-AMLBench -- 14-container stack
+# XAI-AMLBench -- 13-container stack
 #
 # Profiles (so you don't have to run everything at once):
 #   (none)  -> infra: traefik, kafka, postgres, redis, neo4j, immudb
 #   app     -> frontend, backend, node_agent           (ProjectXY legacy)
 #   ml      -> aml-synth-worker, gnn-detection-api
-#   llm     -> xai-narrative-api                       (LLM narratives, needs NVIDIA GPU)
-#   (the app profile already includes xai-narrative-lite: template narratives on CPU. Do not run it together with llm.)
+#   llm     -> xai-narrative-api                       (LLM narratives -- REQUIRES an NVIDIA GPU, see its own
+#                                                         service comment below. There is no CPU fallback
+#                                                         service in this deployment on purpose: a previous
+#                                                         "xai-narrative-lite" service generated narratives
+#                                                         from a fixed template instead of a real model and was
+#                                                         removed -- the app profile alone no longer starts any
+#                                                         narrative service at all, so "why was this flagged"
+#                                                         explanations are unavailable until the llm profile is
+#                                                         running on a GPU machine, rather than silently served
+#                                                         by something that only looks like the real thing.)
 #   obs     -> prometheus-metrics, grafana-dashboard
 #
 # Examples:
 #   docker compose up -d                              # infra only
 #   docker compose --profile ml up -d --build         # infra + ML services
-#   docker compose --profile app --profile ml --profile obs up -d
+#   docker compose --profile app --profile llm --profile ml --profile obs up -d --build   # full stack, GPU required
 #
 # NOTE: image tags below are sensible defaults. If you already pulled different
 # tags, change them here so Docker uses your cached layers.
@@ -31,6 +39,8 @@ volumes:
   prometheus-data:
   grafana-data:
   hf-cache:
+  acme-certs:                  # Let's Encrypt certificate + account key -- keep this across restarts/redeploys
+                                # or you'll re-request a cert every time and can hit Let's Encrypt's rate limit
 
 services:
   # ------------------------------------------------------------------
@@ -42,8 +52,11 @@ services:
     command: ["--configFile=/etc/traefik/traefik.yml"]
     environment:
       DOCKER_API_VERSION: "1.44"      # Docker Engine 29+ refuses the old API version Traefik v3.1 uses; without this Traefik finds no containers
+      ACME_EMAIL: ${ACME_EMAIL}
     ports:
-      - "80:80"
+      - "80:80"                  # kept open only to answer Let's Encrypt's HTTP-01 challenge and 301-redirect
+                                  # everything else to 443 -- see traefik.yml's entryPoints.web.http.redirections
+      - "443:443"
       - "127.0.0.1:8081:8081"     # Traefik dashboard (dev only) -- localhost-only, matching the "dev only"
                                   # comment's own intent. Was previously bound to all interfaces with no
                                   # authentication at all, a real finding from a security hygiene pass: this
@@ -53,6 +66,7 @@ services:
     volumes:
       - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      - acme-certs:/letsencrypt
     networks: [xai-net]
 
   apache-kafka:                   # Container 2 (single-node KRaft, no ZooKeeper)
@@ -111,11 +125,12 @@ services:
     labels:
       - traefik.enable=true
       - traefik.http.routers.frontend.rule=Host(`${PUBLIC_HOST}`)
-      - traefik.http.routers.frontend.entrypoints=web
+      - traefik.http.routers.frontend.entrypoints=websecure
+      - traefik.http.routers.frontend.tls.certresolver=letsencrypt
       - traefik.http.routers.frontend.priority=1
       - traefik.http.services.frontend.loadbalancer.server.port=3000
-    ports:
-      - "3000:3000"
+    # No direct port publish here on purpose: port 80 redirects to 443 and only Traefik terminates TLS, so a
+    # published "3000:3000" would let anyone skip the HTTPS redirect entirely and hit the app in plain HTTP.
     networks: [xai-net]
 
   backend:                        # Container 4
@@ -142,7 +157,8 @@ services:
     labels:
       - traefik.enable=true
       - traefik.http.routers.backend.rule=Host(`${PUBLIC_HOST}`) && PathPrefix(`/api`)
-      - traefik.http.routers.backend.entrypoints=web
+      - traefik.http.routers.backend.entrypoints=websecure
+      - traefik.http.routers.backend.tls.certresolver=letsencrypt
       - traefik.http.routers.backend.priority=10
       - traefik.http.services.backend.loadbalancer.server.port=8000   # adjust to ProjectXY backend port
     networks: [xai-net]
@@ -217,7 +233,8 @@ services:
     labels:
       - traefik.enable=true
       - traefik.http.routers.gnn.rule=Host(`${PUBLIC_HOST}`) && PathPrefix(`/gnn`)
-      - traefik.http.routers.gnn.entrypoints=web
+      - traefik.http.routers.gnn.entrypoints=websecure
+      - traefik.http.routers.gnn.tls.certresolver=letsencrypt
       - traefik.http.routers.gnn.middlewares=gnn-strip
       - traefik.http.middlewares.gnn-strip.stripprefix.prefixes=/gnn
       - traefik.http.services.gnn.loadbalancer.server.port=8000
@@ -331,14 +348,21 @@ services:
       - ./data:/app/data
     networks: [xai-net]
 
-  xai-narrative-api:              # Container 8 (FastAPI + in-process vLLM)
+  xai-narrative-api:              # Container 8 (FastAPI + in-process vLLM) -- the ONLY narrative service in
+                                   # this deployment. REQUIRES an NVIDIA GPU (see the `deploy:` block below) --
+                                   # there is deliberately no CPU/template fallback service running in its
+                                   # place. Without this container (and the llm profile that starts it) up and
+                                   # reachable, "why was this flagged" narrative generation is simply
+                                   # unavailable (backend's /alerts/{id}/narrative returns a 502) rather than
+                                   # silently served by a fixed-template stand-in that only looks like a real
+                                   # model's explanation.
     profiles: [llm]
     build:
       context: .
       dockerfile: xai_explainer/Dockerfile   # FROM vllm/vllm-openai (pin VLLM_TAG build-arg to your pulled tag)
     restart: unless-stopped
     environment:
-      LLM_BACKEND: ${LLM_BACKEND:-vllm}          # set to 'template' to run without a GPU
+      LLM_BACKEND: ${LLM_BACKEND:-vllm}
       LLM_MODEL: ${LLM_MODEL}
       LLM_QUANT: ${LLM_QUANT:-awq}
       LLM_MAX_MODEL_LEN: ${LLM_MAX_MODEL_LEN}
@@ -350,7 +374,6 @@ services:
     volumes:
       - hf-cache:/root/.cache/huggingface
     ipc: host
-    # No NVIDIA GPU? delete this deploy block and set LLM_BACKEND=template in .env
     deploy:
       resources:
         reservations:
@@ -358,34 +381,12 @@ services:
     labels:
       - traefik.enable=true
       - traefik.http.routers.xai.rule=Host(`${PUBLIC_HOST}`) && PathPrefix(`/xai`)
-      - traefik.http.routers.xai.entrypoints=web
+      - traefik.http.routers.xai.entrypoints=websecure
+      - traefik.http.routers.xai.tls.certresolver=letsencrypt
       - traefik.http.routers.xai.middlewares=xai-strip
       - traefik.http.middlewares.xai-strip.stripprefix.prefixes=/xai
       - traefik.http.services.xai.loadbalancer.server.port=8000
     networks: [xai-net]
-
-  xai-narrative-lite:             # CPU-only narrative service (profile app): validated template narratives, no GPU needed
-    profiles: [app]
-    build:
-      context: .
-      dockerfile: xai_explainer/Dockerfile.lite
-    restart: unless-stopped
-    environment:
-      LLM_BACKEND: template
-      GNN_API_URL: http://gnn-detection-api:8000
-      IMMUDB_HOST: immudb-audit-ledger
-      IMMUDB_PORT: 3322
-      IMMUDB_ADMIN_PASSWORD: ${IMMUDB_ADMIN_PASSWORD}
-    labels:
-      - traefik.enable=true
-      - traefik.http.routers.xai-lite.rule=Host(`${PUBLIC_HOST}`) && PathPrefix(`/xai`)
-      - traefik.http.routers.xai-lite.entrypoints=web
-      - traefik.http.routers.xai-lite.middlewares=xai-lite-strip
-      - traefik.http.middlewares.xai-lite-strip.stripprefix.prefixes=/xai
-      - traefik.http.services.xai-lite.loadbalancer.server.port=8000
-    networks:
-      xai-net:
-        aliases: [xai-narrative-api]     # the backend calls http://xai-narrative-api:8000 - this service answers to that name
 
   # ------------------------------------------------------------------
   # D. CACHING & SPECIALIZED STORAGE
@@ -474,7 +475,7 @@ services:
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
-      GF_SERVER_ROOT_URL: http://${PUBLIC_HOST}/grafana/
+      GF_SERVER_ROOT_URL: https://${PUBLIC_HOST}/grafana/
       GF_SERVER_SERVE_FROM_SUB_PATH: "true"
     volumes:
       - grafana-data:/var/lib/grafana
@@ -484,6 +485,7 @@ services:
     labels:
       - traefik.enable=true
       - traefik.http.routers.grafana.rule=Host(`${PUBLIC_HOST}`) && PathPrefix(`/grafana`)
-      - traefik.http.routers.grafana.entrypoints=web
+      - traefik.http.routers.grafana.entrypoints=websecure
+      - traefik.http.routers.grafana.tls.certresolver=letsencrypt
       - traefik.http.services.grafana.loadbalancer.server.port=3000
     networks: [xai-net]

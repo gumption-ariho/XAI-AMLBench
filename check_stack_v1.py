@@ -14,6 +14,7 @@ Start the stack first:   docker compose --profile app --profile ml up -d --build
 """
 import argparse
 import json
+import ssl
 import sys
 import time
 import urllib.error
@@ -22,13 +23,73 @@ import urllib.request
 
 RESULTS = []          # (status, name, detail, hint)
 
+# Traefik only gets a real, browser-trusted certificate for a real domain pointed at it over DNS (Let's
+# Encrypt's HTTP-01 challenge needs that) -- see traefik/traefik.yml. On localhost, or any PUBLIC_HOST that
+# isn't reachable from the internet, it falls back to its own self-signed default certificate instead, which
+# is CORRECT behavior, not a bug: there's no way for anyone (Traefik included) to get a real cert for a
+# hostname nobody but this laptop can resolve. That self-signed cert is exactly why a browser would show a
+# "not private" warning when testing https://localhost by hand (click through it -- same thing curl -k does).
+# This script does the equivalent for its own checks ONLY against a local-looking host; a real domain is still
+# verified normally, so a genuinely bad/expired certificate on your actual deployed server still fails loudly.
+_INSECURE_TLS_CTX = ssl._create_unverified_context()
+FORCE_INSECURE = False     # set from --insecure in main(); otherwise call() still auto-skips verification for
+                           # a local-looking host, since that one always carries Traefik's self-signed fallback
+
+# Every /api/* route except /health and /login now requires a signed-in officer (per-person logins -- see
+# backend/main.py's get_current_officer). TOKEN is set once by the login step in main() and attached to every
+# call made after that, so the rest of this script doesn't have to think about auth at all.
+TOKEN = ""
+
+
+def _is_local_host(hostname: str) -> bool:
+    return hostname in ("localhost", "127.0.0.1", "::1") or hostname.endswith(".localhost")
+
+
+def _env_passkey(path=".env"):
+    """Best-effort read of ANALYST_PASSKEY (preferred -- sees every bank) or ADMIN_PASSKEY straight out of a
+    local .env file, so a plain `python3 check_stack_v1.py` keeps working without extra flags for the common
+    case of running this from the repo root next to your own .env."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    found = {}
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        found[key.strip()] = val.strip().strip('"').strip("'")
+    return found.get("ANALYST_PASSKEY") or found.get("ADMIN_PASSKEY") or None
+
 
 def call(base, method, path, body=None, timeout=30):
+    # Traefik force-redirects every :80 request to :443 with a 308 (traefik/traefik.yml), which correctly
+    # preserves the original method and body -- exactly right for a browser. Python's urllib auto-follows
+    # that for GET (why every GET-based check below silently worked even against http://), but deliberately
+    # refuses to auto-follow a 307/308 for POST/PUT/DELETE (resubmitting a POST's body to a new URL without
+    # the caller's say-so is the one case it won't do silently) -- so POST /api/login against http://
+    # previously came back as a bare, unfollowed "308 Permanent Redirect" instead of ever reaching the real
+    # route. Upgrading to https upfront removes the redirect -- and this discrepancy -- entirely, for every
+    # method, not just the ones that happened to survive it by luck.
+    #
+    # Scoped to the default port (80) only -- Traefik's own dashboard/API (port 8081, plain HTTP, no TLS at
+    # all -- "dev only" in docker-compose.yml) and a service run directly via --gnn/--xai (a bare local
+    # port, also plain HTTP, see run_local.py) both must NOT be upgraded, or the request would try a TLS
+    # handshake against a server that was never listening for one.
+    if base.startswith("http://") and (urllib.parse.urlparse(base).port in (None, 80)):
+        base = "https://" + base[len("http://"):]
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(base.rstrip("/") + path, data=data, method=method, headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    if TOKEN:
+        headers["Authorization"] = f"Bearer {TOKEN}"
+    req = urllib.request.Request(base.rstrip("/") + path, data=data, method=method, headers=headers)
+    insecure = FORCE_INSECURE or _is_local_host(urllib.parse.urlparse(base).hostname or "")
+    ctx = _INSECURE_TLS_CTX if insecure else None
     t0 = time.perf_counter()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
             raw = r.read()
             code = r.status
     except urllib.error.HTTPError as e:
@@ -66,12 +127,24 @@ def upstream_hint(code, body):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base", default="http://localhost")
+    ap.add_argument("--base", default="http://localhost",
+                     help="http:// is fine here -- call() upgrades it to https:// itself before making any "
+                          "request, since the real gateway never actually serves plain http (see call()'s own comment).")
     ap.add_argument("--json", default="")
     ap.add_argument("--traefik", default="", help="gateway dashboard/API URL (default: same host, port 8081)")
     ap.add_argument("--gnn", default="", help="base URL of the model service when it runs outside Docker, e.g. http://127.0.0.1:8001")
     ap.add_argument("--xai", default="", help="base URL of the narrative service when it runs outside Docker, e.g. http://127.0.0.1:8002")
+    ap.add_argument("--insecure", action="store_true", default=None,
+                     help="skip TLS certificate verification even against --base. Auto-enabled already for "
+                          "localhost/127.0.0.1 (self-signed by design, see traefik/traefik.yml); pass this to "
+                          "also skip it against a real hostname, e.g. a VPS tested before its DNS is live yet.")
+    ap.add_argument("--passkey", default="", help="ANALYST_PASSKEY or ADMIN_PASSKEY to sign in with before the "
+                     "GNN/alerts checks below (they're per-officer routes now). Default: read ANALYST_PASSKEY "
+                     "then ADMIN_PASSKEY out of ./.env.")
+    ap.add_argument("--name", default="check_stack", help="the name signed into the session token and audit trail for this run.")
     a = ap.parse_args()
+    global FORCE_INSECURE
+    FORCE_INSECURE = bool(a.insecure)
     B = a.base
     state = {}
     print(f"XAI-AMLBench: stack check  ({B})\n" + "=" * 70)
@@ -107,6 +180,22 @@ def main():
         return code == 200 and isinstance(body, dict) and body.get("status") == "ok", f"{body}" if code != 200 else f"database reachable, {dt:.0f} ms"
     step("GET /api/health", health, "backend or Postgres not up: docker compose ps ; docker compose logs backend --tail 30")
 
+    print("\n2b  Sign in (everything below is a per-officer route)")
+    def do_login():
+        passkey = a.passkey or _env_passkey()
+        if not passkey:
+            return False, "no passkey available"
+        code, body, _ = call(B, "POST", "/api/login", {"name": a.name, "passkey": passkey})
+        if code == 200 and isinstance(body, dict) and body.get("token"):
+            global TOKEN
+            TOKEN = body["token"]
+            return True, f"signed in as '{body.get('name')}', role {body.get('role')}" + (f", bank {body['bank']}" if body.get("bank") else "")
+        return False, f"HTTP {code}: {str(body)[:160]}"
+    step("POST /api/login", do_login,
+         "set ANALYST_PASSKEY (or ADMIN_PASSKEY) in .env and run this from the same directory, or pass "
+         "--passkey <your passkey>. Every check below needs a session token, same as the browser does, so "
+         "they'll all fail with 401 until this one passes.")
+
     print("\n3  GNN service (your trained model)")
     def gnn_health():
         code, body, _ = call(a.gnn, "GET", "/health") if a.gnn else call(B, "GET", "/gnn/health")
@@ -118,14 +207,22 @@ def main():
         code, body, dt = call(B, "GET", "/api/model/info")
         ok = code == 200 and isinstance(body, dict) and "metrics" in body
         return ok, (f"{body.get('model')} AUC {body['metrics']['test_auc_roc']:.3f}, threshold {body['threshold']:.2f}" if ok else f"HTTP {code}: {str(body)[:160]}")
-    step("backend -> GNN: GET /api/model/info", model_info, upstream_hint(0, "") or "the backend cannot reach gnn-detection-api (profile ml): docker compose --profile ml up -d")
+    step("backend -> GNN: GET /api/model/info", model_info, upstream_hint(0, "") or
+         "HTTP 401 here means the login step above didn't get a token (see its hint); any other failure means "
+         "the backend cannot reach gnn-detection-api (profile ml): docker compose --profile ml up -d")
 
     def sample():
+        # An empty "suspicious" list is a REAL, valid result (there just aren't any in this particular
+        # sample right now) -- it must not fail this check, which only verifies the call itself works. If
+        # there happens to be a suspicious account this round, it's stashed in state["acct"] for checks 4+
+        # below, all of which already skip themselves gracefully (`if "acct" in state`) when there isn't one.
         code, body, _ = call(B, "GET", "/api/accounts/sample")
-        ok = code == 200 and isinstance(body, dict) and body.get("suspicious")
-        if ok:
+        ok = code == 200 and isinstance(body, dict) and "suspicious" in body and "benign" in body
+        if ok and body["suspicious"]:
             state["acct"] = body["suspicious"][0]
-        return ok, f"e.g. {state.get('acct')}" if ok else f"HTTP {code}: {str(body)[:160]}"
+        detail = (f"{len(body['suspicious'])} suspicious, {len(body['benign'])} benign in this sample"
+                  if ok else f"HTTP {code}: {str(body)[:160]}")
+        return ok, detail
     step("backend -> GNN: sample accounts", sample, "same cause as above")
 
     print("\n4  Scoring, explanation and narrative (the real workflow)")
@@ -151,7 +248,7 @@ def main():
     def xai_health():
         code, body, _ = call(a.xai, "GET", "/health") if a.xai else call(B, "GET", "/xai/health")
         return code == 200 and isinstance(body, dict) and body.get("status") == "ok", f"backend '{body.get('backend')}'" if isinstance(body, dict) and code == 200 else f"HTTP {code}: {str(body)[:120]}"
-    step("GET /xai/health: narrative service up", xai_health, "no narrative service. CPU-only machine: docker compose --profile app up -d --build (includes xai-narrative-lite); GPU machine: --profile llm")
+    step("GET /xai/health: narrative service up", xai_health, "no narrative service. This needs an NVIDIA GPU machine: docker compose --profile llm up -d --build xai-narrative-api (there is no CPU fallback service)")
 
     def narrative():
         code, body, dt = call(B, "POST", f"/api/alerts/{state['alert']}/narrative", timeout=240)
@@ -160,7 +257,7 @@ def main():
             state["narr"] = body["narrative"]
         return ok, (f"{len(body['narrative'].split())} words, source '{body['narrative_source']}', typology '{body['typology']}', {dt/1000:.1f} s" if ok else f"HTTP {code}: {str(body)[:200]}")
     if "alert" in state:
-        step("POST /api/alerts/{id}/narrative: SAR narrative generated and stored", narrative, "backend -> narrative service failed: docker compose logs backend --tail 30 ; docker compose logs xai-narrative-lite --tail 30")
+        step("POST /api/alerts/{id}/narrative: SAR narrative generated and stored", narrative, "backend -> narrative service failed: docker compose logs backend --tail 30 ; docker compose logs xai-narrative-api --tail 30")
 
     def listing():
         code, body, _ = call(B, "GET", "/api/alerts")

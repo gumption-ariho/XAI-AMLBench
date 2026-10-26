@@ -40,6 +40,9 @@ export interface WhoamiResponse {
    * anomaly, and account this session can see or touch is scoped to this one bank. null for an admin or
    * legacy shared-analyst session, which still sees every bank's data, exactly as before this field existed. */
   bank: string | null;
+  /** "admin" routes straight to the owner backoffice (/owner) instead of the bank console -- see the root
+   * page's mount-time whoami check. */
+  role: "admin" | "analyst";
 }
 
 export interface LoginResponse {
@@ -47,6 +50,95 @@ export interface LoginResponse {
   name: string;
   role: "admin" | "analyst";
   bank: string | null;
+}
+
+/* ---- Owner backoffice (GET /admin/tenants) -- admin-role sessions only, see backend/main.py ---- */
+export interface TenantSummary {
+  bank: string;
+  status: "active" | "suspended";
+  registration_number?: string | null;
+  country?: string | null;
+  region?: string | null;
+  website?: string | null;
+  total_alerts: number;
+  open_alerts: number;
+  total_anomalies: number;
+  open_anomalies: number;
+  accounts: number;
+  last_activity: string | null;
+}
+
+export interface NewBankResponse {
+  name: string;
+  passkey: string;
+  status: "active" | "suspended";
+}
+
+export interface SignupRequest {
+  id: number;
+  bank_name: string;
+  contact_name: string;
+  contact_email: string;
+  note: string;
+  status: "pending" | "approved" | "declined";
+  created_at: string;
+  decided_at: string | null;
+  // Full registration detail -- see backend/main.py's banks/signup_requests ALTER TABLE comments. All
+  // optional/nullable: an older request, or one filled in quickly, may not have every field.
+  registration_number?: string | null;
+  country?: string | null;
+  region?: string | null;
+  address?: string | null;
+  website?: string | null;
+}
+
+export interface PublicStatus {
+  all_ok: boolean;
+  checked_at: number;
+}
+
+export interface BankBranding {
+  name: string;
+  logo_url: string | null;
+  accent_color: string | null;
+}
+
+/* ---- Per-person accounts (on top of the shared admin/analyst/bank passkeys) -- see backend/main.py's
+   admin_invite_user / auth_login / setup_2fa and friends. ---- */
+export interface PersonUser {
+  id: number;
+  name: string;
+  email: string;
+  bank: string | null;
+  role: "admin" | "analyst";
+  // "pending" is a self-registered analyst (POST /auth/signup) awaiting the owner's approval -- see
+  // backend/main.py's users table comment. They cannot sign in until an admin flips this to "active".
+  status: "invited" | "pending" | "active" | "disabled";
+  totp_enabled: boolean;
+  created_at: string;
+}
+
+export interface InviteUserResponse extends PersonUser {
+  invite_token: string;
+  invite_link: string | null;
+}
+
+/* ---- POST /auth/signup -- the public, self-service analyst registration form (frontend/src/app/
+   analyst-signup/page.tsx), the counterpart to the owner-driven invite flow above. ---- */
+export interface AnalystSignupResponse {
+  email: string;
+  bank: string;
+  status: "pending";
+}
+
+/** The second POST /auth/login call throws this exact string as the error detail when the password was
+ * correct but the account has 2FA enabled and no code was sent yet -- the signal to show the code field and
+ * resubmit, see frontend/src/app/signin/page.tsx. */
+export const TOTP_REQUIRED = "totp_required";
+
+export interface Setup2faResponse {
+  secret: string;
+  provisioning_uri: string;
 }
 
 /* ---- Model 2 (anomaly detector) -- see gnn_aml_core/anomaly.py and backend/main.py's /api/anomalies/* ---- */
@@ -87,6 +179,11 @@ export interface Alert {
   review_note: string | null;
   created_at: string;
   reviewed_at: string | null;
+  // Most recent identity_checks result for this account, if ANY has ever been run (manually, or
+  // automatically at intake -- see backend/main.py's _auto_identity_checks). null/undefined on an alert
+  // whose account has never had an identity check -- that means "nothing checked yet", not "verified clean".
+  identity_status?: IdentityCheckStatus | null;
+  identity_detail?: string | null;
 }
 
 export interface ScanResponse {
@@ -188,6 +285,27 @@ export interface IntakeClearResponse {
   remaining_live_accounts?: number;
   remaining_live_transactions?: number;
   [key: string]: unknown;
+}
+
+/* ---- Identity Check page -- POST /api/identity/check, GET /api/identity/checks (backend/main.py's
+   check_identity()). "unconfigured" means no provider is set in .env yet, not that the check failed; see
+   backend/main.py's check_identity() docstring for exactly what each status does and doesn't mean -- in
+   particular "mismatch"/"deceased" are reasons to follow up with a human, never a verdict this system reaches
+   on its own, and NOTHING here can ever confirm whether the real ID owner is aware this account exists. ---- */
+export type IdentityCheckStatus = "unconfigured" | "match" | "mismatch" | "not_found" | "deceased" | "provider_error";
+
+export interface IdentityCheckRecord {
+  id: number;
+  account_id: string;
+  bank: string;
+  claimed_name: string;
+  id_number_last4: string;
+  provider: string;
+  status: IdentityCheckStatus;
+  detail: string;
+  raw_response: unknown;
+  checked_by: string;
+  created_at: string;
 }
 
 export interface Toast {

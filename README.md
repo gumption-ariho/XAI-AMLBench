@@ -140,12 +140,16 @@ python3 check_latency_v1.py --gnn http://127.0.0.1:8001                # cold/wa
 Open http://localhost:3000. Ctrl+C stops everything; `python3 run_local.py --stop` cleans up leftovers.
 
 ## Or build the Docker images (needs a fast connection: about 2 GB of downloads)
+Narrative generation (`xai-narrative-api`) requires an NVIDIA GPU -- there is no CPU fallback service in this
+deployment, so without a GPU machine the rest of the stack still runs, but "why was this flagged" narratives
+are unavailable until you have one.
 ```bash
-docker compose build backend && docker compose build xai-narrative-lite && docker compose build gnn-detection-api && docker compose build frontend
-docker compose up -d gnn-detection-api backend xai-narrative-lite frontend node_agent
+docker compose build backend && docker compose build gnn-detection-api && docker compose build frontend
+docker compose up -d gnn-detection-api backend frontend node_agent
 python3 check_stack_v1.py
+# On a GPU machine, add narrative generation:
+docker compose --profile llm build xai-narrative-api && docker compose --profile llm up -d xai-narrative-api
 ```
-(GPU machine with LLM narratives: use `--profile llm` instead of the lite service, not both.)
 
 ## 1. Start the infrastructure
 ```bash
