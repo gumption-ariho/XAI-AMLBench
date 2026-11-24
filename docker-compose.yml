@@ -124,11 +124,25 @@ services:
     depends_on: [backend]
     labels:
       - traefik.enable=true
-      - traefik.http.routers.frontend.rule=Host(`${PUBLIC_HOST}`)
-      - traefik.http.routers.frontend.entrypoints=websecure
-      - traefik.http.routers.frontend.tls.certresolver=letsencrypt
-      - traefik.http.routers.frontend.priority=1
-      - traefik.http.services.frontend.loadbalancer.server.port=3000
+      - traefik.http.routers.xaml-frontend.rule=Host(`${PUBLIC_HOST}`)
+      - traefik.http.routers.xaml-frontend.entrypoints=websecure
+      - traefik.http.routers.xaml-frontend.tls.certresolver=letsencrypt
+      - traefik.http.routers.xaml-frontend.priority=1
+      - traefik.http.services.xaml-frontend.loadbalancer.server.port=3000
+      # Keeps the owner backoffice (/owner) and the whole admin API (/api/admin/*) invisible to the public
+      # internet: any request that carries the header named by ADMIN_BLOCK_HEADER in .env (e.g. Cf-Ray, which a
+      # Cloudflare tunnel adds to every public request and a visitor can't strip) is answered with the app's
+      # ordinary 404 page, exactly as if /owner didn't exist. Requests from your own machine never carry that
+      # header, so https://localhost/owner keeps working. ADMIN_BLOCK_HEADER unset = this rule watches for a
+      # header nobody sends, so it does nothing. "$$" is Compose's escape for a literal "$" in the regex.
+      - traefik.http.routers.xaml-admin-hide.rule=Host(`${PUBLIC_HOST}`) && (PathPrefix(`/owner`) || PathPrefix(`/api/admin`)) && HeaderRegexp(`${ADMIN_BLOCK_HEADER:-X-Admin-Block-Disabled}`, `.+`) && !HeaderRegexp(`Cookie`, `xai_admin=${ADMIN_UNLOCK_KEY:-unset-key-disabled}`)
+      - traefik.http.routers.xaml-admin-hide.entrypoints=websecure
+      - traefik.http.routers.xaml-admin-hide.tls.certresolver=letsencrypt
+      - traefik.http.routers.xaml-admin-hide.priority=1000
+      - traefik.http.routers.xaml-admin-hide.middlewares=xaml-admin-hide
+      - traefik.http.routers.xaml-admin-hide.service=xaml-frontend
+      - traefik.http.middlewares.xaml-admin-hide.replacepathregex.regex=^.*$$
+      - traefik.http.middlewares.xaml-admin-hide.replacepathregex.replacement=/__not_found__
     # No direct port publish here on purpose: port 80 redirects to 443 and only Traefik terminates TLS, so a
     # published "3000:3000" would let anyone skip the HTTPS redirect entirely and hit the app in plain HTTP.
     networks: [xai-net]
@@ -156,11 +170,11 @@ services:
       database: { condition: service_healthy }
     labels:
       - traefik.enable=true
-      - traefik.http.routers.backend.rule=Host(`${PUBLIC_HOST}`) && PathPrefix(`/api`)
-      - traefik.http.routers.backend.entrypoints=websecure
-      - traefik.http.routers.backend.tls.certresolver=letsencrypt
-      - traefik.http.routers.backend.priority=10
-      - traefik.http.services.backend.loadbalancer.server.port=8000   # adjust to ProjectXY backend port
+      - traefik.http.routers.xaml-backend.rule=Host(`${PUBLIC_HOST}`) && PathPrefix(`/api`)
+      - traefik.http.routers.xaml-backend.entrypoints=websecure
+      - traefik.http.routers.xaml-backend.tls.certresolver=letsencrypt
+      - traefik.http.routers.xaml-backend.priority=10
+      - traefik.http.services.xaml-backend.loadbalancer.server.port=8000   # adjust to ProjectXY backend port
     networks: [xai-net]
 
   node_agent:                     # Container 5
@@ -232,12 +246,12 @@ services:
       - ./data:/app/data
     labels:
       - traefik.enable=true
-      - traefik.http.routers.gnn.rule=Host(`${PUBLIC_HOST}`) && PathPrefix(`/gnn`)
-      - traefik.http.routers.gnn.entrypoints=websecure
-      - traefik.http.routers.gnn.tls.certresolver=letsencrypt
-      - traefik.http.routers.gnn.middlewares=gnn-strip
-      - traefik.http.middlewares.gnn-strip.stripprefix.prefixes=/gnn
-      - traefik.http.services.gnn.loadbalancer.server.port=8000
+      - traefik.http.routers.xaml-gnn.rule=Host(`${PUBLIC_HOST}`) && PathPrefix(`/gnn`)
+      - traefik.http.routers.xaml-gnn.entrypoints=websecure
+      - traefik.http.routers.xaml-gnn.tls.certresolver=letsencrypt
+      - traefik.http.routers.xaml-gnn.middlewares=xaml-gnn-strip
+      - traefik.http.middlewares.xaml-gnn-strip.stripprefix.prefixes=/gnn
+      - traefik.http.services.xaml-gnn.loadbalancer.server.port=8000
     # Uncomment for GPU inference:
     # deploy:
     #   resources:
@@ -332,7 +346,17 @@ services:
       GNN_ADMIN_TOKEN: ${GNN_ADMIN_TOKEN:-}
       ANOMALY_INTERVAL_S: ${ANOMALY_INTERVAL_S:-300}
       ANOMALY_SYNC_INTERVAL_S: ${ANOMALY_SYNC_INTERVAL_S:-60}
-      ANOMALY_K_STD: ${ANOMALY_K_STD:-3.0}
+      ANOMALY_K_STD: ${ANOMALY_K_STD:-3.5}
+      ANOMALY_TRIM_FRACTION: ${ANOMALY_TRIM_FRACTION:-0.05}
+      ANOMALY_TRUSTED_WEIGHT: ${ANOMALY_TRUSTED_WEIGHT:-5}
+      ANOMALY_MIN_PASSES: ${ANOMALY_MIN_PASSES:-2}
+      ANOMALY_MAX_NEW_PER_PASS: ${ANOMALY_MAX_NEW_PER_PASS:-20}
+      ANOMALY_CLEARED_COOLDOWN_DAYS: ${ANOMALY_CLEARED_COOLDOWN_DAYS:-30}
+      ANOMALY_MODE: ${ANOMALY_MODE:-ensemble}
+      ANOMALY_AUTO_CLEAR_NORMAL_AFTER_HOURS: ${ANOMALY_AUTO_CLEAR_NORMAL_AFTER_HOURS:-0}
+      ANOMALY_SOURCE: ${ANOMALY_SOURCE:-reference}
+      ANOMALY_REF_ACCOUNTS: ${ANOMALY_REF_ACCOUNTS:-20000}
+      ANOMALY_REF_EPOCHS: ${ANOMALY_REF_EPOCHS:-150}
       FEEDBACK_MIN_IMPROVEMENT: ${FEEDBACK_MIN_IMPROVEMENT:-0.0}
       FEEDBACK_FINETUNE_LR: ${FEEDBACK_FINETUNE_LR:-0.0005}
       FEEDBACK_FINETUNE_EPOCHS: ${FEEDBACK_FINETUNE_EPOCHS:-30}
@@ -380,12 +404,12 @@ services:
           devices: [{ driver: nvidia, count: 1, capabilities: [gpu] }]
     labels:
       - traefik.enable=true
-      - traefik.http.routers.xai.rule=Host(`${PUBLIC_HOST}`) && PathPrefix(`/xai`)
-      - traefik.http.routers.xai.entrypoints=websecure
-      - traefik.http.routers.xai.tls.certresolver=letsencrypt
-      - traefik.http.routers.xai.middlewares=xai-strip
-      - traefik.http.middlewares.xai-strip.stripprefix.prefixes=/xai
-      - traefik.http.services.xai.loadbalancer.server.port=8000
+      - traefik.http.routers.xaml-xai.rule=Host(`${PUBLIC_HOST}`) && PathPrefix(`/xai`)
+      - traefik.http.routers.xaml-xai.entrypoints=websecure
+      - traefik.http.routers.xaml-xai.tls.certresolver=letsencrypt
+      - traefik.http.routers.xaml-xai.middlewares=xaml-xai-strip
+      - traefik.http.middlewares.xaml-xai-strip.stripprefix.prefixes=/xai
+      - traefik.http.services.xaml-xai.loadbalancer.server.port=8000
     networks: [xai-net]
 
   # ------------------------------------------------------------------
@@ -484,8 +508,8 @@ services:
     depends_on: [prometheus-metrics]
     labels:
       - traefik.enable=true
-      - traefik.http.routers.grafana.rule=Host(`${PUBLIC_HOST}`) && PathPrefix(`/grafana`)
-      - traefik.http.routers.grafana.entrypoints=websecure
-      - traefik.http.routers.grafana.tls.certresolver=letsencrypt
-      - traefik.http.services.grafana.loadbalancer.server.port=3000
+      - traefik.http.routers.xaml-grafana.rule=Host(`${PUBLIC_HOST}`) && PathPrefix(`/grafana`)
+      - traefik.http.routers.xaml-grafana.entrypoints=websecure
+      - traefik.http.routers.xaml-grafana.tls.certresolver=letsencrypt
+      - traefik.http.services.xaml-grafana.loadbalancer.server.port=3000
     networks: [xai-net]

@@ -1,6 +1,0 @@
-INFO:     Started server process [3427182]
-INFO:     Waiting for application startup.
-2026-10-10 23:21:24,414 INFO xai_explainer: LLM_BACKEND=template -> template narratives only
-INFO:     Application startup complete.
-INFO:     Uvicorn running on http://127.0.0.1:8002 (Press CTRL+C to quit)
-INFO:     127.0.0.1:46274 - "GET /health HTTP/1.1" 200 OK

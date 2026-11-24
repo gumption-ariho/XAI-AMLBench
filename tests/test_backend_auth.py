@@ -208,6 +208,27 @@ class TestAdminLoginRoute:
         assert exc.value.status_code == 400
 
 
+class TestAdminLoginHiddenFromPublic:
+    """ADMIN_BLOCK_HEADER -- a request carrying that header (e.g. Cloudflare's Cf-Ray on tunnelled public
+    traffic) must get a plain 404 from /admin/login before anything else happens, even with the right passkey."""
+
+    def test_request_with_the_blocked_header_gets_404_even_with_correct_passkey(self, monkeypatch):
+        from types import SimpleNamespace
+        monkeypatch.setattr(m, "ADMIN_PASSKEY", "letmein-admin")
+        monkeypatch.setattr(m, "ADMIN_BLOCK_HEADER", "cf-ray")
+        fake_request = SimpleNamespace(headers={"cf-ray": "8a1b2c3d4e5f-NBO"}, client=None)
+        with pytest.raises(HTTPException) as exc:
+            m.admin_login(m.LoginRequest(passkey="letmein-admin", name="Jane Smith"), fake_request)
+        assert exc.value.status_code == 404
+
+    def test_feature_is_off_when_header_name_is_blank(self, monkeypatch):
+        monkeypatch.setattr(m, "ADMIN_PASSKEY", "letmein-admin")
+        monkeypatch.setattr(m, "ADMIN_BLOCK_HEADER", "")
+        monkeypatch.setattr(m, "audit", lambda *a, **kw: None)
+        res = m.admin_login(m.LoginRequest(passkey="letmein-admin", name="Jane Smith"))
+        assert res["role"] == "admin"
+
+
 class TestWhoami:
     """whoami() is deliberately trivial -- it just echoes the officer name, bank, and role get_current_officer /
     get_current_bank / get_current_role already resolved and verified (see TestGetCurrentOfficer,

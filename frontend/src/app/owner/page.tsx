@@ -334,7 +334,9 @@ export default function OwnerBackoffice(): ReactElement {
             <div className="muted small">Signed in as {authedOfficer} &middot; platform-wide view, every tenant</div>
           </div>
           <div className="row">
-            <button className="btn ghost" onClick={() => router.push("/")}>Open a bank console</button>
+            <button className="btn shine" onClick={() => router.push("/?view=governance")}>
+              Governing console (all banks)
+            </button>
             <button className="btn ghost" onClick={() => router.push("/identity")}>Identity check</button>
             <button className="btn ghost" onClick={handleLogout}>Sign out</button>
           </div>

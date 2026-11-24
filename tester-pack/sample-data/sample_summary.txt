@@ -1,0 +1,7 @@
+Accounts: 337
+Transactions: 4108
+Suspicious accounts (hidden answer key): 50
+Suspicious by pattern: smurfing 22, scatter_gather 14, shell_company 6, cyclic_loop 4, asymmetric_structuring 2, cross_border_velocity 1, dormant_reactivation 1
+Amount median 603, 95th percentile 7359, largest 1033558
+Cross-border share: 56 percent
+Also contains look-alike honest activity: payroll, merchants with many customers, cash-heavy businesses, savings groups, remittances.

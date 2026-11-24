@@ -1,7 +1,7 @@
 /** Types shared between the UI and the backend JSON (see backend/main.py and gnn_aml_core/main.py). */
 
 export type AlertStatus = "open" | "confirmed" | "dismissed";
-export type TabId = "overview" | "pipeline" | "scan" | "intake" | "alerts" | "investigate" | "network" | "activity" | "connect";
+export type TabId = "banks" | "overview" | "pipeline" | "scan" | "intake" | "alerts" | "investigate" | "network" | "activity" | "connect";
 export type ToastKind = "ok" | "err" | "warn";
 
 /* ---- GET /api/activity -- a merged, real feedback-log feed (see backend/main.py's activity() docstring) ---- */
@@ -151,7 +151,17 @@ export interface InvestigationLogEntry {
   note: string;
 }
 
+/** Plain-language "why was this flagged", written by the anomaly worker (see gnn_aml_core/anomaly.py). */
+export interface AnomalyReason {
+  signals: { feature: number; embedding: number; structure: number };
+  top_features: string[];
+  text: string;
+  /** The two models' evidence weighed into one recommendation (see gnn_aml_core/anomaly.py's ai_verdict). */
+  ai?: { verdict: "likely_normal" | "likely_suspicious" | "unsure"; confidence: number; headline: string };
+}
+
 export interface AnomalyAlert {
+  reason?: AnomalyReason | null;
   id: number;
   account_id: string;
   anomaly_score: number;
@@ -306,6 +316,44 @@ export interface IdentityCheckRecord {
   raw_response: unknown;
   checked_by: string;
   created_at: string;
+}
+
+/* ---- Governing console (system admin only) -- GET /admin/performance, /admin/reminders, /reminders ---- */
+export interface BankPerformance {
+  bank: string;
+  status: "active" | "suspended";
+  country: string | null;
+  region: string | null;
+  registration_number: string | null;
+  autopilot: boolean;
+  grace_hours: number;
+  accounts: number;
+  total_alerts: number;
+  open_alerts: number;
+  decided_alerts: number;
+  confirmed_alerts: number;
+  overdue_alerts: number;
+  avg_decision_hours: number | null;
+  last_alert_at: string | null;
+  total_anomalies: number;
+  new_anomalies: number;
+  investigating_anomalies: number;
+  overdue_anomalies: number;
+  reminders_sent: number;
+  last_reminder_at: string | null;
+  last_reminder_kind: "auto" | "manual" | null;
+  unacknowledged_reminders: number;
+}
+
+export interface BankReminder {
+  id: number;
+  bank?: string;
+  kind: "auto" | "manual";
+  message: string;
+  sent_by?: string;
+  emailed?: boolean;
+  created_at: string;
+  acknowledged_at: string | null;
 }
 
 export interface Toast {

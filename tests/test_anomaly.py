@@ -120,6 +120,18 @@ class TestUpsertAlert:
         assert len(insert_calls) == 1
         assert insert_calls[0][1] == ("A1", 5.0, 1.0)
 
+    def test_recently_cleared_account_is_not_raised_again_unless_clearly_worse(self):
+        class Conn(self._FakeConn):
+            def execute(self, sql, params=None):
+                self.executed.append((sql, params))
+                if "status IN ('cleared','confirmed_mule')" in sql:
+                    return TestUpsertAlert._FakeCursor({"status": "cleared", "anomaly_score": 4.0})
+                if sql.strip().startswith("SELECT"):
+                    return TestUpsertAlert._FakeCursor(None)
+                return TestUpsertAlert._FakeCursor(None)
+        assert an._upsert_alert(Conn(), AnomalyHit(account_id="A1", score=5.0, threshold=1.0)) is False
+        assert an._upsert_alert(Conn(), AnomalyHit(account_id="A1", score=7.0, threshold=1.0)) is True
+
     def test_does_not_duplicate_an_already_open_alert(self):
         conn = self._FakeConn(existing_alert={"id": 7})
         hit = AnomalyHit(account_id="A1", score=5.0, threshold=1.0)
@@ -136,6 +148,9 @@ class TestUpsertAlert:
 # excludes -- without any of those services existing.
 # ---------------------------------------------------------------------------------------------------------
 class TestAnomalyPass:
+    @pytest.fixture(autouse=True)
+    def _legacy_live_training(self, monkeypatch):
+        monkeypatch.setenv("ANOMALY_SOURCE", "live")   # these tests cover the live-training path; the reference path has its own
     def _install_fake_deps(self, monkeypatch, *, predict_results, upsert_created=None):
         fake_torch = types.SimpleNamespace()
         saved = {}
@@ -206,6 +221,7 @@ class TestAnomalyPass:
         assert set(captured_normal_idx["idx"]) == {0, 2}
 
     def test_new_alerts_are_raised_only_for_hits_and_counted_correctly(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("ANOMALY_MIN_PASSES", "1")   # this test is about one pass; persistence has its own test
         # 7 tightly-clustered normal accounts plus 1 real outlier -- 2 normal accounts isn't enough data for
         # score_population's own median/MAD statistics to single out an outlier at the default k_std=3.0
         # (confirmed directly: with just [0.1, 9.0], the outlier itself drags the threshold past 24, so

@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactElement } from "react";
 import { useRouter } from "next/navigation";
 import Background from "@/components/Background";
@@ -22,6 +22,8 @@ import type {
   AlertStatus,
   AnomalyAlert,
   AnomalyStatus,
+  BankPerformance,
+  BankReminder,
   Explanation,
   IntakeIngestResponse,
   IntakeClearResponse,
@@ -50,6 +52,16 @@ interface StatProps {
   hint: string;
   suffix?: string;
   icon: ReactElement;
+}
+
+function ago(iso: string | null): string {
+  if (!iso) return "never";
+  const mins = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return `${Math.round(hrs / 24)}d ago`;
 }
 
 function Stat({ label, value, tone, hint, suffix = "", icon }: StatProps) {
@@ -230,6 +242,16 @@ export default function Home(): ReactElement {
   const [scan, setScan] = useState<ScanResult | null>(null);
   const [authedOfficer, setAuthedOfficer] = useState<string | null>(null);
   const [authedBank, setAuthedBank] = useState<string | null>(null);
+  const [isAdminView, setIsAdminView] = useState<boolean>(false);   // system admin looking at every bank (?view=governance)
+  // Governing console: which ONE bank the admin is looking at right now (null = the all-banks overview), the
+  // per-bank performance numbers, and reminders. viewBankRef mirrors viewBank so the polling loaders below
+  // always ask for the CURRENT bank without being re-created (and re-starting their timers) on every switch.
+  const [viewBank, setViewBank] = useState<string | null>(null);
+  const viewBankRef = useRef<string | null>(null);
+  const [performance, setPerformance] = useState<BankPerformance[] | null>(null);
+  const [adminReminders, setAdminReminders] = useState<BankReminder[]>([]);
+  const [myReminders, setMyReminders] = useState<BankReminder[]>([]);
+  const [govBusy, setGovBusy] = useState<string>("");
   const [authChecked, setAuthChecked] = useState<boolean>(demoMode);   // demo mode skips auth entirely
   const [filter, setFilter] = useState<Filter>("all");
   const [bankFilter, setBankFilter] = useState<string>("all");
@@ -272,8 +294,11 @@ export default function Home(): ReactElement {
   }, []);
 
   const load = useCallback(async (): Promise<void> => {
+    const b = viewBankRef.current;
     try {
-      setAlerts(await api<Alert[]>("/alerts"));
+      const rows = await api<Alert[]>(b ? `/alerts?bank=${encodeURIComponent(b)}` : "/alerts");
+      if (viewBankRef.current !== b) return;   // admin switched banks mid-request: never show the old bank's rows
+      setAlerts(rows);
       setOnline(true);
     } catch {
       setOnline(false);
@@ -281,16 +306,22 @@ export default function Home(): ReactElement {
   }, []);
 
   const loadAnomalies = useCallback(async (): Promise<void> => {
+    const b = viewBankRef.current;
     try {
-      setAnomalies(await api<AnomalyAlert[]>("/anomalies"));
+      const rows = await api<AnomalyAlert[]>(b ? `/anomalies?for_bank=${encodeURIComponent(b)}` : "/anomalies");
+      if (viewBankRef.current !== b) return;
+      setAnomalies(rows);
     } catch {
       // the overview badge/stat just won't update this round; the Investigate tab's own refresh button covers it
     }
   }, []);
 
   const loadActivity = useCallback(async (): Promise<void> => {
+    const b = viewBankRef.current;
     try {
-      setActivity(await api<ActivityEntry[]>("/activity?limit=80"));
+      const rows = await api<ActivityEntry[]>(b ? `/activity?limit=80&for_bank=${encodeURIComponent(b)}` : "/activity?limit=80");
+      if (viewBankRef.current !== b) return;
+      setActivity(rows);
     } catch {
       // Activity tab shows its own "couldn't load" state; nothing else depends on this succeeding
     }
@@ -312,6 +343,23 @@ export default function Home(): ReactElement {
     }
   }, []);
 
+  const loadPerformance = useCallback(async (): Promise<void> => {
+    try {
+      setPerformance(await api<BankPerformance[]>("/admin/performance"));
+      setAdminReminders(await api<BankReminder[]>("/admin/reminders?limit=15"));
+    } catch {
+      // the All banks screen keeps showing its last numbers; the next poll retries
+    }
+  }, []);
+
+  const loadMyReminders = useCallback(async (): Promise<void> => {
+    try {
+      setMyReminders(await api<BankReminder[]>("/reminders"));
+    } catch {
+      // a missing banner is harmless; the next poll retries
+    }
+  }, []);
+
   useEffect(() => {
     if (!demoMode) return;
     void import("../../demo/mockApi").then((m) => {
@@ -322,6 +370,10 @@ export default function Home(): ReactElement {
 
   useEffect(() => {
     if (demoMode) return;   // demo mode (sample-data mode) has no real backend to authenticate against at all
+    // "/?view=governance" is how the system admin opens THIS console as the all-banks governing view (linked
+    // from the owner page). Without it, an admin session is still sent straight to /owner exactly as before.
+    const governing = typeof window !== "undefined"
+      && new URLSearchParams(window.location.search).get("view") === "governance";
     // Always attempt /whoami, even with no key stored at all: if the backend's own DEMO_LOGIN_BYPASS is on
     // (a reviewer-demo convenience, off by default -- see backend/main.py), an unauthenticated call to this
     // same endpoint succeeds and returns "Reviewer (DEMO MODE)", letting this skip the login screen
@@ -334,10 +386,17 @@ export default function Home(): ReactElement {
           // An admin passkey has no bank console of its own -- this page is the customer/bank console, so
           // send an admin session straight to the owner backoffice instead of rendering it here. See
           // handleLoginSuccess below for the same redirect right after login.
-          if (who.role === "admin") { router.replace("/owner"); return; }
+          if (who.role === "admin") {
+            if (!governing) { router.replace("/owner"); return; }
+            setIsAdminView(true); setTab("banks");
+          }
           setAuthedOfficer(who.officer); setAuthedBank(who.bank);
         })
-        .catch(() => {})   // no stored key and bypass is off: expected, fall through to the login screen
+        .catch(() => {   // no stored key and bypass is off: expected, fall through to the login screen
+          // ...except the governing view, which only an admin can open and which this customer login can never
+          // sign into -- send them to the owner page to sign in there instead of a dead-end login box.
+          if (governing) router.replace("/owner");
+        })
         .finally(() => setAuthChecked(true));
       return;
     }
@@ -345,10 +404,13 @@ export default function Home(): ReactElement {
     // rather than trusting it blindly, since it may have been revoked since the last page load
     api<WhoamiResponse>("/whoami")
       .then((who) => {
-        if (who.role === "admin") { router.replace("/owner"); return; }
+        if (who.role === "admin") {
+          if (!governing) { router.replace("/owner"); return; }
+          setIsAdminView(true); setTab("banks");
+        }
         setAuthedOfficer(who.officer); setAuthedBank(who.bank);
       })
-      .catch(() => clearApiKey())
+      .catch(() => { clearApiKey(); if (governing) router.replace("/owner"); })
       .finally(() => setAuthChecked(true));
   }, [demoMode, router]);
 
@@ -363,7 +425,8 @@ export default function Home(): ReactElement {
     clearApiKey();
     setAuthedOfficer(null);
     setAuthedBank(null);
-  }, []);
+    if (isAdminView) router.replace("/owner");   // an admin signs back in on the owner page, not this login box
+  }, [isAdminView, router]);
 
   useEffect(() => {
     if (!ready) return undefined;
@@ -372,6 +435,8 @@ export default function Home(): ReactElement {
     void loadActivity();
     void loadStatus();
     void loadBanks();
+    if (isAdminView) void loadPerformance();
+    if (authedBank) void loadMyReminders();
     api<SampleAccounts>("/accounts/sample").then(setSamples).catch(() => undefined);
     api<ModelInfo>("/model/info").then(setModelInfo).catch(() => undefined);
     const id = setInterval(() => {
@@ -380,9 +445,25 @@ export default function Home(): ReactElement {
       void loadActivity();
       void loadStatus();
       void loadBanks();
+      if (isAdminView) void loadPerformance();
+      if (authedBank) void loadMyReminders();
     }, 15000);
     return () => clearInterval(id);
-  }, [load, loadAnomalies, loadActivity, loadStatus, loadBanks, ready]);
+  }, [load, loadAnomalies, loadActivity, loadStatus, loadBanks, loadPerformance, loadMyReminders, isAdminView, authedBank, ready]);
+
+  // Switching banks in the governing console: clear what's on screen FIRST (so one bank's rows never flash
+  // under another bank's name), then point every loader at the new bank and reload.
+  useEffect(() => {
+    if (!isAdminView) return;
+    viewBankRef.current = viewBank;
+    setAlerts([]);
+    setAnomalies([]);
+    setActivity([]);
+    setBankFilter(viewBank ?? "all");
+    void load();
+    void loadAnomalies();
+    void loadActivity();
+  }, [viewBank, isAdminView, load, loadAnomalies, loadActivity]);
 
   const stats = useMemo(() => {
     const open = alerts.filter((a) => a.status === "open").length;
@@ -653,6 +734,38 @@ export default function Home(): ReactElement {
     }
   };
 
+  /* One-click "this is a normal account" for a single alert, or for a whole group of similar ones. */
+  const quickClear = async (id: number): Promise<void> => {
+    setBusy(`quick${id}`);
+    try {
+      const updated = await api<AnomalyAlert>(`/anomalies/${id}/quick-clear`, { method: "POST" });
+      setAnomalies((list) => list.map((x) => (x.id === id ? updated : x)));
+      notify("ok", `#${id} cleared as normal`);
+    } catch (e) {
+      notify("err", errorMessage(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const bulkClear = async (ids: number[], label: string): Promise<void> => {
+    if (!window.confirm(`Clear these ${ids.length} alerts as normal accounts?\n\n${label}`)) return;
+    setBusy("bulk");
+    try {
+      const r = await api<{ cleared: AnomalyAlert[]; skipped: number }>("/anomalies/bulk-clear", {
+        method: "POST",
+        body: JSON.stringify({ ids, note: `Bulk-cleared as normal (${label})` }),
+      });
+      const byId = new Map(r.cleared.map((x) => [x.id, x]));
+      setAnomalies((list) => list.map((x) => byId.get(x.id) ?? x));
+      notify("ok", `${r.cleared.length} cleared as normal${r.skipped ? `, ${r.skipped} skipped` : ""}`);
+    } catch (e) {
+      notify("err", errorMessage(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
   const doResolveAnomaly = async (id: number, outcome: "confirmed_mule" | "cleared"): Promise<void> => {
     setBusy(`resolve${id}`);
     try {
@@ -906,6 +1019,11 @@ export default function Home(): ReactElement {
   const anomalyOpenCount = anomalies.filter((a) => a.status === "new" || a.status === "under_investigation").length;
 
   const tabs: DockTab[] = [
+    ...(isAdminView ? [{
+      id: "banks" as TabId, label: "All banks", icon: <IconShield />,
+      badge: (performance ?? []).reduce((n, p) => n + p.overdue_alerts + p.overdue_anomalies, 0),
+      group: "Governance", desc: "Every bank side by side, with performance",
+    }] : []),
     { id: "overview", label: "Overview", icon: <IconHome />, group: "Monitoring", desc: "Live counts & system pulse" },
     { id: "alerts", label: "Alerts", icon: <IconBell />, badge: stats.open, group: "Monitoring", desc: "Flagged accounts awaiting review" },
     { id: "activity", label: "Activity", icon: <IconList />, group: "Monitoring", desc: "Full pipeline event log" },
@@ -919,11 +1037,208 @@ export default function Home(): ReactElement {
 
   const shown = alerts.filter((a) => (filter === "all" || a.status === filter)
                                     && (bankFilter === "all" || a.source_bank === bankFilter));
-  const shownAnomalies = anomalies.filter((a) => anomalyFilter === "all" || a.status === anomalyFilter);
+  // Open ones first, strongest signal first -- so the analyst's first look is always the one most worth it.
+  // The AI has already weighed both models: the person's own thinking is needed first for the unsure ones.
+  const aiRank = (a: AnomalyAlert): number => (a.reason?.ai?.verdict === "likely_suspicious" ? 1 : a.reason?.ai?.verdict === "likely_normal" ? 2 : 0);
+  const openRank = (st: string): number => (st === "new" ? 0 : st === "under_investigation" ? 1 : 2);
+  const shownAnomalies = anomalies
+    .filter((a) => anomalyFilter === "all" || a.status === anomalyFilter)
+    .sort((a, b) => openRank(a.status) - openRank(b.status)
+      || aiRank(a) - aiRank(b) || b.anomaly_score - a.anomaly_score);
+  const aiNormalNew = anomalies.filter((a) => a.status === "new" && a.reason?.ai?.verdict === "likely_normal");
+  const aiSuspNew = anomalies.filter((a) => a.status === "new" && a.reason?.ai?.verdict === "likely_suspicious");
+  const aiUnsureNew = anomalies.filter((a) => a.status === "new" && (!a.reason?.ai || a.reason.ai.verdict === "unsure"));
+  // Groups of new alerts that differ from normal in the same main way -- one decision covers the whole group.
+  const anomalyGroups = (() => {
+    const g = new Map<string, AnomalyAlert[]>();
+    for (const a of anomalies) {
+      const key = a.status === "new" ? a.reason?.top_features?.[0] : undefined;
+      if (key) g.set(key, [...(g.get(key) ?? []), a]);
+    }
+    return [...g.entries()].filter(([, v]) => v.length >= 2).sort((x, y) => y[1].length - x[1].length);
+  })();
   const ANOMALY_FILTERS: (AnomalyStatus | "all")[] = ["all", "new", "under_investigation", "confirmed_mule", "cleared"];
+const ANOMALY_FRIENDLY: Record<string, string> = {
+  out_deg: "number of payments sent", in_deg: "number of payments received", out_uniq: "accounts paid", in_uniq: "accounts paying it",
+  out_amt_sum: "total sent", in_amt_sum: "total received", out_amt_mean: "typical amount sent", in_amt_mean: "typical amount received",
+  out_amt_max: "largest payment sent", in_amt_max: "largest payment received", flow_ratio: "money in vs out", retained_frac: "money kept",
+  xb_out_ratio: "payments sent abroad", xb_in_ratio: "payments from abroad", n_cp_countries: "countries dealt with",
+  near_thr_cnt: "payments just under the limit", burst_6h: "bursts of payments", active_span_h: "time active", age_days: "account age",
+  round_amt_ratio: "round amounts", micro_tx_ratio: "very small payments", tax_haven_cp_ratio: "tax-haven dealings",
+  hour_concentration: "same-hour payments", pass_through_match_ratio: "money passed through", dispute_rate: "disputed payments",
+};
   const latencyTarget = modelInfo?.targets.latency_ms ?? 100;
 
+  /* ---- governing console (system admin) ---- */
+  const switchBank = (b: string | null): void => {
+    setViewBank(b);
+    if (b === null) setTab("banks");
+    else if (tab === "banks") setTab("alerts");
+  };
+
+  const govAction = async (key: string, fn: () => Promise<void>): Promise<void> => {
+    setGovBusy(key);
+    try {
+      await fn();
+      await loadPerformance();
+    } catch (e) {
+      notify("err", errorMessage(e));
+    } finally {
+      setGovBusy("");
+    }
+  };
+
+  const setAutopilot = (bank: string, patch: { autopilot?: boolean; grace_hours?: number }): Promise<void> =>
+    govAction(`ap:${bank}`, async () => {
+      await api(`/admin/banks/${encodeURIComponent(bank)}/autopilot`, { method: "PATCH", body: JSON.stringify(patch) });
+      notify("ok", "Autopilot updated.");
+    });
+
+  const remindNow = (bank: string): Promise<void> | undefined => {
+    const msg = window.prompt(`Alert ${bank} right now.\nAdd a message for them (optional -- leave blank for the standard one):`, "");
+    if (msg === null) return undefined;   // cancelled
+    return govAction(`rm:${bank}`, async () => {
+      await api(`/admin/banks/${encodeURIComponent(bank)}/remind`, { method: "POST", body: JSON.stringify({ message: msg }) });
+      notify("ok", `${bank} has been alerted.`);
+    });
+  };
+
+  const runAutopilotNow = (): Promise<void> =>
+    govAction("run", async () => {
+      const r = await api<{ reminders_sent: number }>("/admin/autopilot/run", { method: "POST" });
+      notify("ok", r.reminders_sent ? `Autopilot reminded ${r.reminders_sent} bank(s).` : "Autopilot checked: nothing overdue to remind anyone about.");
+    });
+
+  const ackReminder = async (id: number): Promise<void> => {
+    try {
+      await api(`/reminders/${id}/ack`, { method: "POST" });
+      await loadMyReminders();
+    } catch (e) {
+      notify("err", errorMessage(e));
+    }
+  };
+
+  const needsBank = isAdminView && !viewBank && ["overview", "alerts", "activity", "investigate"].includes(tab);
+
   /* ---- views ---- */
+  const pickBankView = (
+    <Glass className="alert-card">
+      <p style={{ marginTop: 0 }}>
+        Pick a bank to look at. Each bank&apos;s alerts, anomalies and activity are kept separate here, so nothing from
+        one bank gets mixed up with another&apos;s.
+      </p>
+      <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+        {(performance ?? []).map((p) => (
+          <button className="btn ghost" key={p.bank} onClick={() => switchBank(p.bank)}>{p.bank}</button>
+        ))}
+        <button className="btn shine" onClick={() => switchBank(null)}>Back to the all-banks screen</button>
+      </div>
+    </Glass>
+  );
+
+  const banksView = (
+    <>
+      <Glass className="alert-card" style={{ marginBottom: 12 }}>
+        <div className="row between">
+          <div className="muted small" style={{ maxWidth: 780 }}>
+            Every registered bank, kept separate. Open one to see only its own alerts, anomalies and activity.
+            Autopilot never reminds a bank straight away: it waits out the bank&apos;s grace period, and only if
+            something is still untouched after that does it send a reminder. &ldquo;Alert bank now&rdquo; skips the
+            wait for when you are around and want it acted on.
+          </div>
+          <button className="btn ghost" disabled={govBusy === "run"} onClick={() => void runAutopilotNow()}>
+            {govBusy === "run" ? "Checking…" : "Run autopilot check now"}
+          </button>
+        </div>
+      </Glass>
+      {performance === null && <Glass className="alert-card">Loading banks…</Glass>}
+      {performance !== null && performance.length === 0 && (
+        <Glass className="alert-card">No banks registered yet. Add one on the owner page.</Glass>
+      )}
+      {(performance ?? []).map((p) => {
+        const overdue = p.overdue_alerts + p.overdue_anomalies;
+        const rate = p.total_alerts ? Math.round((p.decided_alerts / p.total_alerts) * 100) : null;
+        const graceOptions = Array.from(new Set([1, 6, 12, 24, 48, 72, 168, p.grace_hours])).sort((a, b) => a - b);
+        return (
+          <Glass className="alert-card" key={p.bank} style={{ marginBottom: 12 }}>
+            <div className="row between">
+              <div className="row" style={{ gap: 10, flexWrap: "wrap" }}>
+                <span className="tenant-badge">{p.bank}</span>
+                {(p.region || p.country) && <span className="pill neutral">{[p.region, p.country].filter(Boolean).join(", ")}</span>}
+                {p.status === "suspended" && <span className="pill s-confirmed">suspended</span>}
+                <span className={`pill ${overdue > 0 ? "s-open" : "ok"}`}>{overdue > 0 ? `${overdue} overdue` : "On track"}</span>
+              </div>
+              <div className="row" style={{ gap: 8 }}>
+                <button className="btn ghost" disabled={govBusy === `rm:${p.bank}`} onClick={() => void remindNow(p.bank)}>
+                  {govBusy === `rm:${p.bank}` ? "Sending…" : "Alert bank now"}
+                </button>
+                <button className="btn shine" onClick={() => switchBank(p.bank)}>Open this bank</button>
+              </div>
+            </div>
+
+            <div className="row" style={{ gap: 8, flexWrap: "wrap", marginTop: 12 }}>
+              <span className={`pill ${p.open_alerts > 0 ? "s-open" : "neutral"}`}>{p.open_alerts} open alerts</span>
+              <span className="pill neutral">{p.total_alerts} total</span>
+              <span className="pill neutral">{p.accounts} accounts</span>
+              <span className={`pill ${p.new_anomalies > 0 ? "s-open" : "neutral"}`}>{p.new_anomalies} new anomalies</span>
+              <span className="pill neutral">{p.investigating_anomalies} investigating</span>
+              <span className="pill neutral">
+                avg time to decide: {p.avg_decision_hours === null ? "no decisions yet" : `${p.avg_decision_hours.toFixed(1)}h`}
+              </span>
+            </div>
+
+            <div style={{ marginTop: 12 }}>
+              <div className="muted small" style={{ marginBottom: 4 }}>
+                Alerts decided: {rate === null ? "none raised yet" : `${p.decided_alerts} of ${p.total_alerts} (${rate}%)`}
+                {p.confirmed_alerts > 0 && ` · ${p.confirmed_alerts} confirmed as suspicious`}
+              </div>
+              <div style={{ height: 6, borderRadius: 3, background: "var(--line)", overflow: "hidden" }}>
+                <div style={{ width: `${rate ?? 0}%`, height: "100%", background: "var(--green)" }} />
+              </div>
+            </div>
+
+            <div className="row between" style={{ marginTop: 14, flexWrap: "wrap", gap: 10 }}>
+              <div className="row" style={{ gap: 10, flexWrap: "wrap" }}>
+                <label className="row" style={{ gap: 6, cursor: "pointer" }}>
+                  <input type="checkbox" checked={p.autopilot} disabled={govBusy === `ap:${p.bank}`}
+                    onChange={(e) => void setAutopilot(p.bank, { autopilot: e.target.checked })} />
+                  <span>Autopilot reminders</span>
+                </label>
+                <span className="muted small">remind after</span>
+                <select className="input" style={{ width: "auto" }} value={p.grace_hours}
+                  disabled={govBusy === `ap:${p.bank}` || !p.autopilot}
+                  onChange={(e) => void setAutopilot(p.bank, { grace_hours: Number(e.target.value) })}>
+                  {graceOptions.map((h) => (
+                    <option key={h} value={h}>{h < 24 ? `${h} hour${h === 1 ? "" : "s"}` : `${h / 24 % 1 === 0 ? h / 24 : (h / 24).toFixed(1)} day${h === 24 ? "" : "s"}`}</option>
+                  ))}
+                </select>
+              </div>
+              <span className="muted small">
+                {p.reminders_sent === 0
+                  ? "Never reminded"
+                  : `Last reminder ${ago(p.last_reminder_at)} (${p.last_reminder_kind === "manual" ? "by you" : "autopilot"}) · ${p.reminders_sent} sent · ${p.unacknowledged_reminders} not yet acknowledged`}
+              </span>
+            </div>
+          </Glass>
+        );
+      })}
+
+      {adminReminders.length > 0 && (
+        <>
+          <div className="muted small" style={{ margin: "18px 0 8px" }}>Recent reminders sent to banks</div>
+          {adminReminders.map((r) => (
+            <Glass className="alert-card" key={r.id} style={{ marginBottom: 8 }}>
+              <span className="tenant-badge">{r.bank}</span>{" "}
+              <span className={`pill ${r.kind === "manual" ? "neutral" : "s-open"}`}>{r.kind === "manual" ? "manual" : "autopilot"}</span>{" "}
+              <span className="muted small">{ago(r.created_at)}{r.acknowledged_at ? " · acknowledged" : " · not acknowledged yet"}</span>
+              <div className="muted small" style={{ marginTop: 4 }}>{r.message}</div>
+            </Glass>
+          ))}
+        </>
+      )}
+    </>
+  );
+
   const overview = (
     <>
       <div className="hero-grid">
@@ -1041,7 +1356,7 @@ export default function Home(): ReactElement {
             {/* A tenant session (authedBank set) only ever sees its own bank's alerts no matter what this
                dropdown says -- server-scoped, not just filtered client-side -- so it adds nothing and is
                hidden rather than shown as a no-op control. */}
-            {!authedBank && banks.length > 0 && (
+            {!authedBank && !isAdminView && banks.length > 0 && (
               <select className="input" value={bankFilter} onChange={(e) => setBankFilter(e.target.value)}
                      style={{ width: "auto" }} aria-label="Filter by bank">
                 <option value="all">All banks</option>
@@ -1267,6 +1582,45 @@ export default function Home(): ReactElement {
         </div>
       </Glass>
 
+      {(aiNormalNew.length + aiSuspNew.length + aiUnsureNew.length) > 0 && (
+        <Glass>
+          <div style={{ marginBottom: 8 }}>
+            <b>The AI has already gone through these.</b>{" "}
+            <span className="muted small">Both models&apos; evidence is weighed for you. Only the &quot;unsure&quot; ones need your own judgement.</span>
+          </div>
+          <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+            <span className="pill s-open">{aiUnsureNew.length} need your judgement</span>
+            <span className="pill s-confirmed">{aiSuspNew.length} look suspicious</span>
+            <span className="pill ok">{aiNormalNew.length} look normal</span>
+            {aiNormalNew.length > 0 && (
+              <button className="btn" disabled={busy === "bulk"}
+                onClick={() => void bulkClear(aiNormalNew.map((x) => x.id), "AI judged these likely normal")}>
+                Agree: clear all {aiNormalNew.length} the AI judged normal
+              </button>
+            )}
+          </div>
+        </Glass>
+      )}
+
+      {anomalyGroups.length > 0 && (
+        <Glass>
+          <div className="muted small" style={{ marginBottom: 8 }}>
+            Similar alerts, grouped by their main difference. If you recognise the behaviour as normal, clear the whole group in one click.
+          </div>
+          <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+            {anomalyGroups.map(([feat, list]) => {
+              const label = ANOMALY_FRIENDLY[feat] ?? feat.replaceAll("_", " ");
+              return (
+                <button key={feat} className="chip" disabled={busy === "bulk"}
+                  onClick={() => void bulkClear(list.map((x) => x.id), label)}>
+                  Clear {list.length} with unusual “{label}”
+                </button>
+              );
+            })}
+          </div>
+        </Glass>
+      )}
+
       {shownAnomalies.length === 0 && (
         <Glass>
           <p className="muted">No anomaly alerts in this view yet -- Model 2&apos;s next scan pass may still be running. The lookup tools above work regardless.</p>
@@ -1287,6 +1641,16 @@ export default function Home(): ReactElement {
               anomaly score {a.anomaly_score.toFixed(4)} · threshold {a.threshold.toFixed(4)}
             </div>
           </div>
+
+          {a.reason?.ai && a.status === "new" && (
+            <div className="narr" style={{ marginTop: 8 }}>
+              <b>{a.reason.ai.verdict === "likely_normal" ? "AI recommends: clear it"
+                : a.reason.ai.verdict === "likely_suspicious" ? "AI recommends: investigate it" : "AI is unsure: your call"}</b>
+              {a.reason.ai.verdict !== "unsure" && <span className="muted small"> · {a.reason.ai.confidence}% sure</span>}
+              <div className="small">{a.reason.ai.headline}</div>
+            </div>
+          )}
+          {a.reason?.text && <p className="small" style={{ margin: "8px 0 0" }}><b>Why it was flagged:</b> {a.reason.text}</p>}
 
           <div className="row actions investigator-tools">
             <button className="chip" onClick={() => void doExplain(a.account_id)}>View network →</button>
@@ -1320,9 +1684,22 @@ export default function Home(): ReactElement {
 
           <div className="row actions">
             {a.status === "new" && (
-              <button className="btn" disabled={busy === `claim${a.id}`} onClick={() => void doClaim(a.id)}>
-                {busy === `claim${a.id}` ? "Claiming…" : "Claim for investigation"}
-              </button>
+              <>
+                {(() => {
+                  const v = a.reason?.ai?.verdict;
+                  const clearBtn = (primary: boolean) => (
+                    <button className={primary ? "btn" : "btn ghost"} disabled={busy === `quick${a.id}`} onClick={() => void quickClear(a.id)}>
+                      {busy === `quick${a.id}` ? "Clearing…" : v === "likely_normal" ? "Agree: clear" : "Looks normal: clear"}
+                    </button>
+                  );
+                  const lookBtn = (primary: boolean) => (
+                    <button className={primary ? "btn" : "btn ghost"} disabled={busy === `claim${a.id}`} onClick={() => void doClaim(a.id)}>
+                      {busy === `claim${a.id}` ? "Claiming…" : v === "likely_suspicious" ? "Agree: investigate" : "Needs a look"}
+                    </button>
+                  );
+                  return v === "likely_normal" ? <>{clearBtn(true)}{lookBtn(false)}</> : <>{lookBtn(true)}{clearBtn(false)}</>;
+                })()}
+              </>
             )}
             {a.status === "under_investigation" && (
               <div style={{ display: "flex", flexDirection: "column", gap: 10, width: "100%" }}>
@@ -1739,7 +2116,7 @@ export default function Home(): ReactElement {
             <div className="logo"><IconShield /></div>
             <div>
               <div className="brand-name">XAI·AMLBench</div>
-              <div className="brand-sub">Compliance Console</div>
+              <div className="brand-sub">{isAdminView ? "Governance · all banks" : "Compliance Console"}</div>
             </div>
           </div>
           <Sidebar tabs={tabs} active={tab} onChange={setTab} />
@@ -1752,6 +2129,13 @@ export default function Home(): ReactElement {
               <h1 className="module-title">{tabs.find((t) => t.id === tab)?.label ?? ""}</h1>
             </div>
             <div className="row" style={{ gap: 14 }}>
+              {isAdminView && (
+                <select className="input" style={{ width: "auto" }} value={viewBank ?? ""}
+                  onChange={(e) => switchBank(e.target.value || null)} aria-label="Switch bank">
+                  <option value="">All banks (overview)</option>
+                  {(performance ?? []).map((p) => <option key={p.bank} value={p.bank}>{p.bank}</option>)}
+                </select>
+              )}
               <div className={`status ${online === false ? "off" : online ? "on" : ""}`}>
                 <i />
                 {online === null ? "Connecting…" : online ? "Backend online" : "Backend offline"}
@@ -1759,7 +2143,9 @@ export default function Home(): ReactElement {
               {authedOfficer && (
                 <div className="row officer-badge">
                   {authedBank && <span className="tenant-badge">{authedBank}</span>}
+                  {isAdminView && <span className="pill s-open">System admin · all banks</span>}
                   <span className="muted">Signed in as {authedOfficer}</span>
+                  {isAdminView && <button className="btn ghost" onClick={() => router.push("/owner")}>Owner page</button>}
                   <button className="btn ghost" onClick={() => router.push("/identity")}>Identity check</button>
                   <button className="btn ghost" onClick={handleLogout}>Sign out</button>
                 </div>
@@ -1767,16 +2153,42 @@ export default function Home(): ReactElement {
             </div>
           </header>
 
+          {isAdminView && (
+            <div className="muted small" style={{ padding: "0 4px 10px" }}>
+              Governing view: switch between banks with the selector at the top; each bank&apos;s alerts, anomalies
+              and activity are shown on their own, never mixed together. Anything you decide here is recorded under
+              your name.
+            </div>
+          )}
+
+          {authedBank && myReminders.filter((r) => !r.acknowledged_at).map((r) => (
+            <Glass className="alert-card" key={r.id} style={{ marginBottom: 10 }}>
+              <div className="row between">
+                <div>
+                  <span className="pill s-open">{r.kind === "manual" ? "Message from the platform admin" : "Reminder: items waiting for you"}</span>{" "}
+                  <span className="muted small">{ago(r.created_at)}</span>
+                  <div style={{ marginTop: 6 }}>{r.message}</div>
+                </div>
+                <button className="btn" onClick={() => void ackReminder(r.id)}>Got it</button>
+              </div>
+            </Glass>
+          ))}
+
           <main key={tab} className="view">
-            {tab === "overview" && overview}
-            {tab === "pipeline" && pipelineView}
-            {tab === "scan" && scanView}
-            {tab === "intake" && intakeView}
-            {tab === "alerts" && alertsView}
-            {tab === "investigate" && investigateView}
-            {tab === "network" && networkView}
-            {tab === "activity" && activityView}
-            {tab === "connect" && connectView}
+            {tab === "banks" && banksView}
+            {needsBank ? pickBankView : (
+              <>
+                {tab === "overview" && overview}
+                {tab === "pipeline" && pipelineView}
+                {tab === "scan" && scanView}
+                {tab === "intake" && intakeView}
+                {tab === "alerts" && alertsView}
+                {tab === "investigate" && investigateView}
+                {tab === "network" && networkView}
+                {tab === "activity" && activityView}
+                {tab === "connect" && connectView}
+              </>
+            )}
           </main>
         </div>
       </div>

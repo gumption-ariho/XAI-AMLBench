@@ -26,3 +26,14 @@ frontend/out/
 .DS_Store
 .idea/
 .vscode/
+test-results/
+zips/
+combined/
+tester-pack/recorder/axe.min.js
+
+.idea/
+logs/
+test-results/
+zips/
+combined/
+tester-pack/recorder/axe.min.js

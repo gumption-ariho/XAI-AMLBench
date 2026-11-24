@@ -40,6 +40,7 @@ data access layer is partitioned. See each route's own docstring below for exact
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -122,6 +123,8 @@ CREATE TABLE IF NOT EXISTS anomaly_alerts (
     trained_at        TIMESTAMPTZ   -- set once gnn_aml_core.anomaly has fed a confirmed_mule case into Model 1
 );
 CREATE INDEX IF NOT EXISTS anomaly_alerts_status_idx ON anomaly_alerts (status);
+-- plain-language 'why was this flagged' written by the anomaly worker: {signals, top_features, text}
+ALTER TABLE anomaly_alerts ADD COLUMN IF NOT EXISTS reason JSONB;
 
 -- DB-backed tenants: this is what lets the owner add/suspend/remove a bank from the /owner backoffice at
 -- runtime, no .env edit and no restart -- the BANK_PASSKEYS env var (see its own comment above
@@ -243,6 +246,35 @@ CREATE TABLE IF NOT EXISTS identity_checks (
 );
 CREATE INDEX IF NOT EXISTS identity_checks_account_idx ON identity_checks (account_id);
 CREATE INDEX IF NOT EXISTS identity_checks_bank_idx ON identity_checks (bank);
+
+-- Per-bank governance settings, set by the platform admin from the governing console. `autopilot` is the
+-- automatic reminder (see run_autopilot_once()): if something raised for this bank has sat untouched longer
+-- than `grace_hours`, the bank is reminded -- never immediately, always only after that grace period. A bank
+-- with no row here uses the AUTOPILOT_DEFAULT_* values from .env.
+CREATE TABLE IF NOT EXISTS bank_settings (
+    bank        TEXT PRIMARY KEY,
+    autopilot   BOOLEAN     NOT NULL DEFAULT true,
+    grace_hours INTEGER     NOT NULL DEFAULT 24,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Every reminder sent to a bank, automatic (kind='auto', sent_by='autopilot') or by the admin pressing "Alert
+-- bank now" (kind='manual'). The bank's own console shows its unacknowledged ones as a banner, so a reminder
+-- reaches the bank even when no SMTP server is configured; `emailed` records whether an email also went out.
+CREATE TABLE IF NOT EXISTS bank_reminders (
+    id                 SERIAL PRIMARY KEY,
+    bank               TEXT        NOT NULL,
+    kind               TEXT        NOT NULL,   -- auto | manual
+    overdue_alerts     INTEGER     NOT NULL DEFAULT 0,
+    overdue_anomalies  INTEGER     NOT NULL DEFAULT 0,
+    message            TEXT        NOT NULL DEFAULT '',
+    sent_by            TEXT        NOT NULL,
+    emailed            BOOLEAN     NOT NULL DEFAULT false,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    acknowledged_at    TIMESTAMPTZ,
+    acknowledged_by    TEXT
+);
+CREATE INDEX IF NOT EXISTS bank_reminders_bank_idx ON bank_reminders (bank, created_at DESC);
 """
 
 
@@ -261,7 +293,11 @@ async def lifespan(_: FastAPI):
         except psycopg.OperationalError:
             log.warning("database not ready (attempt %d)", attempt + 1)
             time.sleep(2)
-    yield
+    autopilot_task = asyncio.create_task(_autopilot_loop())
+    try:
+        yield
+    finally:
+        autopilot_task.cancel()
 
 
 app = FastAPI(title="ProjectXY Backend", version="0.1.0", lifespan=lifespan)
@@ -493,6 +529,120 @@ def _bank_contact_emails(bank: str) -> list[str]:
     return [row["contact_email"]] if row and row["contact_email"] else []
 
 
+# ------------------------------------------------------------------ governance: performance, autopilot, reminders
+# The platform admin's view across every bank (see the governing console in the frontend). "Overdue" always means
+# the same thing everywhere below: still untouched after the bank's grace period -- a Model 1 alert still 'open',
+# or a Model 2 anomaly alert still 'new' (one that someone has claimed and is investigating is being dealt with,
+# so it is NOT counted as neglected).
+#
+# AUTOPILOT is a plain rule, not an AI model: every AUTOPILOT_CHECK_SECONDS it looks at each bank that has it
+# switched on, and if that bank has overdue items and has not been reminded within the last grace period, it
+# sends one reminder. It never fires the moment something is raised -- the grace period is the point: it assumes
+# the bank should have dealt with the item by then, and only reminds if it hasn't.
+AUTOPILOT_DEFAULT_ON = os.getenv("AUTOPILOT_DEFAULT_ON", "true").lower() in ("1", "true", "yes")
+AUTOPILOT_DEFAULT_GRACE_HOURS = int(os.getenv("AUTOPILOT_DEFAULT_GRACE_HOURS", "24"))
+AUTOPILOT_CHECK_SECONDS = int(os.getenv("AUTOPILOT_CHECK_SECONDS", "600"))
+
+
+def _governed_banks(conn) -> list[dict]:
+    """Every bank the admin governs: DB-onboarded ones, plus any with alerts or tagged accounts (an
+    env-configured BANK_PASSKEYS tenant has no `banks` row but still shows up once it has data)."""
+    return conn.execute("""
+        SELECT b.bank, COALESCE(bk.status, 'active') AS status, bk.country, bk.region, bk.registration_number
+        FROM (
+            SELECT name AS bank FROM banks
+            UNION SELECT bank FROM account_banks WHERE bank <> 'unknown'
+            UNION SELECT source_bank AS bank FROM alerts WHERE source_bank <> 'unknown'
+        ) b LEFT JOIN banks bk ON bk.name = b.bank
+        ORDER BY b.bank
+    """).fetchall()
+
+
+def _bank_settings(conn, bank: str) -> dict:
+    row = conn.execute("SELECT autopilot, grace_hours FROM bank_settings WHERE bank = %s", (bank,)).fetchone()
+    return {"autopilot": row["autopilot"] if row else AUTOPILOT_DEFAULT_ON,
+            "grace_hours": row["grace_hours"] if row else AUTOPILOT_DEFAULT_GRACE_HOURS}
+
+
+def _overdue_counts(conn, bank: str, grace_hours: int) -> tuple[int, int]:
+    a = conn.execute(
+        "SELECT count(*) AS n FROM alerts WHERE source_bank = %s AND status = 'open' "
+        "AND created_at < now() - (%s * interval '1 hour')", (bank, grace_hours),
+    ).fetchone()["n"]
+    b = conn.execute(
+        "SELECT count(*) AS n FROM anomaly_alerts aa JOIN account_banks ab ON ab.account_id = aa.account_id "
+        "WHERE ab.bank = %s AND aa.status = 'new' AND aa.created_at < now() - (%s * interval '1 hour')",
+        (bank, grace_hours),
+    ).fetchone()["n"]
+    return a, b
+
+
+def _send_bank_reminder(bank: str, kind: str, by: str, custom_message: str = "") -> dict:
+    """Records a reminder for `bank` (shown as a banner in that bank's own console) and also emails the bank's
+    contact if SMTP is configured. Used by both the autopilot and the admin's manual "Alert bank now"."""
+    with db() as conn:
+        settings = _bank_settings(conn, bank)
+        overdue_a, overdue_b = _overdue_counts(conn, bank, settings["grace_hours"])
+        open_a = conn.execute(
+            "SELECT count(*) AS n FROM alerts WHERE source_bank = %s AND status = 'open'", (bank,)).fetchone()["n"]
+    if kind == "auto":
+        text = (f"{overdue_a} alert(s) and {overdue_b} anomaly alert(s) have been waiting for more than "
+                f"{settings['grace_hours']} hours without anyone acting on them. Please review them in your console.")
+    else:
+        text = (custom_message.strip()
+                or f"The platform administrator is asking you to review your open alerts ({open_a} open right now).")
+    emails = _bank_contact_emails(bank)
+    emailed = bool(SMTP_HOST and emails)
+    with db() as conn:
+        row = conn.execute(
+            "INSERT INTO bank_reminders (bank, kind, overdue_alerts, overdue_anomalies, message, sent_by, emailed) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING *",
+            (bank, kind, overdue_a, overdue_b, text, by, emailed),
+        ).fetchone()
+    notify_email(emails, f"Reminder from XAI-AMLBench: action needed for {bank}", text)
+    audit("bank_reminder", {"bank": bank, "kind": kind, "by": by, "overdue_alerts": overdue_a,
+                            "overdue_anomalies": overdue_b})
+    return row
+
+
+def run_autopilot_once() -> int:
+    """One pass of the autopilot. Returns how many reminders it sent. Safe to call any time (the admin's "run
+    check now" button calls it too): a bank is only reminded if autopilot is on for it, it is not suspended, it
+    has overdue items, and it has not already been reminded within the last grace period."""
+    sent = 0
+    with db() as conn:
+        banks = [b for b in _governed_banks(conn) if b["status"] == "active"]
+    for b in banks:
+        bank = b["bank"]
+        with db() as conn:
+            settings = _bank_settings(conn, bank)
+            if not settings["autopilot"]:
+                continue
+            overdue_a, overdue_b = _overdue_counts(conn, bank, settings["grace_hours"])
+            if overdue_a + overdue_b == 0:
+                continue
+            recent = conn.execute(
+                "SELECT 1 FROM bank_reminders WHERE bank = %s AND created_at > now() - (%s * interval '1 hour')",
+                (bank, settings["grace_hours"]),
+            ).fetchone()
+        if recent:
+            continue
+        _send_bank_reminder(bank, "auto", "autopilot")
+        sent += 1
+    return sent
+
+
+async def _autopilot_loop() -> None:
+    while True:
+        await asyncio.sleep(AUTOPILOT_CHECK_SECONDS)
+        try:
+            n = await asyncio.to_thread(run_autopilot_once)
+            if n:
+                log.info("autopilot sent %d reminder(s)", n)
+        except Exception:  # noqa: BLE001 -- a failed pass must never kill the loop; the next pass retries
+            log.exception("autopilot pass failed")
+
+
 # ------------------------------------------------------------------ passwords (per-person accounts)
 # hashlib.scrypt is stdlib -- no bcrypt/argon2 C-extension dependency to install on a box that may not have a
 # compiler handy. scrypt is a well-regarded KDF in its own right (RFC 7914); these cost parameters (N=2**14,
@@ -539,7 +689,7 @@ def _check_login_rate_limit(identifier: str) -> None:
             conn.execute("DELETE FROM login_attempts WHERE created_at < now() - interval '1 day'")
             row = conn.execute(
                 "SELECT count(*) AS n FROM login_attempts "
-                "WHERE identifier = %s AND success = false AND created_at > now() - interval '%s seconds'",
+                "WHERE identifier = %s AND success = false AND created_at > now() - (%s * interval '1 second')",
                 (identifier, LOGIN_LOCKOUT_WINDOW_S),
             ).fetchone()
     except psycopg.Error:
@@ -622,6 +772,22 @@ if DEMO_LOGIN_BYPASS:
 # ------------------------------------------------------------------ passkey + name auth
 ADMIN_PASSKEY = os.getenv("ADMIN_PASSKEY")
 ANALYST_PASSKEY = os.getenv("ANALYST_PASSKEY")
+# Second layer behind Traefik's own admin-hide rule (docker-compose.yml): if a request carries this header
+# (e.g. "Cf-Ray" -- added by a Cloudflare tunnel to every public request), admin_login() answers 404 as if the
+# route didn't exist. Empty (the default) = off. An admin page nobody outside should even know exists is the
+# whole point: it's one fewer door to guess at, even though the passkey would still have to be right.
+ADMIN_BLOCK_HEADER = os.getenv("ADMIN_BLOCK_HEADER", "").strip()
+# Lets the owner (only) reach the admin pages from a phone or any public connection: visiting
+# /api/unlock?key=<this value> once sets a cookie that lifts the hiding for that browser. Empty = disabled.
+# Letters and digits only (it is also used inside a Traefik rule). Treat it like a password.
+ADMIN_UNLOCK_KEY = os.getenv("ADMIN_UNLOCK_KEY", "").strip()
+
+
+def _admin_unlocked(request) -> bool:
+    if not ADMIN_UNLOCK_KEY or request is None:
+        return False
+    got = request.cookies.get("xai_admin", "")
+    return hmac.compare_digest(got.encode(), ADMIN_UNLOCK_KEY.encode())
 
 # Multi-tenant SaaS login: one passkey per bank, so each institution gets its own door into this console
 # without a user-account database to run. BANK_PASSKEYS is a JSON object in .env, {"Bank name": "passkey"},
@@ -874,6 +1040,11 @@ class AnomalyResolveRequest(BaseModel):
     note: str = Field("", max_length=4000)
 
 
+class AnomalyBulkClearRequest(BaseModel):
+    ids: list[int] = Field(..., min_length=1, max_length=200)
+    note: str = Field("", max_length=4000)
+
+
 class IntakeIngestRow(BaseModel):
     src: str
     dst: str
@@ -904,6 +1075,15 @@ class IdentityCheckRequest(BaseModel):
     account_id: str
     claimed_name: str = Field(..., min_length=1, max_length=200)
     id_number: str = Field(..., min_length=1, max_length=64)   # raw value, used in-memory only -- never persisted
+
+
+class AutopilotRequest(BaseModel):
+    autopilot: bool | None = None
+    grace_hours: int | None = Field(None, ge=1, le=24 * 30)
+
+
+class RemindRequest(BaseModel):
+    message: str = Field("", max_length=1000)
 
 
 class IntakeClearRequest(BaseModel):
@@ -997,7 +1177,14 @@ def admin_login(req: LoginRequest, request: Request = None):
     shared door: a bank tenant's login page should never be the same surface an attacker could try the admin
     passkey against. Rate-limited the same way login() is, on the same per-IP bucket (a brute-force attempt
     against either door counts against the same lockout, so splitting the endpoint doesn't also split an
-    attacker's attempt budget in their favor)."""
+    attacker's attempt budget in their favor).
+
+    Hidden from the public when ADMIN_BLOCK_HEADER is set (see its comment above): a request carrying that
+    header gets a plain 404, checked BEFORE the rate-limit bookkeeping or any passkey comparison, so a public
+    visitor learns nothing -- not even that an admin login exists here."""
+    if ADMIN_BLOCK_HEADER and request is not None and request.headers.get(ADMIN_BLOCK_HEADER) \
+            and not _admin_unlocked(request):
+        raise HTTPException(404, "Not Found")
     ip = _client_ip(request) if request is not None else None
     if ip is not None:
         _check_login_rate_limit(ip)
@@ -1037,7 +1224,8 @@ def model_info(officer: str = Depends(get_current_officer)):
 
 
 @api.get("/activity")
-def activity(limit: int = 80, officer: str = Depends(get_current_officer), bank: str | None = Depends(get_current_bank)):
+def activity(limit: int = 80, for_bank: str | None = None, officer: str = Depends(get_current_officer),
+             bank: str | None = Depends(get_current_bank)):
     """A real feedback/activity feed, so an analyst can see what's happening across both pipelines without
     opening a terminal or a database client. Built from data this service already has in Postgres -- it does
     NOT reach into the immudb ledger that audit() writes to (that's a separate, deliberately write-oriented
@@ -1056,6 +1244,7 @@ def activity(limit: int = 80, officer: str = Depends(get_current_officer), bank:
     simply never matches a tenant-scoped join, which is correct -- it isn't that bank's own activity.
     """
     limit = min(max(limit, 1), 300)
+    bank = bank or for_bank   # `for_bank` only ever narrows an admin/global session to ONE bank; a tenant's own bank always wins
     events: list[dict] = []
     with db() as conn:
         for row in conn.execute(
@@ -1513,6 +1702,139 @@ def admin_delete_bank(bank_name: str, role: str = Depends(get_current_role),
     return {"removed": bank_name}
 
 
+@api.get("/admin/performance")
+def admin_performance(role: str = Depends(get_current_role)):
+    """Owner-only: one row per bank with the numbers the governing console's "All banks" screen shows -- how
+    much work each bank has, how fast it decides, what it is neglecting right now, and its autopilot setting."""
+    if role != "admin":
+        raise HTTPException(403, "admin passkey required")
+    out = []
+    with db() as conn:
+        for b in _governed_banks(conn):
+            bank = b["bank"]
+            st = _bank_settings(conn, bank)
+            g = st["grace_hours"]
+            al = conn.execute(
+                "SELECT count(*) AS total, "
+                "count(*) FILTER (WHERE status = 'open') AS open_n, "
+                "count(*) FILTER (WHERE status IN ('confirmed', 'dismissed')) AS decided, "
+                "count(*) FILTER (WHERE status = 'confirmed') AS confirmed, "
+                "count(*) FILTER (WHERE status = 'open' AND created_at < now() - (%s * interval '1 hour')) AS overdue, "
+                "avg(extract(epoch FROM (reviewed_at - created_at)) / 3600.0) FILTER (WHERE reviewed_at IS NOT NULL) AS avg_h, "
+                "max(created_at) AS last_alert FROM alerts WHERE source_bank = %s", (g, bank),
+            ).fetchone()
+            an = conn.execute(
+                "SELECT count(*) AS total, "
+                "count(*) FILTER (WHERE aa.status = 'new') AS new_n, "
+                "count(*) FILTER (WHERE aa.status = 'under_investigation') AS investigating, "
+                "count(*) FILTER (WHERE aa.status = 'new' AND aa.created_at < now() - (%s * interval '1 hour')) AS overdue "
+                "FROM anomaly_alerts aa JOIN account_banks ab ON ab.account_id = aa.account_id WHERE ab.bank = %s",
+                (g, bank),
+            ).fetchone()
+            rem = conn.execute(
+                "SELECT count(*) AS total, max(created_at) AS last_at, "
+                "count(*) FILTER (WHERE acknowledged_at IS NULL) AS unacked, "
+                "(SELECT kind FROM bank_reminders WHERE bank = %s ORDER BY created_at DESC LIMIT 1) AS last_kind "
+                "FROM bank_reminders WHERE bank = %s", (bank, bank),
+            ).fetchone()
+            accounts = conn.execute("SELECT count(*) AS n FROM account_banks WHERE bank = %s", (bank,)).fetchone()["n"]
+            out.append({
+                "bank": bank, "status": b["status"], "country": b["country"], "region": b["region"],
+                "registration_number": b["registration_number"],
+                "autopilot": st["autopilot"], "grace_hours": g,
+                "accounts": accounts,
+                "total_alerts": al["total"], "open_alerts": al["open_n"], "decided_alerts": al["decided"],
+                "confirmed_alerts": al["confirmed"], "overdue_alerts": al["overdue"],
+                "avg_decision_hours": float(al["avg_h"]) if al["avg_h"] is not None else None,
+                "last_alert_at": al["last_alert"],
+                "total_anomalies": an["total"], "new_anomalies": an["new_n"],
+                "investigating_anomalies": an["investigating"], "overdue_anomalies": an["overdue"],
+                "reminders_sent": rem["total"], "last_reminder_at": rem["last_at"],
+                "last_reminder_kind": rem["last_kind"], "unacknowledged_reminders": rem["unacked"],
+            })
+    return out
+
+
+@api.patch("/admin/banks/{bank_name}/autopilot")
+def admin_set_autopilot(bank_name: str, req: AutopilotRequest, role: str = Depends(get_current_role),
+                        officer: str = Depends(get_current_officer)):
+    """Owner-only: switch a bank's automatic reminders on/off and/or change its grace period (hours)."""
+    if role != "admin":
+        raise HTTPException(403, "admin passkey required")
+    with db() as conn:
+        cur = _bank_settings(conn, bank_name)
+        autopilot = cur["autopilot"] if req.autopilot is None else req.autopilot
+        grace = cur["grace_hours"] if req.grace_hours is None else req.grace_hours
+        conn.execute(
+            "INSERT INTO bank_settings (bank, autopilot, grace_hours) VALUES (%s, %s, %s) "
+            "ON CONFLICT (bank) DO UPDATE SET autopilot = EXCLUDED.autopilot, grace_hours = EXCLUDED.grace_hours, "
+            "updated_at = now()", (bank_name, autopilot, grace),
+        )
+    audit("admin_set_autopilot", {"bank": bank_name, "autopilot": autopilot, "grace_hours": grace, "by": officer})
+    return {"bank": bank_name, "autopilot": autopilot, "grace_hours": grace}
+
+
+@api.post("/admin/banks/{bank_name}/remind")
+def admin_remind_bank(bank_name: str, req: RemindRequest, role: str = Depends(get_current_role),
+                      officer: str = Depends(get_current_officer)):
+    """Owner-only manual switch: alert this bank RIGHT NOW (the admin is around and wants it acted on), instead
+    of waiting for the autopilot's grace period."""
+    if role != "admin":
+        raise HTTPException(403, "admin passkey required")
+    return _send_bank_reminder(bank_name, "manual", officer, req.message)
+
+
+@api.post("/admin/autopilot/run")
+def admin_run_autopilot(role: str = Depends(get_current_role)):
+    """Owner-only: run one autopilot pass now (the same one that runs on a timer) -- for testing it without
+    waiting for the next scheduled check."""
+    if role != "admin":
+        raise HTTPException(403, "admin passkey required")
+    return {"reminders_sent": run_autopilot_once()}
+
+
+@api.get("/admin/reminders")
+def admin_list_reminders(bank: str | None = None, limit: int = 50, role: str = Depends(get_current_role)):
+    if role != "admin":
+        raise HTTPException(403, "admin passkey required")
+    q, args = "SELECT * FROM bank_reminders", []
+    if bank:
+        q += " WHERE bank = %s"
+        args.append(bank)
+    q += " ORDER BY created_at DESC LIMIT %s"
+    args.append(min(max(limit, 1), 200))
+    with db() as conn:
+        return conn.execute(q, args).fetchall()
+
+
+@api.get("/reminders")
+def list_my_reminders(officer: str = Depends(get_current_officer), bank: str | None = Depends(get_current_bank)):
+    """A bank's own console reads its reminders here (shown as a banner until acknowledged). Scoped to the
+    signed-in bank; a session with no bank (admin/global) simply has none of its own."""
+    if not bank:
+        return []
+    with db() as conn:
+        return conn.execute(
+            "SELECT id, kind, message, created_at, acknowledged_at FROM bank_reminders WHERE bank = %s "
+            "ORDER BY created_at DESC LIMIT 10", (bank,),
+        ).fetchall()
+
+
+@api.post("/reminders/{reminder_id}/ack")
+def acknowledge_reminder(reminder_id: int, officer: str = Depends(get_current_officer),
+                         bank: str | None = Depends(get_current_bank)):
+    if not bank:
+        raise HTTPException(403, "only a bank's own session can acknowledge its reminders")
+    with db() as conn:
+        row = conn.execute(
+            "UPDATE bank_reminders SET acknowledged_at = now(), acknowledged_by = %s "
+            "WHERE id = %s AND bank = %s AND acknowledged_at IS NULL RETURNING id", (officer, reminder_id, bank),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "no unacknowledged reminder with that id for your bank")
+    return {"acknowledged": reminder_id}
+
+
 @api.post("/signup-requests", status_code=201)
 def create_signup_request(req: SignupRequestBody):
     """Public, unauthenticated -- the front door for a bank that wants a pilot and doesn't have a passkey yet.
@@ -1632,7 +1954,7 @@ def admin_invite_user(req: InviteUserRequest, role: str = Depends(get_current_ro
             raise HTTPException(409, f"a user with email {email!r} already exists")
         row = conn.execute(
             "INSERT INTO users (bank, name, email, role, invite_token, invite_expires) "
-            "VALUES (%s, %s, %s, %s, %s, now() + interval '%s hours') "
+            "VALUES (%s, %s, %s, %s, %s, now() + (%s * interval '1 hour')) "
             "RETURNING id, name, email, bank, role, status, totp_enabled, created_at",
             (req.bank, name, email, req.role, invite_token, INVITE_EXPIRY_HOURS),
         ).fetchone()
@@ -1717,6 +2039,19 @@ def _active_bank_names() -> set[str]:
     return set(BANK_NAME_TO_PASSKEY) | {r["name"] for r in rows}
 
 
+@api.get("/unlock")
+def admin_unlock(key: str = "", request: Request = None):
+    """Owner-only door for reaching the hidden admin pages from a phone: the right key sets a cookie (12 hours)
+    and sends the browser to /owner. A wrong or missing key answers a plain 404, so the route looks absent."""
+    from starlette.responses import Response
+    if not ADMIN_UNLOCK_KEY or not hmac.compare_digest(key.encode(), ADMIN_UNLOCK_KEY.encode()):
+        raise HTTPException(404, "Not Found")
+    resp = Response(status_code=303, headers={"Location": "/owner"})
+    resp.set_cookie("xai_admin", ADMIN_UNLOCK_KEY, max_age=12 * 3600, httponly=True, secure=True,
+                    samesite="lax", path="/")
+    return resp
+
+
 @api.get("/public/banks")
 def public_banks():
     """Unauthenticated -- the list /analyst-signup's bank dropdown populates itself from, so a self-registering
@@ -1784,7 +2119,7 @@ def forgot_password(req: ForgotPasswordRequest):
     reset_token = secrets.token_urlsafe(32)
     with db() as conn:
         row = conn.execute(
-            "UPDATE users SET reset_token = %s, reset_expires = now() + interval '%s hours' "
+            "UPDATE users SET reset_token = %s, reset_expires = now() + (%s * interval '1 hour') "
             "WHERE lower(email) = %s AND status = 'active' RETURNING email",
             (reset_token, RESET_EXPIRY_HOURS, email),
         ).fetchone()
@@ -1988,11 +2323,13 @@ def decide(alert_id: int, req: DecisionRequest, officer: str = Depends(get_curre
 # confirmed_mule is read back out by gnn_aml_core.anomaly.sync_confirmed_to_model1 on its own schedule (not
 # triggered synchronously by this request) and is the only thing that ever teaches Model 1 a new pattern.
 @api.get("/anomalies")
-def list_anomalies(status: str | None = None, limit: int = 100, officer: str = Depends(get_current_officer),
-                   bank: str | None = Depends(get_current_bank)):
+def list_anomalies(status: str | None = None, limit: int = 100, for_bank: str | None = None,
+                   officer: str = Depends(get_current_officer), bank: str | None = Depends(get_current_bank)):
     # anomaly_alerts has no bank column of its own (see activity()'s docstring on why) -- a tenant-scoped
     # session joins against account_banks instead, which also naturally excludes any account with no bank
-    # attribution at all, since that account isn't this tenant's own data.
+    # attribution at all, since that account isn't this tenant's own data. `for_bank` lets an admin/global
+    # session look at one bank at a time (the governing console); a tenant's own bank always wins over it.
+    bank = bank or for_bank
     if bank:
         q = "SELECT a.* FROM anomaly_alerts a JOIN account_banks ab ON ab.account_id = a.account_id AND ab.bank = %s"
         args: list = [bank]
@@ -2077,6 +2414,51 @@ def add_anomaly_note(anomaly_id: int, req: AnomalyNoteRequest, officer: str = De
         alert = _append_investigation_log(conn, anomaly_id,
                                           {"ts": time.time(), "by": officer, "status": alert["status"], "note": req.note})
     return alert
+
+
+def _quick_clear(conn, anomaly_id: int, officer: str, bank: str | None, note: str) -> dict | None:
+    """Clears one 'new' or 'under_investigation' anomaly as a normal account in a single step (claim + resolve),
+    logging who did it. Returns the updated row, or None if it wasn't in a clearable state. Same bank-ownership
+    check as every other /anomalies route. 'cleared' is still never used as a training example."""
+    alert = _get_anomaly_scoped(conn, anomaly_id, bank)
+    if alert["status"] not in ("new", "under_investigation"):
+        return None
+    conn.execute("UPDATE anomaly_alerts SET status='cleared', assigned_to=COALESCE(assigned_to, %s), updated_at=now() "
+                 "WHERE id=%s", (officer, anomaly_id))
+    row = _append_investigation_log(conn, anomaly_id, {"ts": time.time(), "by": officer, "status": "cleared",
+                                                       "note": note or "Quick-cleared: looks like a normal account"})
+    audit("anomaly_resolved", {"anomaly_id": anomaly_id, "account_id": row["account_id"], "outcome": "cleared",
+                               "officer": officer, "note": note, "quick": True})
+    return row
+
+
+@api.post("/anomalies/bulk-clear")
+def bulk_clear_anomalies(req: AnomalyBulkClearRequest, officer: str = Depends(get_current_officer),
+                         bank: str | None = Depends(get_current_bank)):
+    """One click for a whole group of similar alerts an analyst recognises as normal behaviour. Each alert is
+    checked and logged individually; ones not in a clearable state (or not this bank's) are skipped, not errors."""
+    cleared, skipped = [], 0
+    with db() as conn:
+        for i in dict.fromkeys(req.ids):
+            try:
+                row = _quick_clear(conn, i, officer, bank, req.note)
+            except HTTPException:
+                row = None
+            if row is None:
+                skipped += 1
+            else:
+                cleared.append(row)
+    return {"cleared": cleared, "skipped": skipped}
+
+
+@api.post("/anomalies/{anomaly_id}/quick-clear")
+def quick_clear_anomaly(anomaly_id: int, officer: str = Depends(get_current_officer),
+                        bank: str | None = Depends(get_current_bank)):
+    with db() as conn:
+        row = _quick_clear(conn, anomaly_id, officer, bank, "")
+    if row is None:
+        raise HTTPException(409, "alert is not open any more")
+    return row
 
 
 @api.post("/anomalies/{anomaly_id}/resolve")
